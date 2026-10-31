@@ -34,6 +34,29 @@ FORMULA_STRING = (
 )
 
 
+def recompute_tape_check(tc: dict[str, Any]) -> dict[str, Any]:
+    """Recompute measured distance and residual from recorded 3D endpoints and typed tape_m (YS-41).
+
+    Never trusts phone-written `measured_m` or `residual_m`; flags mismatches > 1 mm.
+    """
+    pa_w = np.array(tc["point_a_world_m"], dtype=np.float64)
+    pb_w = np.array(tc["point_b_world_m"], dtype=np.float64)
+    tape_m = float(tc["tape_m"])
+    measured_m = float(np.linalg.norm(pb_w - pa_w))
+    residual_m = abs(measured_m - tape_m)
+    phone_measured = float(tc.get("measured_m", measured_m))
+    phone_residual = float(tc.get("residual_m", residual_m))
+    phone_mismatch = (abs(phone_measured - measured_m) > 1e-3) or (abs(phone_residual - residual_m) > 1e-3)
+    out = dict(tc)
+    out["tape_m"] = tape_m
+    out["measured_m"] = measured_m
+    out["residual_m"] = residual_m
+    out["phone_measured_m"] = phone_measured
+    out["phone_residual_m"] = phone_residual
+    out["phone_mismatch"] = phone_mismatch
+    return out
+
+
 def compute_tolerance_at_range(
     r_m: float,
     primary_tape_checks: list[dict[str, Any]],
@@ -45,8 +68,9 @@ def compute_tolerance_at_range(
     """Evaluate closed-form 95% distance tolerance tol(r) at range r_m (YS-41, Q029)."""
     primary_floor = 0.0
     for tc in primary_tape_checks:
-        res_m = float(tc["residual_m"])
-        tape_m = max(float(tc["tape_m"]), 2.0)
+        rtc = recompute_tape_check(tc) if "point_a_world_m" in tc else tc
+        res_m = float(rtc["residual_m"])
+        tape_m = max(float(rtc["tape_m"]), 2.0)
         scaled = res_m * max(1.0, float(r_m) / tape_m)
         primary_floor = max(primary_floor, res_m, scaled)
 
@@ -72,29 +96,32 @@ def compute_grade_and_tolerances(
     R_yw = T_yard_from_world[:3, :3]
     t_yw = T_yard_from_world[:3, 3]
 
-    primary_tapes = [tc for tc in tape_checks_world if tc.get("role", "primary") == "primary"]
+    recomputed_tapes = [recompute_tape_check(tc) for tc in tape_checks_world]
+    primary_tapes = [tc for tc in recomputed_tapes if tc.get("role", "primary") == "primary"]
     max_primary_residual_m = max((float(tc["residual_m"]) for tc in primary_tapes), default=0.0)
 
     scale_error_ratio = float(marker_scale_info.get("scale_error_ratio", 0.0))
     scale_error_se = float(marker_scale_info.get("scale_error_se", 0.0))
     scale_error_eff = float(marker_scale_info.get("scale_error_eff", max(0.0, abs(scale_error_ratio) - 2.0 * scale_error_se)))
 
-    # Marker 0 loop-closure gap
-    m0_gap: float | None = None
+    # Marker 0 loop-closure gap (track whether Marker 0 actually closed the loop before applying jump_sum)
+    raw_m0_gap: float | None = None
     for gap_entry in frame_info.get("loop_closure_gaps", []):
         if int(gap_entry["marker_id"]) == 0:
-            m0_gap = float(gap_entry["gap_m"])
+            raw_m0_gap = float(gap_entry["gap_m"])
             break
+    has_m0_loop_closure = raw_m0_gap is not None
 
     pose_jumps = frame_info.get("pose_jumps", [])
     jump_sum = sum(float(j["jump_m"]) for j in pose_jumps)
+    m0_gap: float | None = raw_m0_gap
     if m0_gap is not None:
         m0_gap = max(m0_gap, jump_sum)
     elif jump_sum > 0.0:
         m0_gap = jump_sum
 
     eff_walk_len = max(float(walk_length_m), 10.0)
-    # If Marker 0 loop closure is missing, assume a conservative 1.0% open-loop drift rate for tol(r)
+    # If Marker 0 loop closure is missing, assume a conservative 0.8% open-loop drift rate for tol(r)
     loop_gap_per_m = (m0_gap / eff_walk_len) if m0_gap is not None else 0.008
 
     sigma_tracking_m = SIGMA_TRACKING_BASE_M + SIGMA_TRACKING_SLOPE_M * float(limited_tracking_share)
@@ -121,14 +148,20 @@ def compute_grade_and_tolerances(
 
     # Transform tape check points to yard frame and evaluate each against tol(tape_m)
     tape_checks_yard: list[dict[str, Any]] = []
-    for tc in tape_checks_world:
+    phone_mismatches: list[str] = []
+    for tc in recomputed_tapes:
         pa_w = np.array(tc["point_a_world_m"], dtype=np.float64)
         pb_w = np.array(tc["point_b_world_m"], dtype=np.float64)
         pa_y = R_yw @ pa_w + t_yw
         pb_y = R_yw @ pb_w + t_yw
         tape_m = float(tc["tape_m"])
         measured_m = float(tc["measured_m"])
-        residual_m = abs(measured_m - tape_m)
+        residual_m = float(tc["residual_m"])
+        if tc.get("phone_mismatch", False):
+            phone_mismatches.append(
+                f"tape_check_id={tc['id']}: phone wrote measured={tc['phone_measured_m']:.4f}m/res={tc['phone_residual_m']:.4f}m "
+                f"vs recomputed measured={measured_m:.4f}m/res={residual_m:.4f}m"
+            )
         tol_at_tape = compute_tolerance_at_range(
             r_m=tape_m,
             primary_tape_checks=primary_tapes,
@@ -157,15 +190,18 @@ def compute_grade_and_tolerances(
     caps_applied: list[str] = []
 
     reasons.append(f"distance_tolerance_10m_m={dist_tol_10m:.4f}m")
-    if m0_gap is not None:
+    if has_m0_loop_closure and m0_gap is not None:
         reasons.append(f"loop_closure_gap_m={m0_gap:.4f}m")
     else:
-        reasons.append("loop_closure_gap_m=null (Marker 0 seen in fewer than 2 passes)")
+        reasons.append("loop_closure_gap_m=null (Marker 0 not revisited at end of walk)")
 
     if primary_tapes:
         reasons.append(f"max_primary_tape_residual_m={max_primary_residual_m:.4f}m")
     else:
         reasons.append("primary_tape_checks=0")
+
+    for mm_msg in phone_mismatches:
+        reasons.append(f"phone_tape_residual_mismatch: {mm_msg}")
 
     reasons.append(
         f"marker_scale_error_ratio={scale_error_ratio:.4f} (se={scale_error_se:.4f}, eff={scale_error_eff:.4f})"
@@ -209,7 +245,7 @@ def compute_grade_and_tolerances(
         caps_applied.append("marker_0_tilted")
         reasons.append("cap_applied: marker_0_tilted (>30 deg from ground up) -> max grade C")
 
-    if m0_gap is None and frame_info.get("method") == "marker":
+    if not has_m0_loop_closure and frame_info.get("method") == "marker":
         if band > 1:
             band = 1
         caps_applied.append("no_loop_closure")
@@ -220,6 +256,25 @@ def compute_grade_and_tolerances(
             band = 1
         caps_applied.append("no_tape_check")
         reasons.append("cap_applied: no_tape_check -> max grade C")
+
+    # Held-out tape checks (YS-42): 1 failing held-out pair caps at C; >= 2 failing held-out pairs grade fail.
+    failed_held_out = [
+        tc for tc in tape_checks_yard if tc.get("role") == "held_out" and not tc["within_tolerance"]
+    ]
+    if len(failed_held_out) >= 2:
+        band = 0
+        caps_applied.append("held_out_tape_failed_2plus")
+        reasons.append(
+            f"cap_applied: held_out_tape_failed_2plus ({len(failed_held_out)} held-out tape checks outside tolerance) -> fail"
+        )
+    elif len(failed_held_out) == 1:
+        if band > 1:
+            band = 1
+        caps_applied.append("held_out_tape_failed_1")
+        f_tc = failed_held_out[0]
+        reasons.append(
+            f"cap_applied: held_out_tape_failed_1 (id={f_tc['id']} residual={f_tc['residual_m']:.4f}m > tol={f_tc['tolerance_at_tape_m']:.4f}m) -> max grade C"
+        )
 
     if limited_tracking_share > 0.10:
         if band > 2:
@@ -272,3 +327,4 @@ def compute_grade_and_tolerances(
         "caps_applied": caps_applied,
         "reasons": reasons,
     }
+

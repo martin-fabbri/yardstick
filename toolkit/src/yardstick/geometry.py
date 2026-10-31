@@ -26,12 +26,23 @@ import numpy as np
 from scipy.ndimage import binary_closing, binary_fill_holes, label
 
 
-def quat_to_rotmat(qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+def is_valid_unit_quaternion(qx: float, qy: float, qz: float, qw: float, tol: float = 1e-4) -> bool:
+    """Return True if (qx, qy, qz, qw) is finite and has unit norm within tol (YS-23)."""
+    if not (math.isfinite(qx) and math.isfinite(qy) and math.isfinite(qz) and math.isfinite(qw)):
+        return False
+    norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
+    return abs(norm - 1.0) <= tol
+
+
+def quat_to_rotmat(qx: float, qy: float, qz: float, qw: float, *, normalize: bool = True) -> np.ndarray:
     """Convert Hamilton unit quaternion (qx, qy, qz, qw) to 3x3 rotation matrix."""
     norm = math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw)
     if norm < 1e-12:
+        if not normalize:
+            return np.zeros((3, 3), dtype=np.float64)
         return np.eye(3, dtype=np.float64)
-    qx, qy, qz, qw = qx / norm, qy / norm, qz / norm, qw / norm
+    if normalize:
+        qx, qy, qz, qw = qx / norm, qy / norm, qz / norm, qw / norm
     xx, yy, zz = qx * qx, qy * qy, qz * qz
     xy, xz, yz = qx * qy, qx * qz, qy * qz
     wx, wy, wz = qw * qx, qw * qy, qw * qz
@@ -78,10 +89,20 @@ def rotmat_to_quat(R: np.ndarray) -> tuple[float, float, float, float]:
     return (float(qx / norm), float(qy / norm), float(qz / norm), float(qw / norm))
 
 
-def pose_to_matrix(px: float, py: float, pz: float, qx: float, qy: float, qz: float, qw: float) -> np.ndarray:
+def pose_to_matrix(
+    px: float,
+    py: float,
+    pz: float,
+    qx: float,
+    qy: float,
+    qz: float,
+    qw: float,
+    *,
+    normalize: bool = True,
+) -> np.ndarray:
     """Build 4x4 homogeneous transform matrix from position and Hamilton quaternion."""
     T = np.eye(4, dtype=np.float64)
-    T[:3, :3] = quat_to_rotmat(qx, qy, qz, qw)
+    T[:3, :3] = quat_to_rotmat(qx, qy, qz, qw, normalize=normalize)
     T[:3, 3] = [px, py, pz]
     return T
 
@@ -271,11 +292,10 @@ def fit_ground_plane_ransac(
         if float(np.dot(refined_normal, y_up)) >= cos_min:
             best_normal = refined_normal / np.linalg.norm(refined_normal)
             best_d = -float(np.dot(best_normal, centroid))
-        residuals = np.abs(inlier_pts @ best_normal + best_d)
-        median_residual = float(np.median(residuals))
-    else:
-        residuals = np.abs(candidates @ best_normal + best_d)
-        median_residual = float(np.median(residuals)) if residuals.size > 0 else 0.0
+    # Evaluate residual over the entire ground candidate band so a crowned or stepped yard
+    # increases ground_plane_residual_m honestly (YS-51).
+    residuals = np.abs(candidates @ best_normal + best_d)
+    median_residual = float(np.median(residuals)) if residuals.size > 0 else 0.0
 
     return best_normal, best_d, median_residual
 
@@ -322,28 +342,40 @@ def detect_pose_jumps(
     jump_threshold_m: float = 0.08,
     max_dt_s: float = 0.10,
 ) -> list[dict[str, Any]]:
-    """Detect non-physical single-frame ARKit relocalization snaps (> 0.08 m within 0.1 s) (YS-32, Q026)."""
+    """Detect non-physical ARKit relocalization snaps (> 0.08 m within 0.10 s across 1..2 frames) (YS-32, Q026)."""
     jumps: list[dict[str, Any]] = []
-    for i in range(1, len(poses_rows)):
-        p_prev = np.array(
-            [float(poses_rows[i - 1]["px"]), float(poses_rows[i - 1]["py"]), float(poses_rows[i - 1]["pz"])],
-            dtype=np.float64,
-        )
+    used_indices: set[int] = set()
+    n = len(poses_rows)
+    for i in range(1, n):
+        if i in used_indices:
+            continue
         p_curr = np.array(
             [float(poses_rows[i]["px"]), float(poses_rows[i]["py"]), float(poses_rows[i]["pz"])],
             dtype=np.float64,
         )
-        dt = float(poses_rows[i]["t"]) - float(poses_rows[i - 1]["t"])
-        dist = float(np.linalg.norm(p_curr - p_prev))
-        if 0.0 < dt <= max_dt_s and dist > jump_threshold_m:
-            jumps.append(
-                {
-                    "saved_index_from": int(poses_rows[i - 1]["saved_index"]),
-                    "saved_index_to": int(poses_rows[i]["saved_index"]),
-                    "t_s": round(float(poses_rows[i]["t"]), 6),
-                    "jump_m": round(dist, 6),
-                }
+        t_curr = float(poses_rows[i]["t"])
+        for step in (1, 2):
+            j = i - step
+            if j < 0 or any(k in used_indices for k in range(j + 1, i + 1)):
+                continue
+            p_prev = np.array(
+                [float(poses_rows[j]["px"]), float(poses_rows[j]["py"]), float(poses_rows[j]["pz"])],
+                dtype=np.float64,
             )
+            dt = t_curr - float(poses_rows[j]["t"])
+            dist = float(np.linalg.norm(p_curr - p_prev))
+            if 0.0 < dt <= max_dt_s and dist > jump_threshold_m:
+                jumps.append(
+                    {
+                        "saved_index_from": int(poses_rows[j]["saved_index"]),
+                        "saved_index_to": int(poses_rows[i]["saved_index"]),
+                        "t_s": round(t_curr, 6),
+                        "jump_m": round(dist, 6),
+                    }
+                )
+                for k in range(j + 1, i + 1):
+                    used_indices.add(k)
+                break
     return jumps
 
 
@@ -354,14 +386,51 @@ def build_yard_frame(
     passes_by_marker: dict[int, list[list[dict[str, Any]]]],
     first_camera_pose_world: np.ndarray,
     pose_jumps: list[dict[str, Any]],
+    *,
+    walk_start_t_s: float | None = None,
+    walk_end_t_s: float | None = None,
+    last_tap_t_s: float | None = None,
 ) -> dict[str, Any]:
     """Construct world_to_yard_transform (4x4) and frame residuals (YS-31, YS-32, YS-51)."""
     z_yard = ground_normal_world / np.linalg.norm(ground_normal_world)
     jump_sum = sum(float(j["jump_m"]) for j in pose_jumps)
 
+    latest_other_marker_t_s: float | None = None
+    for mid, m_passes in passes_by_marker.items():
+        if mid != 0 and m_passes:
+            t_last_other = float(m_passes[-1][-1]["t"])
+            if latest_other_marker_t_s is None or t_last_other > latest_other_marker_t_s:
+                latest_other_marker_t_s = t_last_other
+
+    walk_span_s = (
+        (walk_end_t_s - walk_start_t_s)
+        if (walk_end_t_s is not None and walk_start_t_s is not None and walk_end_t_s >= walk_start_t_s)
+        else 0.0
+    )
+
+    m0_has_valid_closing_pass = False
+    if 0 in passes_by_marker and len(passes_by_marker[0]) >= 2:
+        last_pass_m0 = passes_by_marker[0][-1]
+        last_m0_t = float(last_pass_m0[-1]["t"])
+        is_valid_closing = True
+        if walk_end_t_s is not None:
+            # YS-32: Closing pass on Marker 0 counts as loop closure ONLY if in the walk's final seconds
+            # (within the last 30 s of the walk, after the last tap event and after other markers).
+            if (walk_end_t_s - last_m0_t) > 30.0:
+                is_valid_closing = False
+            if walk_span_s > 5.0 and (walk_end_t_s - last_m0_t) > min(30.0, 0.35 * walk_span_s):
+                is_valid_closing = False
+        if last_tap_t_s is not None and last_m0_t < last_tap_t_s - 1e-6:
+            is_valid_closing = False
+        if latest_other_marker_t_s is not None and last_m0_t < latest_other_marker_t_s - 1e-6:
+            is_valid_closing = False
+        m0_has_valid_closing_pass = is_valid_closing
+
     loop_closure_gaps: list[dict[str, Any]] = []
     for mid, m_passes in sorted(passes_by_marker.items()):
         if len(m_passes) >= 2:
+            if mid == 0 and not m0_has_valid_closing_pass:
+                continue
             first_pass = m_passes[0]
             last_pass = m_passes[-1]
             p_first = np.median(
@@ -424,7 +493,7 @@ def build_yard_frame(
         T_yard_from_world[:3, 3] = t_yard_from_world
 
         origin_residual_m: float | None = None
-        if len(passes_by_marker[0]) >= 2:
+        if m0_has_valid_closing_pass and len(passes_by_marker[0]) >= 2:
             last_pass_m0 = passes_by_marker[0][-1]
             p_m0_last = np.median(
                 np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in last_pass_m0], dtype=np.float64),
@@ -684,9 +753,23 @@ def compute_scanned_ground_coverage(
     high_mask = ground_confs == 2
     high_grid[gy[high_mask], gx[high_mask]] = True
 
-    # 1-cell morphological closing
+    cell_area_m2 = grid_cell_m * grid_cell_m
+    max_hole_cells = int(round(max_filled_hole_m2 / cell_area_m2))
+
+    # Preserve large interior holes (> max_filled_hole_m2) that already exist in raw occ_grid
+    # before 1-cell morphological closing so a 1.0..1.5 m^2 hole is not eroded below threshold.
+    raw_filled = binary_fill_holes(occ_grid)
+    raw_holes = raw_filled & (~occ_grid)
+    raw_h_labels, n_raw_h = label(raw_holes)
+    protected_holes = np.zeros_like(occ_grid)
+    for rh_id in range(1, n_raw_h + 1):
+        rh_comp = raw_h_labels == rh_id
+        if int(np.sum(rh_comp)) > max_hole_cells:
+            protected_holes |= rh_comp
+
+    # 1-cell morphological closing, restoring protected large holes
     struct = np.ones((2 * closing_cells + 1, 2 * closing_cells + 1), dtype=bool)
-    closed = binary_closing(occ_grid, structure=struct)
+    closed = binary_closing(occ_grid, structure=struct) & (~protected_holes)
 
     # Largest connected component
     labeled, n_comp = label(closed)
@@ -700,20 +783,29 @@ def compute_scanned_ground_coverage(
     # Identify interior holes: fill only small occlusion holes <= max_filled_hole_m2 (<= 25 cells)
     filled_all = binary_fill_holes(region)
     holes_mask = filled_all & (~region)
-    cell_area_m2 = grid_cell_m * grid_cell_m
-    max_hole_cells = int(round(max_filled_hole_m2 / cell_area_m2))
 
     hole_labels, n_holes = label(holes_mask)
     large_holes_mask = np.zeros_like(region)
+    large_hole_components: list[np.ndarray] = []
     for h_id in range(1, n_holes + 1):
         h_comp = hole_labels == h_id
         if int(np.sum(h_comp)) <= max_hole_cells:
             region = region | h_comp
         else:
             large_holes_mask = large_holes_mask | h_comp
+            large_hole_components.append(h_comp)
 
-    # Extract outer contour of `filled_all` (the outer boundary of the largest region)
-    outer_uint8 = (filled_all.astype(np.uint8)) * 255
+    def _cells_to_corner_mask(cell_mask: np.ndarray) -> np.ndarray:
+        """Expand (h, w) cell mask to (h+1, w+1) cell-corner vertex mask so findContours traces exact cell edges."""
+        cm = np.zeros((cell_mask.shape[0] + 1, cell_mask.shape[1] + 1), dtype=np.uint8)
+        cm[:-1, :-1] |= cell_mask.astype(np.uint8)
+        cm[1:, :-1] |= cell_mask.astype(np.uint8)
+        cm[:-1, 1:] |= cell_mask.astype(np.uint8)
+        cm[1:, 1:] |= cell_mask.astype(np.uint8)
+        return cm * 255
+
+    # Extract outer contour of `filled_all` along cell edges
+    outer_uint8 = _cells_to_corner_mask(filled_all)
     contours, _ = cv2.findContours(outer_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
     if not contours:
         raise ValueError("Could not extract outer boundary contour")
@@ -723,8 +815,8 @@ def compute_scanned_ground_coverage(
         pts_grid = cnt[:, 0, :].astype(np.float64)
         pts_m = np.column_stack(
             [
-                (pts_grid[:, 0] + min_ix + 0.5) * grid_cell_m,
-                (pts_grid[:, 1] + min_iy + 0.5) * grid_cell_m,
+                (pts_grid[:, 0] + min_ix) * grid_cell_m,
+                (pts_grid[:, 1] + min_iy) * grid_cell_m,
             ]
         )
         for factor in [1.0, 0.7, 0.5, 0.25, 0.1, 0.0]:
@@ -749,15 +841,17 @@ def compute_scanned_ground_coverage(
 
     holes_xy_m: list[list[list[float]]] = []
     holes_area = 0.0
-    if np.any(large_holes_mask):
-        h_uint8 = (large_holes_mask.astype(np.uint8)) * 255
+    for h_comp in large_hole_components:
+        h_uint8 = _cells_to_corner_mask(h_comp)
         h_contours, _ = cv2.findContours(h_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        for hc in h_contours:
-            h_poly = _contour_to_xy(hc, simplify_epsilon_m, ccw=False)
-            h_a = abs(_polygon_signed_area(np.array(h_poly, dtype=np.float64)))
-            if h_a >= max_filled_hole_m2:
-                holes_xy_m.append(h_poly)
-                holes_area += h_a
+        if not h_contours:
+            continue
+        hc = max(h_contours, key=cv2.contourArea)
+        h_poly = _contour_to_xy(hc, simplify_epsilon_m, ccw=False)
+        h_a = abs(_polygon_signed_area(np.array(h_poly, dtype=np.float64)))
+        if h_a >= max_filled_hole_m2 or int(np.sum(h_comp)) > max_hole_cells:
+            holes_xy_m.append(h_poly)
+            holes_area += h_a
 
     net_area = max(0.01, round(outer_area - holes_area, 4))
     occ_in_region = occ_grid & region
@@ -780,3 +874,4 @@ def compute_scanned_ground_coverage(
             "simplify_epsilon_m": simplify_epsilon_m,
         },
     }
+

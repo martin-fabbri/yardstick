@@ -420,3 +420,153 @@ def test_cli_entrypoints(tmp_path: Path) -> None:
     assert cli_main(["convert", str(out_cap)]) == 0
     assert cli_main(["validate", str(out_cap), "--standard"]) == 0
     assert cli_main(["grade", str(out_cap)]) == 0
+
+
+def test_ys42_held_out_tape_failures_cap_and_fail(tmp_path: Path) -> None:
+    """YS-42 (CS005): 1 failing held-out tape pair caps grade at C; >= 2 failing held-out pairs grade fail."""
+    # 1 failing held-out pair (35 cm residual on held-out #1) -> capped at C
+    cap_1fail = tmp_path / "cap_held_out_1fail"
+    generate_synthetic_capture(
+        cap_1fail,
+        SynthOptions(held_out_residuals_m=(0.35, -0.012, 0.014)),
+    )
+    res_1 = convert_recording_to_standard(cap_1fail)
+    assert res_1["grade"]["grade"] == "C"
+    assert "held_out_tape_failed_1" in res_1["grade"]["caps_applied"]
+
+    # 2 failing held-out pairs (35 cm and 40 cm residuals) -> grade fail
+    cap_2fail = tmp_path / "cap_held_out_2fail"
+    generate_synthetic_capture(
+        cap_2fail,
+        SynthOptions(held_out_residuals_m=(0.35, -0.40, 0.014)),
+    )
+    res_2 = convert_recording_to_standard(cap_2fail)
+    assert res_2["grade"]["grade"] == "fail"
+    assert "held_out_tape_failed_2plus" in res_2["grade"]["caps_applied"]
+
+
+def test_ys41_phone_written_tape_residuals_never_trusted(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-41 (CS005): Converter & validator recompute measured_m and residual_m from 3D endpoints and tape_m."""
+    cap = _clone_capture(base_synth_dir, tmp_path / "cap_spoofed_tape")
+    sess = json.loads((cap / "session.json").read_text())
+    # Move primary endpoint B to 5.45 m (45 cm error vs 5.0 m tape) while phone claims 0.0 m residual
+    sess["tape_checks"][0]["point_b_world_m"] = [5.45, 0.0, 0.0]
+    sess["tape_checks"][0]["measured_m"] = 5.00
+    sess["tape_checks"][0]["residual_m"] = 0.00
+    (cap / "session.json").write_text(json.dumps(sess, indent=2))
+    seal_manifest(cap)
+
+    rep = validate_recording(cap)
+    assert any(f["code"] == "tape_check_residual_mismatch" for f in rep["findings"])
+
+    res = convert_recording_to_standard(cap)
+    tc0 = res["grade"]["tape_checks"][0]
+    assert abs(tc0["measured_m"] - 5.45) < 1e-4
+    assert abs(tc0["residual_m"] - 0.45) < 1e-4
+    assert res["grade"]["tolerances_95pct"]["distance_m"] >= 0.45
+    assert res["grade"]["grade"] == "fail"
+
+
+def test_ys32_early_resighting_of_marker0_not_counted_as_loop_closure(
+    tmp_path: Path,
+) -> None:
+    """YS-32 (CS005): An early re-sighting of Marker 0 (not at walk end) does not count as loop closure."""
+    cap = tmp_path / "cap_early_m0"
+    generate_synthetic_capture(cap, SynthOptions(include_loop_closure=False, fps=1))
+
+    poses_rows = list(csv.DictReader((cap / "poses.csv").open()))
+    pose_t_by_idx = {int(r["saved_index"]): r["t"] for r in poses_rows}
+
+    m_rows = list(csv.DictReader((cap / "markers.csv").open()))
+    early_m0 = dict(m_rows[0])
+    # Inject an early second pass of Marker 0 at saved_index=7 (odd frame, ~7s after start, before Markers 2 & 3)
+    early_m0["saved_index"] = "7"
+    early_m0["t"] = pose_t_by_idx[7]
+    m_rows.append(early_m0)
+    m_rows.sort(key=lambda r: float(r["t"]))
+
+    with (cap / "markers.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(m_rows[0].keys()))
+        w.writeheader()
+        w.writerows(m_rows)
+    seal_manifest(cap)
+
+    rep = validate_recording(cap)
+    assert rep["status"] == "clean", f"Unexpected findings: {rep['findings']}"
+
+    res = convert_recording_to_standard(cap)
+    assert res["frame"]["origin_residual_m"] is None
+    assert not any(g["marker_id"] == 0 for g in res["frame"]["loop_closure_gaps"])
+    assert res["grade"]["grade"] == "C"
+    assert "no_loop_closure" in res["grade"]["caps_applied"]
+
+
+def test_ys42_pose_jump_without_loop_closure_still_caps_no_loop_closure(tmp_path: Path) -> None:
+    """YS-42 (CS005): Missing loop closure caps at C even when pose jumps were found."""
+    cap = tmp_path / "cap_jump_no_loop"
+    generate_synthetic_capture(
+        cap,
+        SynthOptions(include_loop_closure=False, pose_jump_m=0.12),
+    )
+    res = convert_recording_to_standard(cap)
+    assert len(res["frame"]["pose_jumps"]) >= 1
+    assert "no_loop_closure" in res["grade"]["caps_applied"]
+    assert res["grade"]["grade"] == "C"
+
+
+def test_ys23_raw_quaternion_norm_and_every_image_opened(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-23 (CS005): Raw non-unit or zero quaternion is invalid, and corrupt non-sampled PNG is caught."""
+    # 1. Zero quaternion in poses.csv -> invalid
+    cap_q = _clone_capture(base_synth_dir, tmp_path / "cap_zero_quat")
+    p_rows = list(csv.DictReader((cap_q / "poses.csv").open()))
+    p_rows[5]["qx"] = "0.0"
+    p_rows[5]["qy"] = "0.0"
+    p_rows[5]["qz"] = "0.0"
+    p_rows[5]["qw"] = "0.0"
+    with (cap_q / "poses.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(p_rows[0].keys()))
+        w.writeheader()
+        w.writerows(p_rows)
+    seal_manifest(cap_q)
+    rep_q = validate_recording(cap_q)
+    assert rep_q["status"] == "invalid"
+    assert any(f["code"] == "non_orthonormal_pose" for f in rep_q["findings"])
+
+    # 2. Corrupt depth/000007.png (non-endpoint, non-midpoint index) with sealed manifest -> caught
+    cap_png = _clone_capture(base_synth_dir, tmp_path / "cap_corrupt_png7")
+    dp7 = cap_png / "depth" / "000007.png"
+    dp7.write_bytes(b"not_a_valid_png_file_payload")
+    seal_manifest(cap_png)
+    rep_png = validate_recording(cap_png)
+    assert rep_png["status"] == "invalid"
+    assert any(f["code"] == "corrupt_depth_or_conf_png" for f in rep_png["findings"])
+
+
+def test_ys50_ys52_1cm_synthetic_accuracy_and_1p2m2_hole_preserved(
+    base_synth_dir: Path,
+) -> None:
+    """YS-50, YS-52: Synthetic ground points are within 1 cm of Z=0, and a 1.2 m^2 hole is preserved."""
+    from yardstick.geometry import compute_scanned_ground_coverage
+
+    verts = read_cloud_ply(base_synth_dir / "standard" / "cloud.ply")
+    ground_verts = verts[verts["x"] < 5.8]
+    assert float(np.max(np.abs(ground_verts["z"]))) <= 0.01
+
+    # Build a synthetic grid of ground points on [0, 6] x [0, 6] with:
+    # - a 1.2 m x 1.2 m = 1.44 m^2 void (> 1.0 m^2, must be preserved in holes_xy_m)
+    # - a 0.6 m x 0.6 m = 0.36 m^2 void (<= 1.0 m^2, must be filled)
+    xs, ys = np.meshgrid(np.linspace(0.05, 5.95, 60), np.linspace(0.05, 5.95, 60))
+    pts = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    in_large_hole = (pts[:, 0] >= 1.2) & (pts[:, 0] <= 2.4) & (pts[:, 1] >= 1.2) & (pts[:, 1] <= 2.4)
+    in_small_hole = (pts[:, 0] >= 4.0) & (pts[:, 0] <= 4.6) & (pts[:, 1] >= 4.0) & (pts[:, 1] <= 4.6)
+    pts = pts[~(in_large_hole | in_small_hole)]
+    confs = np.full((pts.shape[0],), 2, dtype=np.uint8)
+    ranges = np.full((pts.shape[0],), 2.0, dtype=np.float64)
+
+    cov = compute_scanned_ground_coverage(pts, confs, ranges)
+    assert len(cov["holes_xy_m"]) == 1
+

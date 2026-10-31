@@ -213,7 +213,14 @@ def convert_recording_to_standard(
         else np.eye(4, dtype=np.float64)
     )
 
-    # 5. Build Yard Frame transform & calibrate North (YS-31, YS-14)
+    walk_start_t_s: float | None = float(poses_rows[0]["t"]) if poses_rows else None
+    walk_end_t_s: float | None = float(poses_rows[-1]["t"]) if poses_rows else None
+    non_done_tap_times = [
+        float(er["t"]) for er in events_rows if er.get("kind", "").strip() not in ("", "done")
+    ]
+    last_tap_t_s: float | None = max(non_done_tap_times) if non_done_tap_times else None
+
+    # 5. Build Yard Frame transform & calibrate North (YS-31, YS-32, YS-14)
     yard_frame_dict = build_yard_frame(
         ground_normal_world=ground_normal_w,
         ground_d_world=ground_d_w,
@@ -221,6 +228,9 @@ def convert_recording_to_standard(
         passes_by_marker=passes_by_marker,
         first_camera_pose_world=first_cam_pose_w,
         pose_jumps=pose_jumps,
+        walk_start_t_s=walk_start_t_s,
+        walk_end_t_s=walk_end_t_s,
+        last_tap_t_s=last_tap_t_s,
     )
     T_yard_from_world: np.ndarray = yard_frame_dict["T_matrix"]
     R_yw = T_yard_from_world[:3, :3]

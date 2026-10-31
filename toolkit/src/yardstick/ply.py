@@ -98,3 +98,4 @@ def read_cloud_ply(ply_path: Path) -> np.ndarray:
     if len(body) != expected_bytes:
         raise ValueError(f"PLY body byte size {len(body)} != expected {expected_bytes} for {n_verts} vertices")
     return np.frombuffer(body, dtype=PLY_VERTEX_DTYPE).copy()
+

@@ -85,7 +85,7 @@ The laptop toolkit uses Python 3.12+ managed with [`uv`](https://github.com/astr
 
 ```bash
 cd toolkit
-uv run pytest
+uv run --extra dev pytest
 uv run yardstick synth --output /tmp/test-walk
 uv run yardstick validate /tmp/test-walk
 uv run yardstick convert /tmp/test-walk

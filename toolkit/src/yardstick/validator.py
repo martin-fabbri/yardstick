@@ -30,7 +30,8 @@ import jsonschema
 import numpy as np
 from PIL import Image
 
-from yardstick.geometry import is_orthonormal_se3, is_simple_polygon, pose_to_matrix
+from yardstick.geometry import is_orthonormal_se3, is_simple_polygon, is_valid_unit_quaternion, pose_to_matrix
+from yardstick.grading import recompute_tape_check
 from yardstick.markers import detect_aruco_markers_opencv
 from yardstick.ply import read_cloud_ply
 
@@ -213,6 +214,17 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
             f"Location/heading calibration status is {loc_obj['status']} (YS-14)",
         )
 
+    # Check YS-41 tape check endpoints vs phone-written measured_m / residual_m
+    for tc in session_data.get("tape_checks", []):
+        rtc = recompute_tape_check(tc)
+        if rtc.get("phone_mismatch", False):
+            add_finding(
+                "tape_check_residual_mismatch",
+                "warning",
+                f"session.json tape_check id={tc.get('id')} phone measured={rtc['phone_measured_m']:.4f}m/res={rtc['phone_residual_m']:.4f}m "
+                f"!= recomputed measured={rtc['measured_m']:.4f}m/res={rtc['residual_m']:.4f}m (YS-41)",
+            )
+
     # Check manifest.json (YS-20, YS-21): for a stopped capture, manifest.json must exist and match all files
     if not manifest_path.exists():
         if is_partial:
@@ -374,16 +386,18 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     prev_t = t_val
                     s_idx = int(row["saved_index"])
                     poses_by_idx[s_idx] = row
+                    qx, qy, qz, qw = float(row["qx"]), float(row["qy"]), float(row["qz"]), float(row["qw"])
                     T = pose_to_matrix(
                         float(row["px"]),
                         float(row["py"]),
                         float(row["pz"]),
-                        float(row["qx"]),
-                        float(row["qy"]),
-                        float(row["qz"]),
-                        float(row["qw"]),
+                        qx,
+                        qy,
+                        qz,
+                        qw,
+                        normalize=False,
                     )
-                    if not is_orthonormal_se3(T, tol=1e-4):
+                    if not is_valid_unit_quaternion(qx, qy, qz, qw, tol=1e-4) or not is_orthonormal_se3(T, tol=1e-4):
                         add_finding("non_orthonormal_pose", "error", f"Pose at saved_index={s_idx} is not orthonormal SE(3)")
                     fx, fy = float(row["fx"]), float(row["fy"])
                     w, h = int(row["width"]), int(row["height"])
@@ -393,7 +407,7 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
     if sorted(poses_by_idx.keys()) != expected_saved:
         add_finding("poses_count_mismatch", "error", f"poses.csv saved_index set does not match 0..{n_saved-1}")
 
-    # Validate depth/ and confidence/ PNGs (YS-04)
+    # Validate depth/ and confidence/ PNGs (YS-04, YS-23: open EVERY image in the recording)
     depth_dir = capture_dir / "depth"
     conf_dir = capture_dir / "confidence"
     if not depth_dir.exists() or not conf_dir.exists():
@@ -408,14 +422,14 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                 f"Expected {n_saved} depth & confidence PNGs, found {len(depth_files)} depth and {len(conf_files)} confidence",
             )
         else:
-            # Sample frames to verify 16-bit depth and 8-bit confidence (0..2)
-            sample_indices = sorted({0, n_saved // 2, max(0, n_saved - 1)}) if n_saved > 0 else []
-            for idx in sample_indices:
+            for idx in range(n_saved):
                 dp = depth_dir / f"{idx:06d}.png"
                 cp = conf_dir / f"{idx:06d}.png"
                 try:
-                    d_arr = np.array(Image.open(dp))
-                    c_arr = np.array(Image.open(cp))
+                    with Image.open(dp) as d_img:
+                        d_arr = np.array(d_img)
+                    with Image.open(cp) as c_img:
+                        c_arr = np.array(c_img)
                 except Exception as exc:
                     add_finding("corrupt_depth_or_conf_png", "error", f"Corrupt or truncated PNG at index {idx:06d}: {exc}")
                     continue
@@ -506,10 +520,30 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     s_idx = int(r["saved_index"])
                     rel_f = r["file"]
                     stills_by_idx[s_idx] = rel_f
+                    sqx, sqy, sqz, sqw = float(r["qx"]), float(r["qy"]), float(r["qz"]), float(r["qw"])
+                    T_s = pose_to_matrix(
+                        float(r["px"]),
+                        float(r["py"]),
+                        float(r["pz"]),
+                        sqx,
+                        sqy,
+                        sqz,
+                        sqw,
+                        normalize=False,
+                    )
+                    if not is_valid_unit_quaternion(sqx, sqy, sqz, sqw, tol=1e-4) or not is_orthonormal_se3(T_s, tol=1e-4):
+                        add_finding("still_pose_not_orthonormal", "error", f"Still pose at saved_index={s_idx} not orthonormal SE(3)")
                     if s_idx not in poses_by_idx:
                         add_finding("still_invalid_saved_index", "error", f"Still references unknown saved_index {s_idx}")
-                    if not (capture_dir / rel_f).exists():
+                    still_fp = capture_dir / rel_f
+                    if not still_fp.exists():
                         add_finding("missing_still_file", "error", f"Still file {rel_f} missing")
+                    else:
+                        try:
+                            with Image.open(still_fp) as s_img:
+                                s_img.load()
+                        except Exception as exc:
+                            add_finding("corrupt_still_file", "error", f"Corrupt still image {rel_f}: {exc}")
 
     # Validate markers.csv & OpenCV agreement on still-backed sightings (YS-30)
     markers_path = capture_dir / "markers.csv"
@@ -534,16 +568,18 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     prev_t = t_val
                     s_idx = int(r["saved_index"])
                     mid = int(r["marker_id"])
+                    mqx, mqy, mqz, mqw = float(r["qx"]), float(r["qy"]), float(r["qz"]), float(r["qw"])
                     T_m = pose_to_matrix(
                         float(r["x"]),
                         float(r["y"]),
                         float(r["z"]),
-                        float(r["qx"]),
-                        float(r["qy"]),
-                        float(r["qz"]),
-                        float(r["qw"]),
+                        mqx,
+                        mqy,
+                        mqz,
+                        mqw,
+                        normalize=False,
                     )
-                    if not is_orthonormal_se3(T_m, tol=1e-4):
+                    if not is_valid_unit_quaternion(mqx, mqy, mqz, mqw, tol=1e-4) or not is_orthonormal_se3(T_m, tol=1e-4):
                         add_finding("marker_pose_not_orthonormal", "error", f"Marker {mid} pose at {s_idx} not orthonormal")
                     if verify_opencv_markers and s_idx in stills_by_idx:
                         still_fp = capture_dir / stills_by_idx[s_idx]
@@ -683,20 +719,45 @@ def validate_standard_capture(capture_dir: Path) -> dict[str, Any]:
             if not is_simple_polygon(h_poly):
                 add_finding("coverage_hole_not_simple", "error", "coverage.json hole polygon is not simple")
 
-    # Verify grade.json floor: distance_m >= largest primary tape residual (YS-41)
+    # Verify grade.json floor & recomputed tape checks (YS-41, YS-42)
     if "grade.json" in loaded_json:
         gr = loaded_json["grade.json"]
         dist_tol = float(gr["tolerances_95pct"]["distance_m"])
-        primary_residuals = [
-            float(tc["residual_m"])
-            for tc in gr.get("tape_checks", [])
-            if tc.get("role", "primary") == "primary"
-        ]
+        primary_residuals: list[float] = []
+        failed_held_out_count = 0
+        for tc in gr.get("tape_checks", []):
+            pa_y = np.array(tc["point_a_yard_m"], dtype=np.float64)
+            pb_y = np.array(tc["point_b_yard_m"], dtype=np.float64)
+            recomp_meas = float(np.linalg.norm(pb_y - pa_y))
+            recomp_res = abs(recomp_meas - float(tc["tape_m"]))
+            if abs(float(tc["measured_m"]) - recomp_meas) > 1e-3 or abs(float(tc["residual_m"]) - recomp_res) > 1e-3:
+                add_finding(
+                    "grade_tape_residual_not_recomputed",
+                    "error",
+                    f"grade.json tape_check id={tc['id']} measured_m/residual_m does not match 3D endpoints (YS-41)",
+                )
+            if tc.get("role", "primary") == "primary":
+                primary_residuals.append(recomp_res)
+            elif tc.get("role") == "held_out":
+                if recomp_res > float(tc["tolerance_at_tape_m"]) + 1e-6:
+                    failed_held_out_count += 1
         if primary_residuals and dist_tol + 1e-9 < max(primary_residuals):
             add_finding(
                 "tolerance_below_tape_residual",
                 "error",
                 f"grade.json distance_m ({dist_tol}) < largest primary tape residual ({max(primary_residuals)}) (YS-41 floor)",
+            )
+        if failed_held_out_count >= 2 and gr["grade"] != "fail":
+            add_finding(
+                "held_out_tape_cap_violated",
+                "error",
+                f"grade.json has {failed_held_out_count} failing held-out tape checks but grade is {gr['grade']} != fail (YS-42)",
+            )
+        elif failed_held_out_count == 1 and gr["grade"] in ("A", "B"):
+            add_finding(
+                "held_out_tape_cap_violated",
+                "error",
+                f"grade.json has 1 failing held-out tape check but grade is {gr['grade']} (must be capped at C, YS-42)",
             )
 
     # Verify cloud.ply binary little-endian format (YS-50)

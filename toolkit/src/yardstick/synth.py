@@ -340,7 +340,7 @@ def generate_synthetic_capture(
 
         r_c_w = r_w_c.T
         for mid, m_pos_w in markers_world.items():
-            is_return_pass = mid == 0 and s_idx >= n_frames - 2
+            is_return_pass = mid == 0 and s_idx >= 18
             if is_return_pass and not opts.include_loop_closure:
                 continue
             m_center = m_pos_w.copy()

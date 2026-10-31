@@ -15,6 +15,31 @@
 import SwiftUI
 import UIKit
 
+#if canImport(ARKit)
+import ARKit
+import SceneKit
+
+/// Live `ARSCNView` camera feed bound to `recorder.arSession` (`YS-40`).
+private struct ARCameraPreviewView: UIViewRepresentable {
+    let session: ARSession
+
+    func makeUIView(context: Context) -> ARSCNView {
+        let view = ARSCNView(frame: .zero)
+        view.session = session
+        view.automaticallyUpdatesLighting = false
+        view.rendersCameraGrain = false
+        view.rendersMotionBlur = false
+        return view
+    }
+
+    func updateUIView(_ uiView: ARSCNView, context: Context) {
+        if uiView.session !== session {
+            uiView.session = session
+        }
+    }
+}
+#endif
+
 /// Main SwiftUI operator interface for Yardstick (`YS-00`, `YS-05`, `YS-07`, `YS-12`, `YS-22`, `YS-40`, `YS-44`).
 ///
 /// Screens:
@@ -105,20 +130,27 @@ public struct ContentView: View {
             Button {
                 recorder.requestPermissionsAndStart()
             } label: {
-                Text("Start Yard Walk")
+                Text(CaptureSessionRecorder.isLiDARSupported ? "Start Yard Walk" : "LiDAR Required (YS-00)")
                     .font(.headline)
                     .foregroundColor(.black)
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(Color.green)
+                    .background(CaptureSessionRecorder.isLiDARSupported ? Color.green : Color.gray)
                     .cornerRadius(12)
             }
+            .disabled(!CaptureSessionRecorder.isLiDARSupported)
         }
         .padding(24)
     }
 
     private var recordingHUDView: some View {
         ZStack {
+            // Live ARKit Camera Preview (YS-40)
+            #if canImport(ARKit)
+            ARCameraPreviewView(session: recorder.arSession)
+                .ignoresSafeArea()
+            #endif
+
             // Center Crosshair for 5x5 LiDAR depth patch tape checks (YS-40)
             VStack {
                 Spacer()
@@ -186,7 +218,10 @@ public struct ContentView: View {
                         recorder.captureTapeEndpointA()
                     }
                     hudButton(title: "Tape B", icon: "b.circle.fill", color: .orange) {
-                        showTapeBKeypad = true
+                        // Lock Endpoint B 3D point immediately at tap time BEFORE opening keypad (YS-40)
+                        if recorder.captureTapeEndpointB() {
+                            showTapeBKeypad = true
+                        }
                     }
                     hudButton(title: "Note", icon: "mic.fill", color: .purple) {
                         recorder.logEvent(kind: "note", detail: "Spoken note anchor")
