@@ -43,7 +43,7 @@ from yardstick.geometry import (
     voxel_downsample_point_cloud,
 )
 from yardstick.grading import compute_grade_and_tolerances
-from yardstick.markers import evaluate_marker_scale_errors
+from yardstick.markers import detect_aruco_markers_opencv, evaluate_marker_scale_errors
 from yardstick.ply import write_cloud_ply
 from yardstick.validator import sha256_file, validate_recording
 
@@ -221,6 +221,25 @@ def convert_recording_to_standard(
     last_tap_t_s: float | None = max(non_done_tap_times) if non_done_tap_times else None
 
     # 5. Build Yard Frame transform & calibrate North (YS-31, YS-32, YS-14)
+    confirmed_marker0_still_indices: set[int] = set()
+    m0_candidate_indices = {
+        int(mr["saved_index"]) for mr in markers_rows if int(mr["marker_id"]) == 0
+    }
+    for s_idx in m0_candidate_indices:
+        if s_idx not in stills_by_saved:
+            continue
+        still_path = capture_dir / stills_by_saved[s_idx]["file"]
+        if not still_path.exists():
+            continue
+        try:
+            with Image.open(still_path) as s_img:
+                gray = np.array(s_img.convert("L"), dtype=np.uint8)
+            dets = detect_aruco_markers_opencv(gray)
+            if 0 in dets:
+                confirmed_marker0_still_indices.add(s_idx)
+        except Exception:
+            continue
+
     yard_frame_dict = build_yard_frame(
         ground_normal_world=ground_normal_w,
         ground_d_world=ground_d_w,
@@ -231,6 +250,9 @@ def convert_recording_to_standard(
         walk_start_t_s=walk_start_t_s,
         walk_end_t_s=walk_end_t_s,
         last_tap_t_s=last_tap_t_s,
+        camera_poses_by_index=camera_poses_world,
+        confirmed_marker0_still_indices=confirmed_marker0_still_indices,
+        max_closing_distance_m=1.50,
     )
     T_yard_from_world: np.ndarray = yard_frame_dict["T_matrix"]
     R_yw = T_yard_from_world[:3, :3]

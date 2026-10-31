@@ -475,6 +475,9 @@ def build_yard_frame(
     walk_start_t_s: float | None = None,
     walk_end_t_s: float | None = None,
     last_tap_t_s: float | None = None,
+    camera_poses_by_index: dict[int, np.ndarray] | None = None,
+    confirmed_marker0_still_indices: set[int] | None = None,
+    max_closing_distance_m: float = 1.50,
 ) -> dict[str, Any]:
     """Construct world_to_yard_transform (4x4) and frame residuals (YS-31, YS-32, YS-51)."""
     z_yard = ground_normal_world / np.linalg.norm(ground_normal_world)
@@ -494,22 +497,33 @@ def build_yard_frame(
     )
 
     m0_has_valid_closing_pass = False
+    valid_closing_m0_rows: list[dict[str, Any]] = []
     if 0 in passes_by_marker and len(passes_by_marker[0]) >= 2:
         last_pass_m0 = passes_by_marker[0][-1]
-        last_m0_t = float(last_pass_m0[-1]["t"])
-        is_valid_closing = True
-        if walk_end_t_s is not None:
-            # YS-32: Closing pass on Marker 0 counts as loop closure ONLY if in the walk's final seconds
-            # (within the last 30 s of the walk, after the last tap event and after other markers).
-            if (walk_end_t_s - last_m0_t) > 30.0:
-                is_valid_closing = False
-            if walk_span_s > 5.0 and (walk_end_t_s - last_m0_t) > min(30.0, 0.35 * walk_span_s):
-                is_valid_closing = False
-        if last_tap_t_s is not None and last_m0_t < last_tap_t_s - 1e-6:
-            is_valid_closing = False
-        if latest_other_marker_t_s is not None and last_m0_t < latest_other_marker_t_s - 1e-6:
-            is_valid_closing = False
-        m0_has_valid_closing_pass = is_valid_closing
+        for r in last_pass_m0:
+            r_t = float(r["t"])
+            r_idx = int(r["saved_index"])
+            if walk_end_t_s is not None:
+                if (walk_end_t_s - r_t) > 30.0:
+                    continue
+                if walk_span_s > 5.0 and (walk_end_t_s - r_t) > min(30.0, 0.35 * walk_span_s):
+                    continue
+            if last_tap_t_s is not None and r_t < last_tap_t_s - 1e-6:
+                continue
+            if latest_other_marker_t_s is not None and r_t < latest_other_marker_t_s - 1e-6:
+                continue
+            if camera_poses_by_index is not None:
+                if r_idx not in camera_poses_by_index:
+                    continue
+                cam_p = camera_poses_by_index[r_idx][:3, 3]
+                m_p = np.array([float(r["x"]), float(r["y"]), float(r["z"])], dtype=np.float64)
+                if float(np.linalg.norm(cam_p - m_p)) > max_closing_distance_m:
+                    continue
+            if confirmed_marker0_still_indices is not None:
+                if r_idx not in confirmed_marker0_still_indices:
+                    continue
+            valid_closing_m0_rows.append(r)
+        m0_has_valid_closing_pass = len(valid_closing_m0_rows) >= 1
 
     loop_closure_gaps: list[dict[str, Any]] = []
     for mid, m_passes in sorted(passes_by_marker.items()):
@@ -517,7 +531,7 @@ def build_yard_frame(
             if mid == 0 and not m0_has_valid_closing_pass:
                 continue
             first_pass = m_passes[0]
-            last_pass = m_passes[-1]
+            last_pass = valid_closing_m0_rows if mid == 0 else m_passes[-1]
             p_first = np.median(
                 np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in first_pass], dtype=np.float64),
                 axis=0,
@@ -578,10 +592,9 @@ def build_yard_frame(
         T_yard_from_world[:3, 3] = t_yard_from_world
 
         origin_residual_m: float | None = None
-        if m0_has_valid_closing_pass and len(passes_by_marker[0]) >= 2:
-            last_pass_m0 = passes_by_marker[0][-1]
+        if m0_has_valid_closing_pass and valid_closing_m0_rows:
             p_m0_last = np.median(
-                np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in last_pass_m0], dtype=np.float64),
+                np.array([[float(r["x"]), float(r["y"]), float(r["z"])] for r in valid_closing_m0_rows], dtype=np.float64),
                 axis=0,
             )
             p_last_yard = R_yard_from_world @ p_m0_last + t_yard_from_world
