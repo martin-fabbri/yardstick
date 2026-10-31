@@ -139,12 +139,12 @@ def generate_synthetic_capture(
     actual_size_m = opts.actual_marker_size_mm / 1000.0
     half_s = actual_size_m / 2.0
 
-    # Markers in ARKit world on ground Y_w = 0:
+    # Markers in ARKit world on ground Y_w = 0 around the smooth circular loop:
     markers_world: dict[int, np.ndarray] = {
         0: np.array([0.0, 0.0, 0.0], dtype=np.float64),
-        1: np.array([5.0, 0.0, 0.0], dtype=np.float64),
-        2: np.array([5.0, 0.0, -4.0], dtype=np.float64),
-        3: np.array([0.0, 0.0, -4.0], dtype=np.float64),
+        1: np.array([2.40, 0.0, -3.70], dtype=np.float64),
+        2: np.array([5.65, 0.0, 0.0], dtype=np.float64),
+        3: np.array([2.40, 0.0, 3.70], dtype=np.float64),
     }
     if not opts.include_marker_0:
         markers_world.pop(0, None)
@@ -152,36 +152,9 @@ def generate_synthetic_capture(
     n_frames = opts.num_saved_frames
     # Camera height = 0.90 m so at 30 deg downward pitch the optical center hits ground at 1.56 m horizontal!
     cam_height_m = 0.90
-    perimeter_waypoints = [
-        (-1.10, 0.0, 0.0),            # 0: Looking at Marker 0 at [0,0,0]
-        (-1.05, 0.0, 0.0),            # 1: Pass 1 on Marker 0
-        (0.5, -0.5, 0.0),
-        (1.5, -0.5, 0.0),
-        (2.5, -0.5, 0.0),
-        (3.90, 0.0, 0.0),             # 5: Looking at Marker 1 at [5,0,0]
-        (3.95, 0.0, 0.0),             # 6: Pass on Marker 1
-        (5.0, -1.0, -math.pi / 2),
-        (5.0, -2.0, -math.pi / 2),
-        (5.0, -2.90, -math.pi / 2),   # 9: Looking at Marker 2 at [5,0,-4]
-        (5.0, -2.95, -math.pi / 2),   # 10: Pass on Marker 2
-        (4.0, -4.0, math.pi),
-        (3.0, -4.0, math.pi),
-        (2.0, -4.0, math.pi),
-        (1.10, -4.0, math.pi),        # 14: Looking at Marker 3 at [0,0,-4]
-        (1.05, -4.0, math.pi),        # 15: Pass on Marker 3
-        (0.0, -3.2, math.pi / 2),
-        (0.0, -2.4, math.pi / 2),
-        (0.0, -1.6, math.pi / 2),
-        (0.0, -0.8, math.pi / 2),
-        (1.5, -2.5, 0.4),
-        (-1.12, 0.0, 0.0),            # 21: Return pass at Marker 0
-        (-1.08, 0.0, 0.0),            # 22: Return pass at Marker 0
-        (-1.02, 0.0, 0.0),            # 23: Final frame on Marker 0
-    ]
-    waypoints: list[tuple[float, float, float]] = []
-    for i in range(n_frames):
-        idx = min(i, len(perimeter_waypoints) - 1)
-        waypoints.append(perimeter_waypoints[idx])
+    cx_loop = 1.85
+    radius_loop = 2.75
+    total_time_steps = float(max(1, (n_frames - 2) + (1 if opts.include_upstream_frame_drop else 0)))
 
     frames_rows: list[dict[str, Any]] = []
     poses_rows: list[dict[str, Any]] = []
@@ -214,25 +187,32 @@ def generate_synthetic_capture(
             )
             t_cursor += dt_step
 
-        # Ensure > 3.0s gap before the return pass so cluster_marker_passes separates Pass 1 and Pass 2
-        if s_idx == n_frames - 2:
-            t_cursor += 3.5
-
-        # If pose_jump_m > 0, make dt <= 0.08 s on the jump frame so detect_pose_jumps triggers!
-        if opts.pose_jump_m > 0.0 and s_idx == n_frames // 2:
-            t_s = round(saved_timestamps[-1] + 0.05, 6)
-            t_cursor = t_s + dt_step
-        else:
-            t_s = round(t_cursor, 6)
-            t_cursor += dt_step
+        t_s = round(t_cursor, 6)
+        t_cursor += dt_step
 
         saved_timestamps.append(t_s)
         all_timestamps.append(t_s)
 
-        wx, wz, yaw_rad = waypoints[s_idx]
-        if opts.pose_jump_m > 0.0 and s_idx == n_frames // 2:
-            wx = waypoints[s_idx - 1][0] + opts.pose_jump_m
-            wz = waypoints[s_idx - 1][1]
+        step_f = (t_s - 100.0) / dt_step
+        theta = (2.0 * math.pi * step_f) / total_time_steps
+        wx = cx_loop - radius_loop * math.cos(theta)
+        wz = -radius_loop * math.sin(theta)
+        if s_idx in (0, 1) or s_idx >= n_frames - 3:
+            target = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+        elif s_idx in (5, 6):
+            target = np.array([2.40, 0.0, -3.70], dtype=np.float64)
+        elif s_idx in (10, 11):
+            target = np.array([5.65, 0.0, 0.0], dtype=np.float64)
+        elif s_idx in (15, 16):
+            target = np.array([2.40, 0.0, 3.70], dtype=np.float64)
+        else:
+            target = np.array([cx_loop, 0.0, 0.0], dtype=np.float64)
+        yaw_rad = math.atan2(float(target[2]) - wz, float(target[0]) - wx)
+        if s_idx == 0:
+            yaw_rad = 0.0
+
+        if opts.pose_jump_m > 0.0 and s_idx >= n_frames // 2:
+            wx += opts.pose_jump_m
 
         cam_pos_w = np.array([wx, cam_height_m, wz], dtype=np.float64)
         r_w_c = _camera_rotation_from_yaw_pitch(yaw_rad, opts.pitch_down_deg)
@@ -298,11 +278,11 @@ def generate_synthetic_capture(
 
         pts_hit_w = cam_pos_w.reshape(1, 1, 3) + z_depth_m[..., None] * rays_w
 
-        # Optional vertical wall at X_w = 6.2 m (YS-51)
-        if opts.include_wall_points and s_idx in (4, 5):
+        # Optional vertical wall at X_w = 5.95 m (YS-51)
+        if opts.include_wall_points and s_idx in (10, 11):
             with np.errstate(divide="ignore", invalid="ignore"):
                 z_wall = np.where(
-                    rays_w[..., 0] > 1e-4, (6.2 - cam_pos_w[0]) / rays_w[..., 0], 999.0
+                    rays_w[..., 0] > 1e-4, (5.95 - cam_pos_w[0]) / rays_w[..., 0], 999.0
                 )
             wall_y = cam_pos_w[1] + z_wall * rays_w[..., 1]
             use_wall = (
@@ -317,13 +297,13 @@ def generate_synthetic_capture(
         ranges_m = z_depth_m * np.sqrt(1.0 + ray_x_c * ray_x_c + ray_y_c * ray_y_c)
         valid_range = (ranges_m >= 0.25) & (ranges_m <= 3.95)
 
-        # Carve an unscanned center void (> 1.0 m^2) at X_w in [1.6, 3.4], Z_w in [-2.9, -1.1] (1.8m x 1.8m = 3.24 m^2)
+        # Carve an unscanned center void (> 1.0 m^2) at X_w in [1.0, 2.6], Z_w in [-0.8, 0.8] (1.6m x 1.6m = 2.56 m^2)
         if opts.include_center_void_hole:
             in_void = (
-                (pts_hit_w[..., 0] >= 1.6)
-                & (pts_hit_w[..., 0] <= 3.4)
-                & (pts_hit_w[..., 2] >= -2.9)
-                & (pts_hit_w[..., 2] <= -1.1)
+                (pts_hit_w[..., 0] >= 1.0)
+                & (pts_hit_w[..., 0] <= 2.6)
+                & (pts_hit_w[..., 2] >= -0.8)
+                & (pts_hit_w[..., 2] <= 0.8)
             )
             valid_range = valid_range & (~in_void)
 
@@ -340,11 +320,15 @@ def generate_synthetic_capture(
 
         r_c_w = r_w_c.T
         for mid, m_pos_w in markers_world.items():
-            is_return_pass = mid == 0 and s_idx >= 18
+            if mid == 0 and 2 <= s_idx < n_frames - 3:
+                continue
+            is_return_pass = mid == 0 and s_idx >= n_frames - 3
             if is_return_pass and not opts.include_loop_closure:
                 continue
             m_center = m_pos_w.copy()
             if is_return_pass:
+                if opts.pose_jump_m > 0.0 and s_idx >= n_frames // 2:
+                    m_center[0] += opts.pose_jump_m
                 m_center[0] += opts.loop_drift_xy_m[0]
                 m_center[2] -= opts.loop_drift_xy_m[1]
 
@@ -450,7 +434,7 @@ def generate_synthetic_capture(
         rgb_frames_for_video.append(rgb_img)
 
         # Save still every 2 frames or on marker frames
-        if s_idx % 2 == 0 or s_idx in (0, 1, 5, 6, 9, 10, 14, 15, n_frames - 3, n_frames - 2, n_frames - 1):
+        if s_idx % 2 == 0 or s_idx in (0, 1, 5, 6, 10, 11, 15, 16, n_frames - 3, n_frames - 2, n_frames - 1):
             still_rel = f"stills/{s_idx:06d}.jpg"
             Image.fromarray(rgb_img, mode="RGB").save(out_dir / still_rel, quality=95)
             stills_rows.append(

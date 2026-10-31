@@ -341,41 +341,126 @@ def detect_pose_jumps(
     poses_rows: list[dict[str, Any]],
     jump_threshold_m: float = 0.08,
     max_dt_s: float = 0.10,
+    max_step_dt_s: float = 2.50,
+    max_ramp_dt_s: float = 0.80,
 ) -> list[dict[str, Any]]:
-    """Detect non-physical ARKit relocalization snaps (> 0.08 m within 0.10 s across 1..2 frames) (YS-32, Q026)."""
-    jumps: list[dict[str, Any]] = []
-    used_indices: set[int] = set()
+    """Detect non-physical ARKit relocalization snaps and multi-frame ramps against local walk velocity (YS-32, Q026)."""
     n = len(poses_rows)
-    for i in range(1, n):
-        if i in used_indices:
+    if n < 2:
+        return []
+    pos = np.array(
+        [[float(r["px"]), float(r["py"]), float(r["pz"])] for r in poses_rows],
+        dtype=np.float64,
+    )
+    ts = np.array([float(r["t"]) for r in poses_rows], dtype=np.float64)
+    s_idx = [int(r["saved_index"]) for r in poses_rows]
+
+    dp = np.diff(pos, axis=0)
+    dt = np.diff(ts)
+    valid_dt = np.where(dt > 1e-6, dt, 1e-6)
+    vel = dp / valid_dt[:, None]
+    speeds = np.linalg.norm(vel, axis=1)
+    m = len(vel)
+
+    # 1. Single-step snaps (including across frame-drop gaps > 0.10 s up to max_step_dt_s)
+    # Compare each step displacement against the speed-preserving midpoint-time velocity prediction.
+    raw_res = np.zeros(m, dtype=np.float64)
+    for k in range(m):
+        if dt[k] <= 0.0 or dt[k] > max_step_dt_s:
             continue
-        p_curr = np.array(
-            [float(poses_rows[i]["px"]), float(poses_rows[i]["py"]), float(poses_rows[i]["pz"])],
-            dtype=np.float64,
-        )
-        t_curr = float(poses_rows[i]["t"])
-        for step in (1, 2):
-            j = i - step
-            if j < 0 or any(k in used_indices for k in range(j + 1, i + 1)):
-                continue
-            p_prev = np.array(
-                [float(poses_rows[j]["px"]), float(poses_rows[j]["py"]), float(poses_rows[j]["pz"])],
-                dtype=np.float64,
+        if m == 1:
+            v_hat = np.zeros(3, dtype=np.float64)
+        elif 0 < k < m - 1:
+            denom = dt[k - 1] + 2.0 * dt[k] + dt[k + 1]
+            w_l = (dt[k] + dt[k + 1]) / denom
+            w_r = (dt[k] + dt[k - 1]) / denom
+            v_lin = w_l * vel[k - 1] + w_r * vel[k + 1]
+            n_lin = float(np.linalg.norm(v_lin))
+            s_hat = float(w_l * speeds[k - 1] + w_r * speeds[k + 1])
+            v_hat = (v_lin / n_lin) * s_hat if n_lin > 1e-6 else v_lin
+        elif k == 0:
+            if m >= 3:
+                tau01 = dt[0] + dt[1]
+                tau12 = max(dt[1] + dt[2], 1e-6)
+                v_lin = vel[1] - (tau01 / tau12) * (vel[2] - vel[1])
+                n_lin = float(np.linalg.norm(v_lin))
+                v_hat = (v_lin / n_lin) * float(speeds[1]) if n_lin > 1e-6 else v_lin
+            else:
+                v_hat = vel[1]
+        else:
+            if m >= 3:
+                tau_a = dt[m - 1] + dt[m - 2]
+                tau_b = max(dt[m - 2] + dt[m - 3], 1e-6)
+                v_lin = vel[m - 2] + (tau_a / tau_b) * (vel[m - 2] - vel[m - 3])
+                n_lin = float(np.linalg.norm(v_lin))
+                v_hat = (v_lin / n_lin) * float(speeds[m - 2]) if n_lin > 1e-6 else v_lin
+            else:
+                v_hat = vel[m - 2]
+        raw_res[k] = float(np.linalg.norm(dp[k] - v_hat * dt[k]))
+
+    used_steps: set[int] = set()
+    jumps: list[dict[str, Any]] = []
+    for k in range(m):
+        if raw_res[k] <= jump_threshold_m:
+            continue
+        left_r = raw_res[k - 1] if k > 0 else 0.0
+        right_r = raw_res[k + 1] if k + 1 < m else 0.0
+        if raw_res[k] >= left_r and raw_res[k] >= right_r:
+            used_steps.add(k)
+            jumps.append(
+                {
+                    "saved_index_from": s_idx[k],
+                    "saved_index_to": s_idx[k + 1],
+                    "t_s": round(float(ts[k + 1]), 6),
+                    "jump_m": round(float(raw_res[k]), 6),
+                }
             )
-            dt = t_curr - float(poses_rows[j]["t"])
-            dist = float(np.linalg.norm(p_curr - p_prev))
-            if 0.0 < dt <= max_dt_s and dist > jump_threshold_m:
-                jumps.append(
-                    {
-                        "saved_index_from": int(poses_rows[j]["saved_index"]),
-                        "saved_index_to": int(poses_rows[i]["saved_index"]),
-                        "t_s": round(t_curr, 6),
-                        "jump_m": round(dist, 6),
-                    }
-                )
-                for k in range(j + 1, i + 1):
-                    used_indices.add(k)
-                break
+
+    # 2. Multi-frame ramps (2..20 frames within max_ramp_dt_s) where pre-ramp and post-ramp velocities agree
+    ramp_candidates: list[tuple[float, float, int, int, float]] = []
+    max_w = min(20, m)
+    for w in range(2, max_w + 1):
+        for j in range(1, n - w - 1):
+            i = j + w
+            if any(st in used_steps for st in range(j - 1, i + 1)):
+                continue
+            dt_win = float(ts[i] - ts[j])
+            if dt_win <= 0.0 or dt_win > max_ramp_dt_s:
+                continue
+            v_pre = vel[j - 1]
+            v_post = vel[i]
+            if float(np.linalg.norm(v_post - v_pre)) * dt_win > 0.5 * jump_threshold_m:
+                continue
+            v_hat = 0.5 * (v_pre + v_post)
+            diff_vec = (pos[i] - pos[j]) - v_hat * dt_win
+            res_m = float(np.linalg.norm(diff_vec))
+            if res_m > jump_threshold_m:
+                u_ramp = diff_vec / res_m
+                step_excess = [
+                    float(np.dot(dp[st] - v_hat * dt[st], u_ramp))
+                    for st in range(j, i)
+                ]
+                if min(step_excess) <= 0.002:
+                    continue
+                score = res_m - 1e-4 * w
+                ramp_candidates.append((score, res_m, j, i, float(ts[i])))
+
+    ramp_candidates.sort(key=lambda c: c[0], reverse=True)
+    for _, res_m, j, i, t_s in ramp_candidates:
+        step_range = set(range(j, i))
+        if step_range & used_steps:
+            continue
+        used_steps |= step_range
+        jumps.append(
+            {
+                "saved_index_from": s_idx[j],
+                "saved_index_to": s_idx[i],
+                "t_s": round(t_s, 6),
+                "jump_m": round(res_m, 6),
+            }
+        )
+
+    jumps.sort(key=lambda x: int(x["saved_index_from"]))
     return jumps
 
 
