@@ -26,17 +26,286 @@ import simd
 import ARKit
 #endif
 
+/// Sendable wrapper for a cloned `CVPixelBuffer` transferred strictly from the ARFrame callback to `writerQueue`.
+private struct SendablePixelBuffer: @unchecked Sendable {
+    let buffer: CVPixelBuffer
+}
+
+/// Sendable wrapper for an audio `CMSampleBuffer` transferred strictly from the ARSession audio callback to `writerQueue`.
+private struct SendableAudioSampleBuffer: @unchecked Sendable {
+    let buffer: CMSampleBuffer
+}
+
+/// Serial-queue disk writer engine confined strictly to `writerQueue` so no file I/O ever runs on `@MainActor`
+/// and non-Sendable AVFoundation/FileHandle objects never cross concurrency domains (Blockers 3, 4, 5, 6).
+private final class CaptureWriterEngine: @unchecked Sendable {
+    let captureDirURL: URL
+    let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+
+    var assetWriter: AVAssetWriter?
+    var videoWriterInput: AVAssetWriterInput?
+    var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
+    var videoSessionStarted: Bool = false
+
+    var framesFH: FileHandle?
+    var posesFH: FileHandle?
+    var stillsFH: FileHandle?
+    var markersFH: FileHandle?
+    var eventsFH: FileHandle?
+    var audioFH: FileHandle?
+
+    var audioConverter: AVAudioConverter?
+    var audioInputFormat: AVAudioFormat?
+    let audioOutputFormat: AVAudioFormat? = AVAudioFormat(
+        commonFormat: .pcmFormatInt16,
+        sampleRate: 16000.0,
+        channels: 1,
+        interleaved: true
+    )
+
+    var savedFrameCount: Int = 0
+    var droppedFrameCount: Int = 0
+    var audioPCMByteCount: UInt32 = 0
+    var audioFirstSampleTS: Double? = nil
+    var lastStillSavedTimeS: Double = -10.0
+    var savedStillsIndices: Set<Int> = []
+    var isClosed: Bool = false
+
+    init(captureDirURL: URL, width: Int, height: Int) throws {
+        self.captureDirURL = captureDirURL
+        let fm = FileManager.default
+        try fm.createDirectory(at: captureDirURL.appendingPathComponent("depth"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: captureDirURL.appendingPathComponent("confidence"), withIntermediateDirectories: true)
+        try fm.createDirectory(at: captureDirURL.appendingPathComponent("stills"), withIntermediateDirectories: true)
+
+        try Self.createFileWithHeader(
+            "t,saved_index,dropped,drop_reason,tracking_state,tracking_reason\n",
+            at: captureDirURL.appendingPathComponent("frames.csv")
+        )
+        try Self.createFileWithHeader(
+            "t,saved_index,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n",
+            at: captureDirURL.appendingPathComponent("poses.csv")
+        )
+        try Self.createFileWithHeader(
+            "t,saved_index,file,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n",
+            at: captureDirURL.appendingPathComponent("stills.csv")
+        )
+        try Self.createFileWithHeader(
+            "t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v\n",
+            at: captureDirURL.appendingPathComponent("markers.csv")
+        )
+        try Self.createFileWithHeader(
+            "t,saved_index,kind,detail\n",
+            at: captureDirURL.appendingPathComponent("events.csv")
+        )
+        try Self.initializeAudioWavHeader(at: captureDirURL.appendingPathComponent("audio.wav"))
+
+        self.framesFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("frames.csv"))
+        try self.framesFH?.seekToEnd()
+        self.posesFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("poses.csv"))
+        try self.posesFH?.seekToEnd()
+        self.stillsFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("stills.csv"))
+        try self.stillsFH?.seekToEnd()
+        self.markersFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("markers.csv"))
+        try self.markersFH?.seekToEnd()
+        self.eventsFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("events.csv"))
+        try self.eventsFH?.seekToEnd()
+        self.audioFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("audio.wav"))
+        try self.audioFH?.seekToEnd()
+
+        let videoURL = captureDirURL.appendingPathComponent("rgb.mp4")
+        let writer = try AVAssetWriter(outputURL: videoURL, fileType: .mp4)
+        writer.movieFragmentInterval = CMTime(seconds: 5.0, preferredTimescale: 600)
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.hevc,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = true
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ]
+        )
+        guard writer.canAdd(input) else {
+            throw NSError(domain: "Yardstick", code: -2, userInfo: [NSLocalizedDescriptionKey: "Cannot add video input to AVAssetWriter"])
+        }
+        writer.add(input)
+        guard writer.startWriting() else {
+            throw writer.error ?? NSError(domain: "Yardstick", code: -1, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter startWriting failed"])
+        }
+        self.assetWriter = writer
+        self.videoWriterInput = input
+        self.pixelBufferAdaptor = adaptor
+    }
+
+    private static func createFileWithHeader(_ header: String, at url: URL) throws {
+        guard let data = header.data(using: .utf8) else {
+            throw NSError(domain: "Yardstick", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to encode CSV header as UTF-8"])
+        }
+        try data.write(to: url, options: .atomic)
+    }
+
+    private static func initializeAudioWavHeader(at url: URL) throws {
+        var header = Data(count: 44)
+        header.replaceSubrange(0..<4, with: "RIFF".data(using: .ascii)!)
+        header.replaceSubrange(8..<12, with: "WAVE".data(using: .ascii)!)
+        header.replaceSubrange(12..<16, with: "fmt ".data(using: .ascii)!)
+        var fmtChunkSize: UInt32 = 16
+        var audioFormat: UInt16 = 1  // PCM
+        var numChannels: UInt16 = 1
+        var sampleRate: UInt32 = 16000
+        var byteRate: UInt32 = 32000
+        var blockAlign: UInt16 = 2
+        var bitsPerSample: UInt16 = 16
+        withUnsafeBytes(of: &fmtChunkSize) { header.replaceSubrange(16..<20, with: $0) }
+        withUnsafeBytes(of: &audioFormat) { header.replaceSubrange(20..<22, with: $0) }
+        withUnsafeBytes(of: &numChannels) { header.replaceSubrange(22..<24, with: $0) }
+        withUnsafeBytes(of: &sampleRate) { header.replaceSubrange(24..<28, with: $0) }
+        withUnsafeBytes(of: &byteRate) { header.replaceSubrange(28..<32, with: $0) }
+        withUnsafeBytes(of: &blockAlign) { header.replaceSubrange(32..<34, with: $0) }
+        withUnsafeBytes(of: &bitsPerSample) { header.replaceSubrange(34..<36, with: $0) }
+        header.replaceSubrange(36..<40, with: "data".data(using: .ascii)!)
+        try header.write(to: url, options: .atomic)
+    }
+
+    func appendLine(_ line: String, to fh: FileHandle?) throws {
+        guard let data = line.data(using: .utf8) else {
+            throw NSError(domain: "Yardstick", code: -4, userInfo: [NSLocalizedDescriptionKey: "UTF-8 string encoding returned nil"])
+        }
+        guard let fh else {
+            throw NSError(domain: "Yardstick", code: -5, userInfo: [NSLocalizedDescriptionKey: "Stream FileHandle is nil"])
+        }
+        try fh.write(contentsOf: data)
+    }
+
+    /// Convert `CMSampleBuffer` audio to 16,000 Hz mono Int16 PCM using stateful `AVAudioConverter` (`YS-06`).
+    func appendAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer) throws {
+        guard let outFmt = audioOutputFormat else {
+            throw NSError(domain: "Yardstick", code: -10, userInfo: [NSLocalizedDescriptionKey: "16 kHz output AVAudioFormat unavailable"])
+        }
+        guard let fmtDesc = CMSampleBufferGetFormatDescription(sampleBuffer) else {
+            throw NSError(domain: "Yardstick", code: -11, userInfo: [NSLocalizedDescriptionKey: "CMSampleBuffer missing audio format description"])
+        }
+        let inFmt = AVAudioFormat(cmAudioFormatDescription: fmtDesc)
+        let numFrames = AVAudioFrameCount(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard numFrames > 0, inFmt.sampleRate > 0 else {
+            throw NSError(domain: "Yardstick", code: -12, userInfo: [NSLocalizedDescriptionKey: "Empty or zero-rate audio CMSampleBuffer"])
+        }
+
+        if audioConverter == nil || audioInputFormat != inFmt {
+            guard let conv = AVAudioConverter(from: inFmt, to: outFmt) else {
+                throw NSError(domain: "Yardstick", code: -13, userInfo: [NSLocalizedDescriptionKey: "Failed to create AVAudioConverter from \(inFmt) to 16 kHz mono Int16"])
+            }
+            audioConverter = conv
+            audioInputFormat = inFmt
+        }
+        guard let conv = audioConverter else {
+            throw NSError(domain: "Yardstick", code: -14, userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter unavailable"])
+        }
+
+        guard let inPCMBuffer = AVAudioPCMBuffer(pcmFormat: inFmt, frameCapacity: numFrames) else {
+            throw NSError(domain: "Yardstick", code: -15, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate input AVAudioPCMBuffer"])
+        }
+        inPCMBuffer.frameLength = numFrames
+        let copyStatus = CMSampleBufferCopyPCMDataIntoAudioBufferList(
+            sampleBuffer,
+            at: 0,
+            frameCount: Int32(numFrames),
+            into: inPCMBuffer.mutableAudioBufferList
+        )
+        guard copyStatus == noErr else {
+            throw NSError(domain: "Yardstick", code: Int(copyStatus), userInfo: [NSLocalizedDescriptionKey: "CMSampleBufferCopyPCMDataIntoAudioBufferList failed (\(copyStatus))"])
+        }
+
+        let ratio = outFmt.sampleRate / inFmt.sampleRate
+        let outCapacity = AVAudioFrameCount(ceil(Double(numFrames) * ratio) + 32)
+        guard let outPCMBuffer = AVAudioPCMBuffer(pcmFormat: outFmt, frameCapacity: outCapacity) else {
+            throw NSError(domain: "Yardstick", code: -16, userInfo: [NSLocalizedDescriptionKey: "Failed to allocate output AVAudioPCMBuffer"])
+        }
+
+        var providedInput = false
+        var convError: NSError?
+        let status = conv.convert(to: outPCMBuffer, error: &convError) { _, outStatus in
+            if providedInput {
+                outStatus.pointee = .noDataNow
+                return nil
+            }
+            providedInput = true
+            outStatus.pointee = .haveData
+            return inPCMBuffer
+        }
+        if status == .error {
+            throw convError ?? NSError(domain: "Yardstick", code: -17, userInfo: [NSLocalizedDescriptionKey: "AVAudioConverter conversion error"])
+        }
+
+        let outFrames = Int(outPCMBuffer.frameLength)
+        if outFrames > 0, let int16Ptr = outPCMBuffer.int16ChannelData?[0] {
+            let byteCount = outFrames * MemoryLayout<Int16>.size
+            let pcmData = Data(bytes: int16Ptr, count: byteCount)
+            guard let aFH = audioFH else {
+                throw NSError(domain: "Yardstick", code: -18, userInfo: [NSLocalizedDescriptionKey: "audio.wav FileHandle is closed"])
+            }
+            try aFH.write(contentsOf: pcmData)
+            audioPCMByteCount &+= UInt32(byteCount)
+        }
+    }
+
+    /// Finalize `audio.wav` RIFF/data chunk sizes, finish `rgb.mp4`, and close all open file handles.
+    /// Does NOT call `handleStreamFailure` so it can never cause recursive failure loops (Blocker 6).
+    func finishStreamsAndCloseFiles() throws {
+        guard !isClosed else { return }
+        isClosed = true
+
+        try? framesFH?.close()
+        try? posesFH?.close()
+        try? stillsFH?.close()
+        try? markersFH?.close()
+        try? eventsFH?.close()
+
+        var audioFinalizeErr: Error?
+        if let aFH = audioFH {
+            do {
+                var riffSize: UInt32 = (36 &+ audioPCMByteCount).littleEndian
+                var dataSize: UInt32 = audioPCMByteCount.littleEndian
+                try aFH.seek(toOffset: 4)
+                try aFH.write(contentsOf: withUnsafeBytes(of: &riffSize) { Data($0) })
+                try aFH.seek(toOffset: 40)
+                try aFH.write(contentsOf: withUnsafeBytes(of: &dataSize) { Data($0) })
+                try aFH.close()
+            } catch {
+                audioFinalizeErr = error
+            }
+        }
+        audioFH = nil
+
+        if let writer = assetWriter, writer.status == .writing {
+            if videoSessionStarted {
+                videoWriterInput?.markAsFinished()
+                let sema = DispatchSemaphore(value: 0)
+                writer.finishWriting {
+                    sema.signal()
+                }
+                _ = sema.wait(timeout: .now() + 15.0)
+                if writer.status == .failed {
+                    throw writer.error ?? NSError(domain: "Yardstick", code: -20, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter finishWriting failed"])
+                }
+            } else {
+                writer.cancelWriting()
+            }
+        }
+
+        if let audioFinalizeErr {
+            throw audioFinalizeErr
+        }
+    }
+}
+
 /// Crash-safe, zero-`ARFrame`-retention LiDAR capture session recorder (`YS-00`–`YS-14`, `YS-21`, `YS-22`, `YS-30`–`YS-33`, `YS-40`–`YS-44`).
-///
-/// Key engineering invariants (`docs/DESIGN.md`):
-/// 1. **Zero `ARFrame` retention**: inside `session(_:didUpdate:)`, pixel buffers and transforms are copied out
-///    synchronously in < 2 ms and dispatched to `writerQueue`; the `ARFrame` reference is never stored.
-/// 2. **Gravity-only world alignment (`YS-03`, `Q020`)**: `.gravity` prevents magnetometer yaw spikes mid-walk;
-///    True North is calibrated at Marker 0 at start using >= 10 heading pairs (`YS-14`).
-/// 3. **Single-clock audio (`YS-01`, `YS-06`, `Q018`)**: `providesAudioData = true` delivers audio on the exact
-///    same monotonic host clock as `ARFrame.timestamp`, resampled to 16 kHz mono 16-bit PCM `audio.wav`.
-/// 4. **Crash safety (`YS-08`, `YS-09`, `YS-10`)**: `isIdleTimerDisabled = true`, `movieFragmentInterval = 5s`
-///    on `AVAssetWriter`, explicit stream write error handling, and interruption/background observers.
 @MainActor
 public final class CaptureSessionRecorder: NSObject, ObservableObject {
     public enum SessionPhase: String, Sendable {
@@ -76,32 +345,26 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     #endif
 
     private let writerQueue = DispatchQueue(label: "io.yardstick.capture.writer", qos: .userInitiated)
-    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
     private let locationManager = CLLocationManager()
     private var notificationObservers: [NSObjectProtocol] = []
+    private var writerEngine: CaptureWriterEngine?
 
     private var captureDirURL: URL?
     private var t0MonotonicS: Double?
     private var audioFirstSampleTS: Double?
     private var startedAtUTC: String = ""
     private var lastHeartbeatS: Double = 0.0
-    private var lastStillSavedTimeS: Double = -10.0
     private var lastNorthSampleTimeS: Double = -10.0
     private var lastDeliveredFrameTimestampS: Double?
     private var pendingForceMarkerDetect: Bool = false
+    private var pendingWriterJobs: Int = 0
 
-    private let requestedWidth: Int = 1920
-    private let requestedHeight: Int = 1440
-    private let requestedFPS: Int = 30
+    private var requestedWidth: Int = 1920
+    private var requestedHeight: Int = 1440
+    private var requestedFPS: Int = 30
     private var actualWidth: Int = 1920
     private var actualHeight: Int = 1440
     private var actualFPS: Int = 30
-
-    private var assetWriter: AVAssetWriter?
-    private var videoWriterInput: AVAssetWriterInput?
-    private var pixelBufferAdaptor: AVAssetWriterInputPixelBufferAdaptor?
-    private var videoSessionStarted: Bool = false
-    private var pendingWriterJobs: Int = 0
 
     private var latestCameraTransform: simd_double4x4 = matrix_identity_double4x4
     private var latestCrosshairWorld: SIMD3<Double>?
@@ -123,8 +386,33 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var pendingTapeATimeS: Double = 0.0
     private var pendingTapeBSavedIndex: Int = 0
     private var pendingTapeBTimeS: Double = 0.0
-    private var audioPCMByteCount: UInt32 = 0
-    private var savedStillsIndices: Set<Int> = []
+    private var provisionalDistanceTolerance10m: Double = 0.05
+    private var activeBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
+
+    private func beginSealingBackgroundTask(name: String) {
+        endSealingBackgroundTask()
+        activeBackgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
+            Task { @MainActor in
+                self?.endSealingBackgroundTask()
+            }
+        }
+    }
+
+    private func endSealingBackgroundTask() {
+        if activeBackgroundTaskID != .invalid {
+            UIApplication.shared.endBackgroundTask(activeBackgroundTaskID)
+            activeBackgroundTaskID = .invalid
+        }
+    }
+
+    /// Precomputed 256-entry IEEE 802.3 CRC-32 lookup table (`0xEDB88320`) for fast streaming ZIP packaging (Blocker 4).
+    nonisolated private static let crc32Table: [UInt32] = (0..<256).map { i -> UInt32 in
+        var c = UInt32(i)
+        for _ in 0..<8 {
+            c = (c & 1 != 0) ? (0xEDB88320 ^ (c >> 1)) : (c >> 1)
+        }
+        return c
+    }
 
     public override init() {
         super.init()
@@ -136,7 +424,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         registerLifecycleObservers()
     }
 
-    /// Exact hardware model identifier (e.g. `"iPhone18,1"`) via `uname` (`YS-00`).
+    /// Exact hardware model identifier (e.g. `"iPhone18,2"`) via `uname` (`YS-00`).
     public static var hardwareModelIdentifier: String {
         var sysinfo = utsname()
         uname(&sysinfo)
@@ -158,17 +446,11 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         #endif
     }
 
+    /// Observe only actual backgrounding (`didEnterBackground`) and audio/AR session interruptions,
+    /// NOT `willResignActiveNotification`, so permission alerts, Control Center, and notification banners
+    /// never abort the walk (Blocker 1).
     private func registerLifecycleObservers() {
         let nc = NotificationCenter.default
-        let resignObs = nc.addObserver(
-            forName: UIApplication.willResignActiveNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.handleInterruption(stopReason: "backgrounded")
-            }
-        }
         let bgObs = nc.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil,
@@ -190,7 +472,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                 }
             }
         }
-        notificationObservers = [resignObs, bgObs, audioObs]
+        notificationObservers = [bgObs, audioObs]
     }
 
     public func toggleMarkerSize(for markerID: Int) {
@@ -237,90 +519,78 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         marker0FirstPassTimeS = nil
         marker0LastPassTimeS = nil
         marker0MaxExcursionM = 0.0
-        audioPCMByteCount = 0
         t0MonotonicS = nil
         audioFirstSampleTS = nil
-        lastStillSavedTimeS = -10.0
         lastNorthSampleTimeS = -10.0
         lastDeliveredFrameTimestampS = nil
         pendingWriterJobs = 0
-        savedStillsIndices.removeAll()
+        provisionalGrade = "—"
+        provisionalReasons = []
+        provisionalDistanceTolerance10m = 0.05
+        archiveZipURL = nil
+
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+        let config = ARWorldTrackingConfiguration()
+        config.worldAlignment = .gravity
+        config.providesAudioData = true
+        config.environmentTexturing = .none
+        config.isAutoFocusEnabled = true
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics = [.sceneDepth]
+        }
+
+        // Explicitly select highest-resolution 4:3 format at 30 fps (or highest-resolution 30 fps format),
+        // never falling back to a 60 fps `.first` format when 30 fps is supported (`YS-03`, Blocker 5).
+        let supported = ARWorldTrackingConfiguration.supportedVideoFormats
+        let formats30 = supported.filter { $0.framesPerSecond == 30 }
+        let candidatePool = formats30.isEmpty ? supported : formats30
+        let fourByThreePool = candidatePool.filter { fmt in
+            let w = Int(fmt.imageResolution.width)
+            let h = Int(fmt.imageResolution.height)
+            return abs(w * 3 - h * 4) <= 8
+        }
+        let bestPool = fourByThreePool.isEmpty ? candidatePool : fourByThreePool
+        let chosenFormat = bestPool.max { a, b in
+            let areaA = Int(a.imageResolution.width) * Int(a.imageResolution.height)
+            let areaB = Int(b.imageResolution.width) * Int(b.imageResolution.height)
+            return areaA < areaB
+        }
+
+        if let fmt = chosenFormat {
+            config.videoFormat = fmt
+            requestedWidth = Int(fmt.imageResolution.width)
+            requestedHeight = Int(fmt.imageResolution.height)
+            requestedFPS = fmt.framesPerSecond
+            actualWidth = requestedWidth
+            actualHeight = requestedHeight
+            actualFPS = requestedFPS
+        }
+        #endif
 
         do {
-            try FileManager.default.createDirectory(at: dir.appendingPathComponent("depth"), withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: dir.appendingPathComponent("confidence"), withIntermediateDirectories: true)
-            try FileManager.default.createDirectory(at: dir.appendingPathComponent("stills"), withIntermediateDirectories: true)
-            try initializeCSVFiles(in: dir)
-            try initializeAudioWavHeader(at: dir.appendingPathComponent("audio.wav"))
+            let engine = try CaptureWriterEngine(captureDirURL: dir, width: actualWidth, height: actualHeight)
+            self.writerEngine = engine
 
             #if canImport(ARKit) && !targetEnvironment(simulator)
-            let config = ARWorldTrackingConfiguration()
-            config.worldAlignment = .gravity
-            config.providesAudioData = true
-            config.environmentTexturing = .none
-            config.isAutoFocusEnabled = true
-            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-                config.frameSemantics = [.sceneDepth]
-            }
-            if let fmt = ARWorldTrackingConfiguration.supportedVideoFormats.first(where: {
-                Int($0.imageResolution.width) == requestedWidth
-                    && Int($0.imageResolution.height) == requestedHeight
-                    && $0.framesPerSecond == requestedFPS
-            }) ?? ARWorldTrackingConfiguration.supportedVideoFormats.first {
-                config.videoFormat = fmt
-                actualWidth = Int(fmt.imageResolution.width)
-                actualHeight = Int(fmt.imageResolution.height)
-                actualFPS = fmt.framesPerSecond
-            }
-            try initializeVideoWriter(at: dir.appendingPathComponent("rgb.mp4"), width: actualWidth, height: actualHeight)
             arSession.run(config, options: [.resetTracking, .removeExistingAnchors])
-            #else
-            try initializeVideoWriter(at: dir.appendingPathComponent("rgb.mp4"), width: actualWidth, height: actualHeight)
             #endif
 
-            writeSessionJSON(in: dir, status: "recording", stopReason: nil, failedStream: nil)
+            let snapData = makeSessionJSONData(status: "recording", stopReason: nil, failedStream: nil)
+            writerQueue.async {
+                Self.writeSessionJSONDataOnQueue(snapData, in: dir)
+            }
             phase = .recording
-            statusBanner = "Recording — hold steady on Marker 0 for North & Origin"
+            statusBanner = "Recording (\(actualWidth)×\(actualHeight)@\(actualFPS)fps) — hold on Marker 0"
         } catch {
             UIApplication.shared.isIdleTimerDisabled = false
             phase = .failed
-            statusBanner = "Failed to initialize capture directory: \(error.localizedDescription)"
+            statusBanner = "Failed to initialize capture: \(error.localizedDescription)"
         }
     }
 
-    private func initializeVideoWriter(at url: URL, width: Int, height: Int) throws {
-        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
-        writer.movieFragmentInterval = CMTime(seconds: 5.0, preferredTimescale: 600)
-        let settings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-        ]
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
-        input.expectsMediaDataInRealTime = true
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange),
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-            ]
-        )
-        if writer.canAdd(input) {
-            writer.add(input)
-        }
-        guard writer.startWriting() else {
-            throw writer.error ?? NSError(domain: "Yardstick", code: -1, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter startWriting failed"])
-        }
-        assetWriter = writer
-        videoWriterInput = input
-        pixelBufferAdaptor = adaptor
-        videoSessionStarted = false
-    }
-
-    /// Record a timed user event (`marker`, `tape_a`, `tape_b`, `note`, `done`, `YS-07`).
+    /// Record a timed user event (`marker`, `tape_a`, `tape_b`, `note`, `done`, `YS-07`) on `writerQueue`.
     public func logEvent(kind: String, detail: String) {
-        guard let dir = captureDirURL, phase == .recording else { return }
+        guard phase == .recording, let engine = writerEngine else { return }
         if kind == "marker" {
             pendingForceMarkerDetect = true
         }
@@ -328,7 +598,15 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let sIdx = max(0, latestSavedIndex)
         let safeDetail = detail.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
         let line = String(format: "%.6f,%d,%@,%@\n", t, sIdx, kind, safeDetail)
-        appendString(line, to: dir.appendingPathComponent("events.csv"), stream: "events")
+        writerQueue.async { [weak self] in
+            do {
+                try engine.appendLine(line, to: engine.eventsFH)
+            } catch {
+                Task { @MainActor in
+                    self?.handleStreamFailure(stream: "events", message: error.localizedDescription)
+                }
+            }
+        }
     }
 
     /// Capture Endpoint A of a tape-measure check using the live 5x5 center crosshair LiDAR patch (`YS-40`).
@@ -397,54 +675,64 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         statusBanner = String(format: "Tape #%d logged: |%.2fm - %.2fm| = %.1f cm", checkID + 1, measuredM, tapeMeters, residualM * 100.0)
     }
 
-    /// Handle an unexpected stream write error explicitly (`YS-10`).
+    /// Handle an unexpected stream write error explicitly without recursive failure loops (`YS-10`, Blocker 6).
     public func handleStreamFailure(stream: String, message: String) {
-        guard phase == .recording, let dir = captureDirURL else { return }
+        guard phase == .recording || phase == .sealing, let dir = captureDirURL else { return }
+        // Transition to `.failed` FIRST so no subsequent error callback can re-enter `handleStreamFailure`
+        phase = .failed
         UIApplication.shared.isIdleTimerDisabled = false
         #if canImport(ARKit)
         arSession.pause()
         #endif
         locationManager.stopUpdatingHeading()
         locationManager.stopUpdatingLocation()
-        finalizeAudioWavHeader(at: dir.appendingPathComponent("audio.wav"), pcmByteCount: audioPCMByteCount)
         provisionalGrade = "fail"
         provisionalReasons = ["stream_write_failed: \(stream) (\(message))"]
-        writeSessionJSON(in: dir, status: "failed", stopReason: "write_error", failedStream: stream)
-        phase = .failed
         statusBanner = "Capture halted — write failed on \(stream): \(message)"
+
+        let engine = writerEngine
+        let snapData = makeSessionJSONData(status: "failed", stopReason: "write_error", failedStream: stream)
+        writerQueue.async {
+            try? engine?.finishStreamsAndCloseFiles()
+            Self.writeSessionJSONDataOnQueue(snapData, in: dir)
+        }
     }
 
-    /// Handle system interruption or backgrounding without silently claiming a complete recording (`YS-08`).
+    /// Handle backgrounding or session interruption by finishing streams, writing `status: "interrupted"`,
+    /// and sealing `manifest.json` + `.zip` inside a UIKit background task (`YS-08`, Blocker 1).
     public func handleInterruption(stopReason: String) {
-        guard phase == .recording, let dir = captureDirURL else { return }
+        guard phase == .recording, let dir = captureDirURL, let engine = writerEngine else { return }
+        phase = .sealing
         UIApplication.shared.isIdleTimerDisabled = false
         #if canImport(ARKit)
         arSession.pause()
         #endif
         locationManager.stopUpdatingHeading()
         locationManager.stopUpdatingLocation()
-        finalizeAudioWavHeader(at: dir.appendingPathComponent("audio.wav"), pcmByteCount: audioPCMByteCount)
         provisionalGrade = "fail"
         provisionalReasons = ["recording_interrupted: \(stopReason)"]
-        writeSessionJSON(in: dir, status: "stopped", stopReason: stopReason, failedStream: nil)
+        statusBanner = "Capture interrupted (\(stopReason)) — sealing partial recording…"
 
-        let writer = assetWriter
-        let vInput = videoWriterInput
-        writerQueue.async {
-            if let writer, writer.status == .writing {
-                vInput?.markAsFinished()
-                let sema = DispatchSemaphore(value: 0)
-                writer.finishWriting { sema.signal() }
-                _ = sema.wait(timeout: .now() + 5.0)
+        beginSealingBackgroundTask(name: "YardstickSealInterrupted")
+        let snapData = makeSessionJSONData(status: "interrupted", stopReason: stopReason, failedStream: nil)
+        writerQueue.async { [weak self] in
+            try? engine.finishStreamsAndCloseFiles()
+            Self.writeSessionJSONDataOnQueue(snapData, in: dir)
+            let zipURL = try? Self.sealManifestAndPackZip(in: dir)
+            Task { @MainActor in
+                if let self {
+                    self.archiveZipURL = zipURL
+                    self.phase = .completed
+                    self.statusBanner = "Capture interrupted (\(stopReason)) — partial archive sealed"
+                    self.endSealingBackgroundTask()
+                }
             }
         }
-        phase = .completed
-        statusBanner = "Capture interrupted (\(stopReason)) — saved partial recording"
     }
 
     /// Cleanly stop the recording, finish `rgb.mp4`, hash all streams (`Q022`), write `manifest.json`, and build the store-mode `.zip` (`YS-21`, `YS-22`).
     public func stopAndSealCapture() {
-        guard let dir = captureDirURL, phase == .recording else { return }
+        guard let dir = captureDirURL, phase == .recording, let engine = writerEngine else { return }
         UIApplication.shared.isIdleTimerDisabled = false
         logEvent(kind: "done", detail: "User tapped Done")
         phase = .sealing
@@ -456,33 +744,27 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         locationManager.stopUpdatingHeading()
         locationManager.stopUpdatingLocation()
 
-        finalizeAudioWavHeader(at: dir.appendingPathComponent("audio.wav"), pcmByteCount: audioPCMByteCount)
+        beginSealingBackgroundTask(name: "YardstickSealDone")
         updateProvisionalGrade()
-        writeSessionJSON(in: dir, status: "stopped", stopReason: "user_done", failedStream: nil)
+        let snapData = makeSessionJSONData(status: "stopped", stopReason: "user_done", failedStream: nil)
 
-        let writer = assetWriter
-        let vInput = videoWriterInput
         writerQueue.async { [weak self] in
             guard let self else { return }
-            let sema = DispatchSemaphore(value: 0)
-            if let writer, writer.status == .writing {
-                vInput?.markAsFinished()
-                writer.finishWriting {
-                    sema.signal()
-                }
-                _ = sema.wait(timeout: .now() + 10.0)
-            }
             do {
-                let zipURL = try self.sealManifestAndPackZip(in: dir)
+                try engine.finishStreamsAndCloseFiles()
+                Self.writeSessionJSONDataOnQueue(snapData, in: dir)
+                let zipURL = try Self.sealManifestAndPackZip(in: dir)
                 Task { @MainActor in
                     self.archiveZipURL = zipURL
                     self.phase = .completed
                     self.statusBanner = "Capture sealed — Grade \(self.provisionalGrade)"
+                    self.endSealingBackgroundTask()
                 }
             } catch {
+                let errMsg = error.localizedDescription
                 Task { @MainActor in
-                    self.phase = .failed
-                    self.statusBanner = "Seal error: \(error.localizedDescription)"
+                    self.handleStreamFailure(stream: "manifest", message: errMsg)
+                    self.endSealingBackgroundTask()
                 }
             }
         }
@@ -498,6 +780,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let loopGapPerM = (gapM ?? 0.08) / 25.0
         let rss = sqrt(0.015 * 0.015 + (loopGapPerM * 10.0) * (loopGapPerM * 10.0) + 0.005 * 0.005)
         let distTol10m = max(maxPrimaryRes, 1.96 * rss)
+        provisionalDistanceTolerance10m = distTol10m
 
         var band = 3
         let gVal = gapM ?? 0.0
@@ -529,70 +812,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         provisionalReasons = reasons
     }
 
-    private func initializeCSVFiles(in dir: URL) throws {
-        try "t,saved_index,dropped,drop_reason,tracking_state,tracking_reason\n"
-            .write(to: dir.appendingPathComponent("frames.csv"), atomically: true, encoding: .utf8)
-        try "t,saved_index,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n"
-            .write(to: dir.appendingPathComponent("poses.csv"), atomically: true, encoding: .utf8)
-        try "t,saved_index,file,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n"
-            .write(to: dir.appendingPathComponent("stills.csv"), atomically: true, encoding: .utf8)
-        try "t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v\n"
-            .write(to: dir.appendingPathComponent("markers.csv"), atomically: true, encoding: .utf8)
-        try "t,saved_index,kind,detail\n"
-            .write(to: dir.appendingPathComponent("events.csv"), atomically: true, encoding: .utf8)
-    }
-
-    private func initializeAudioWavHeader(at url: URL) throws {
-        var header = Data(count: 44)
-        header.replaceSubrange(0..<4, with: "RIFF".data(using: .ascii)!)
-        header.replaceSubrange(8..<12, with: "WAVE".data(using: .ascii)!)
-        header.replaceSubrange(12..<16, with: "fmt ".data(using: .ascii)!)
-        var fmtChunkSize: UInt32 = 16
-        var audioFormat: UInt16 = 1  // PCM
-        var numChannels: UInt16 = 1
-        var sampleRate: UInt32 = 16000
-        var byteRate: UInt32 = 32000
-        var blockAlign: UInt16 = 2
-        var bitsPerSample: UInt16 = 16
-        withUnsafeBytes(of: &fmtChunkSize) { header.replaceSubrange(16..<20, with: $0) }
-        withUnsafeBytes(of: &audioFormat) { header.replaceSubrange(20..<22, with: $0) }
-        withUnsafeBytes(of: &numChannels) { header.replaceSubrange(22..<24, with: $0) }
-        withUnsafeBytes(of: &sampleRate) { header.replaceSubrange(24..<28, with: $0) }
-        withUnsafeBytes(of: &byteRate) { header.replaceSubrange(28..<32, with: $0) }
-        withUnsafeBytes(of: &blockAlign) { header.replaceSubrange(32..<34, with: $0) }
-        withUnsafeBytes(of: &bitsPerSample) { header.replaceSubrange(34..<36, with: $0) }
-        header.replaceSubrange(36..<40, with: "data".data(using: .ascii)!)
-        try header.write(to: url, options: .atomic)
-    }
-
-    private func finalizeAudioWavHeader(at url: URL, pcmByteCount: UInt32) {
-        do {
-            let fh = try FileHandle(forUpdating: url)
-            var riffSize: UInt32 = 36 + pcmByteCount
-            var dataSize: UInt32 = pcmByteCount
-            try fh.seek(toOffset: 4)
-            try fh.write(contentsOf: Data(bytes: &riffSize, count: 4))
-            try fh.seek(toOffset: 40)
-            try fh.write(contentsOf: Data(bytes: &dataSize, count: 4))
-            try fh.close()
-        } catch {
-            handleStreamFailure(stream: "audio", message: error.localizedDescription)
-        }
-    }
-
-    private func appendString(_ text: String, to fileURL: URL, stream: String) {
-        guard let data = text.data(using: .utf8) else { return }
-        do {
-            let fh = try FileHandle(forWritingTo: fileURL)
-            try fh.seekToEnd()
-            try fh.write(contentsOf: data)
-            try fh.close()
-        } catch {
-            handleStreamFailure(stream: stream, message: error.localizedDescription)
-        }
-    }
-
-    private func writeSessionJSON(in dir: URL, status: String, stopReason: String?, failedStream: String?) {
+    private func makeSessionJSONDictionary(status: String, stopReason: String?, failedStream: String?) -> [String: Any] {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         let nowUTC = formatter.string(from: Date())
@@ -617,7 +837,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             ])
         }
 
-        let stopPairAny: Any = (status == "stopped") ? ["t_s": tEnd, "utc": nowUTC] : NSNull()
+        let stopPairAny: Any = (status == "stopped" || status == "interrupted") ? ["t_s": tEnd, "utc": nowUTC] : NSNull()
         let stopReasonAny: Any = stopReason ?? NSNull()
         let failedStreamAny: Any = failedStream ?? NSNull()
         let latAny: Any = latestLocation?.coordinate.latitude ?? NSNull()
@@ -628,7 +848,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let headAccAny: Any = latestHeadingAccuracyDeg ?? NSNull()
         let loopGapAny: Any = loopClosureGapMeters ?? NSNull()
 
-        let sessionObj: [String: Any] = [
+        return [
             "contract": "yardstick-capture/1",
             "capture_id": captureID,
             "device": [
@@ -680,42 +900,84 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             "tape_checks": tapeChecks,
             "provisional_grade": [
                 "grade": provisionalGrade == "—" ? "C" : provisionalGrade,
-                "distance_tolerance_10m_m": 0.05,
+                "distance_tolerance_10m_m": provisionalDistanceTolerance10m,
                 "loop_closure_gap_m": loopGapAny,
                 "reasons": provisionalReasons,
             ],
         ]
-
-        do {
-            let data = try JSONSerialization.data(withJSONObject: sessionObj, options: [.prettyPrinted, .sortedKeys])
-            try data.write(to: dir.appendingPathComponent("session.json"), options: .atomic)
-        } catch {
-            // Avoid infinite recursion if session.json itself fails
-            phase = .failed
-            statusBanner = "Failed to write session.json: \(error.localizedDescription)"
-        }
     }
 
-    nonisolated private func sealManifestAndPackZip(in dir: URL) throws -> URL {
+    private func makeSessionJSONData(status: String, stopReason: String?, failedStream: String?) -> Data? {
+        let dict = makeSessionJSONDictionary(status: status, stopReason: stopReason, failedStream: failedStream)
+        return try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
+    }
+
+    nonisolated private static func writeSessionJSONDataOnQueue(_ data: Data?, in dir: URL) {
+        guard let data else { return }
+        try? data.write(to: dir.appendingPathComponent("session.json"), options: .atomic)
+    }
+
+    /// Stream-compute SHA-256, table-driven CRC-32, and exact byte size in 64 KB chunks so large videos
+    /// are never loaded into memory (Blocker 4).
+    nonisolated public static func streamHashAndCRC32(of fileURL: URL) throws -> (sha256: String, crc32: UInt32, sizeBytes: UInt64) {
+        let fh = try FileHandle(forReadingFrom: fileURL)
+        defer { try? fh.close() }
+        var hasher = SHA256()
+        var crc: UInt32 = 0xFFFFFFFF
+        var totalSize: UInt64 = 0
+        let table = Self.crc32Table
+
+        while true {
+            var shouldBreak = false
+            var readErr: Error?
+            autoreleasepool {
+                do {
+                    guard let chunk = try fh.read(upToCount: 65536), !chunk.isEmpty else {
+                        shouldBreak = true
+                        return
+                    }
+                    hasher.update(data: chunk)
+                    totalSize += UInt64(chunk.count)
+                    chunk.withUnsafeBytes { rawBuf in
+                        for byte in rawBuf {
+                            let idx = Int((crc ^ UInt32(byte)) & 0xFF)
+                            crc = (crc >> 8) ^ table[idx]
+                        }
+                    }
+                } catch {
+                    readErr = error
+                    shouldBreak = true
+                }
+            }
+            if let readErr { throw readErr }
+            if shouldBreak { break }
+        }
+
+        let digest = hasher.finalize()
+        let hex = digest.map { String(format: "%02x", $0) }.joined()
+        return (hex, ~crc, totalSize)
+    }
+
+    nonisolated private static func sealManifestAndPackZip(in dir: URL) throws -> URL {
         let fm = FileManager.default
-        let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey])
+        let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey])
         var filesArray: [[String: Any]] = []
+        var precomputedCRCByRelPath: [String: (crc32: UInt32, sizeBytes: UInt64)] = [:]
 
         while let fileURL = enumerator?.nextObject() as? URL {
             let rel = fileURL.path.replacingOccurrences(of: dir.path + "/", with: "")
             if rel == "manifest.json" || rel.hasPrefix("standard/") || rel.hasPrefix(".") {
                 continue
             }
-            let vals = try fileURL.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
+            let vals = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
             guard vals.isRegularFile == true else { continue }
-            let data = try Data(contentsOf: fileURL)
-            let digest = SHA256.hash(data: data)
-            let hex = digest.map { String(format: "%02x", $0) }.joined()
+            let (hex, crc, sizeBytes) = try Self.streamHashAndCRC32(of: fileURL)
             filesArray.append([
                 "path": rel,
-                "size_bytes": data.count,
+                "size_bytes": sizeBytes,
                 "sha256": hex,
             ])
+            precomputedCRCByRelPath[rel] = (crc, sizeBytes)
         }
         filesArray.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
 
@@ -731,21 +993,28 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             ],
             "files": filesArray,
         ]
+        let manifestURL = dir.appendingPathComponent("manifest.json")
         let manifestData = try JSONSerialization.data(withJSONObject: manifestObj, options: [.prettyPrinted, .sortedKeys])
-        try manifestData.write(to: dir.appendingPathComponent("manifest.json"), options: .atomic)
+        try manifestData.write(to: manifestURL, options: .atomic)
+        let (_, manifestCRC, manifestSize) = try Self.streamHashAndCRC32(of: manifestURL)
+        precomputedCRCByRelPath["manifest.json"] = (manifestCRC, manifestSize)
 
         let zipURL = dir.deletingLastPathComponent().appendingPathComponent("\(dir.lastPathComponent).zip")
-        try Self.writeStoreModeZipArchive(sourceDir: dir, destinationZipURL: zipURL)
+        try Self.writeStoreModeZipArchive(
+            sourceDir: dir,
+            destinationZipURL: zipURL,
+            precomputedMeta: precomputedCRCByRelPath
+        )
         return zipURL
     }
 
-    /// Encode 16-bit depth millimetres (`[UInt16]`) into a 16-bit grayscale PNG (`YS-04`).
+    /// Encode 16-bit depth millimetres (`[UInt16]`) into a 16-bit linear grayscale PNG (`YS-04`).
     @discardableResult
     nonisolated public static func writeDepth16BitPNG(_ pixels: [UInt16], width: Int, height: Int, to url: URL) -> Bool {
         let bigEndian = pixels.map { $0.bigEndian }
         let data = bigEndian.withUnsafeBytes { Data($0) } as CFData
         guard let provider = CGDataProvider(data: data),
-              let cs = CGColorSpace(name: CGColorSpace.genericGrayGamma2_2),
+              let cs = CGColorSpace(name: CGColorSpace.linearGray),
               let cgImg = CGImage(
                   width: width,
                   height: height,
@@ -767,12 +1036,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return CGImageDestinationFinalize(dest)
     }
 
-    /// Encode 8-bit LiDAR confidence levels (`0, 1, 2`) into an 8-bit grayscale PNG (`YS-04`).
+    /// Encode 8-bit LiDAR confidence levels (`0, 1, 2`) into an 8-bit linear grayscale PNG (`YS-04`).
     @discardableResult
     nonisolated public static func writeConfidence8BitPNG(_ pixels: [UInt8], width: Int, height: Int, to url: URL) -> Bool {
         let data = Data(pixels) as CFData
         guard let provider = CGDataProvider(data: data),
-              let cs = CGColorSpace(name: CGColorSpace.genericGrayGamma2_2),
+              let cs = CGColorSpace(name: CGColorSpace.linearGray),
               let cgImg = CGImage(
                   width: width,
                   height: height,
@@ -868,105 +1137,19 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return out
     }
 
-    /// Convert arbitrary `CMSampleBuffer` audio (e.g. 48 kHz or 44.1 kHz Float32/Int16) to 16,000 Hz mono Int16 PCM (`YS-06`).
-    nonisolated public static func extractAndResampleTo16kHzMonoPCM(_ sampleBuffer: CMSampleBuffer) -> Data? {
-        guard let fmtDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(fmtDesc),
-              let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer)
-        else {
-            return nil
-        }
-        let asbd = asbdPtr.pointee
-        let inRate = asbd.mSampleRate
-        let channels = max(1, Int(asbd.mChannelsPerFrame))
-        let bits = Int(asbd.mBitsPerChannel)
-        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
-        let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
-        let numFrames = CMSampleBufferGetNumSamples(sampleBuffer)
-        guard inRate > 0, numFrames > 0 else { return nil }
-
-        var totalLength = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(
-            blockBuffer,
-            atOffset: 0,
-            lengthAtOffsetOut: nil,
-            totalLengthOut: &totalLength,
-            dataPointerOut: &dataPointer
-        )
-        guard status == kCMBlockBufferNoErr, let rawPtr = dataPointer, totalLength > 0 else {
-            return nil
-        }
-
-        // 1. Decode to mono Float32 in [-1.0, 1.0]
-        var monoFloats = [Float](repeating: 0.0, count: numFrames)
-        let strideChannels = isNonInterleaved ? 1 : channels
-
-        if isFloat && bits == 32 {
-            let fPtr = UnsafeRawPointer(rawPtr).assumingMemoryBound(to: Float.self)
-            let maxSamples = totalLength / MemoryLayout<Float>.size
-            for i in 0..<numFrames {
-                let baseIdx = i * strideChannels
-                if baseIdx < maxSamples {
-                    monoFloats[i] = fPtr[baseIdx]
-                }
-            }
-        } else if !isFloat && bits == 16 {
-            let iPtr = UnsafeRawPointer(rawPtr).assumingMemoryBound(to: Int16.self)
-            let maxSamples = totalLength / MemoryLayout<Int16>.size
-            for i in 0..<numFrames {
-                let baseIdx = i * strideChannels
-                if baseIdx < maxSamples {
-                    monoFloats[i] = Float(Int16(littleEndian: iPtr[baseIdx])) / 32768.0
-                }
-            }
-        } else if !isFloat && bits == 32 {
-            let iPtr = UnsafeRawPointer(rawPtr).assumingMemoryBound(to: Int32.self)
-            let maxSamples = totalLength / MemoryLayout<Int32>.size
-            for i in 0..<numFrames {
-                let baseIdx = i * strideChannels
-                if baseIdx < maxSamples {
-                    monoFloats[i] = Float(Int32(littleEndian: iPtr[baseIdx])) / 2147483648.0
-                }
-            }
-        } else {
-            return nil
-        }
-
-        // 2. Resample from `inRate` to 16,000 Hz mono Int16 with anti-aliasing box filter
-        let outRate = 16000.0
-        let ratio = inRate / outRate
-        let outFrames = max(1, Int((Double(numFrames) / ratio).rounded()))
-        var outPCM = [Int16](repeating: 0, count: outFrames)
-
-        for oIdx in 0..<outFrames {
-            let srcStart = Double(oIdx) * ratio
-            let srcEnd = min(Double(numFrames), srcStart + max(1.0, ratio))
-            let i0 = min(numFrames - 1, max(0, Int(srcStart.rounded(.down))))
-            let i1 = min(numFrames - 1, max(i0, Int(srcEnd.rounded(.down))))
-            var acc: Float = 0.0
-            var cnt: Float = 0.0
-            for k in i0...i1 {
-                acc += monoFloats[k]
-                cnt += 1.0
-            }
-            let sampleF = (cnt > 0) ? (acc / cnt) : monoFloats[i0]
-            let scaled = max(-32768.0, min(32767.0, Double(sampleF) * 32767.0))
-            outPCM[oIdx] = Int16(scaled.rounded()).littleEndian
-        }
-
-        return outPCM.withUnsafeBytes { Data($0) }
-    }
-
-    /// Pure-Swift ZIP_STORED (`compressionMethod = 0`) archiver so LiDAR PNGs & MP4 are packaged without re-compression (`YS-22`).
-    nonisolated public static func writeStoreModeZipArchive(sourceDir: URL, destinationZipURL: URL) throws {
+    /// Streaming, table-CRC, ZIP64-capable `ZIP_STORED` (`compressionMethod = 0`) archiver (`YS-22`, Blocker 4).
+    nonisolated public static func writeStoreModeZipArchive(
+        sourceDir: URL,
+        destinationZipURL: URL,
+        precomputedMeta: [String: (crc32: UInt32, sizeBytes: UInt64)] = [:]
+    ) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: destinationZipURL.path) {
             try fm.removeItem(at: destinationZipURL)
         }
         fm.createFile(atPath: destinationZipURL.path, contents: nil)
-        let fh = try FileHandle(forWritingTo: destinationZipURL)
-        defer { try? fh.close() }
+        let dstFH = try FileHandle(forWritingTo: destinationZipURL)
+        defer { try? dstFH.close() }
 
         let baseFolderName = sourceDir.lastPathComponent
         let enumerator = fm.enumerator(at: sourceDir, includingPropertiesForKeys: [.isRegularFileKey])
@@ -985,86 +1168,159 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         struct CentralRecord {
             let nameData: Data
             let crc32: UInt32
-            let size: UInt32
-            let localHeaderOffset: UInt32
+            let size: UInt64
+            let localHeaderOffset: UInt64
+            let usesZip64: Bool
         }
         var centralRecords: [CentralRecord] = []
-        var offset: UInt32 = 0
+        var offset: UInt64 = 0
 
         for rel in relPaths {
             let fileURL = sourceDir.appendingPathComponent(rel)
-            let fileData = try Data(contentsOf: fileURL)
+            let meta: (crc32: UInt32, sizeBytes: UInt64)
+            if let cached = precomputedMeta[rel] {
+                meta = cached
+            } else {
+                let (_, crc, sz) = try Self.streamHashAndCRC32(of: fileURL)
+                meta = (crc, sz)
+            }
             let arcName = "\(baseFolderName)/\(rel)"
             let nameData = arcName.data(using: .utf8) ?? Data()
-            let crc = Self.crc32(fileData)
-            let size = UInt32(fileData.count)
+            let usesZip64 = (meta.sizeBytes >= 0xFFFFFFFF) || (offset >= 0xFFFFFFFF)
+
+            var extraField = Data()
+            if usesZip64 {
+                Self.appendUInt16(&extraField, 0x0001)  // ZIP64 extended info tag
+                Self.appendUInt16(&extraField, 16)      // 2 x UInt64 sizes
+                Self.appendUInt64(&extraField, meta.sizeBytes)
+                Self.appendUInt64(&extraField, meta.sizeBytes)
+            }
 
             var localHeader = Data()
             Self.appendUInt32(&localHeader, 0x04034b50)
-            Self.appendUInt16(&localHeader, 20)
+            Self.appendUInt16(&localHeader, usesZip64 ? 45 : 20)
             Self.appendUInt16(&localHeader, 0)
             Self.appendUInt16(&localHeader, 0)  // Store mode
             Self.appendUInt16(&localHeader, 0)
             Self.appendUInt16(&localHeader, 0)
-            Self.appendUInt32(&localHeader, crc)
-            Self.appendUInt32(&localHeader, size)
-            Self.appendUInt32(&localHeader, size)
+            Self.appendUInt32(&localHeader, meta.crc32)
+            Self.appendUInt32(&localHeader, usesZip64 ? 0xFFFFFFFF : UInt32(meta.sizeBytes))
+            Self.appendUInt32(&localHeader, usesZip64 ? 0xFFFFFFFF : UInt32(meta.sizeBytes))
             Self.appendUInt16(&localHeader, UInt16(nameData.count))
-            Self.appendUInt16(&localHeader, 0)
+            Self.appendUInt16(&localHeader, UInt16(extraField.count))
             localHeader.append(nameData)
+            localHeader.append(extraField)
 
-            try fh.write(contentsOf: localHeader)
-            try fh.write(contentsOf: fileData)
+            try dstFH.write(contentsOf: localHeader)
+
+            // Stream file contents in 64 KB chunks
+            let srcFH = try FileHandle(forReadingFrom: fileURL)
+            defer { try? srcFH.close() }
+            while true {
+                var done = false
+                var copyErr: Error?
+                autoreleasepool {
+                    do {
+                        guard let chunk = try srcFH.read(upToCount: 65536), !chunk.isEmpty else {
+                            done = true
+                            return
+                        }
+                        try dstFH.write(contentsOf: chunk)
+                    } catch {
+                        copyErr = error
+                        done = true
+                    }
+                }
+                if let copyErr { throw copyErr }
+                if done { break }
+            }
 
             centralRecords.append(
                 CentralRecord(
                     nameData: nameData,
-                    crc32: crc,
-                    size: size,
-                    localHeaderOffset: offset
+                    crc32: meta.crc32,
+                    size: meta.sizeBytes,
+                    localHeaderOffset: offset,
+                    usesZip64: usesZip64
                 )
             )
-            offset += UInt32(localHeader.count) + size
+            offset += UInt64(localHeader.count) + meta.sizeBytes
         }
 
         let centralStartOffset = offset
-        var centralDirSize: UInt32 = 0
+        var centralDirSize: UInt64 = 0
+        var anyZip64 = (centralStartOffset >= 0xFFFFFFFF) || (centralRecords.count >= 0xFFFF)
 
         for rec in centralRecords {
+            if rec.usesZip64 { anyZip64 = true }
+            var cdExtra = Data()
+            if rec.usesZip64 {
+                Self.appendUInt16(&cdExtra, 0x0001)
+                Self.appendUInt16(&cdExtra, 24)
+                Self.appendUInt64(&cdExtra, rec.size)
+                Self.appendUInt64(&cdExtra, rec.size)
+                Self.appendUInt64(&cdExtra, rec.localHeaderOffset)
+            }
+
             var cd = Data()
             Self.appendUInt32(&cd, 0x02014b50)
-            Self.appendUInt16(&cd, 20)
-            Self.appendUInt16(&cd, 20)
+            Self.appendUInt16(&cd, rec.usesZip64 ? 45 : 20)
+            Self.appendUInt16(&cd, rec.usesZip64 ? 45 : 20)
             Self.appendUInt16(&cd, 0)
             Self.appendUInt16(&cd, 0)  // Store mode
             Self.appendUInt16(&cd, 0)
             Self.appendUInt16(&cd, 0)
             Self.appendUInt32(&cd, rec.crc32)
-            Self.appendUInt32(&cd, rec.size)
-            Self.appendUInt32(&cd, rec.size)
+            Self.appendUInt32(&cd, rec.usesZip64 ? 0xFFFFFFFF : UInt32(rec.size))
+            Self.appendUInt32(&cd, rec.usesZip64 ? 0xFFFFFFFF : UInt32(rec.size))
             Self.appendUInt16(&cd, UInt16(rec.nameData.count))
-            Self.appendUInt16(&cd, 0)
+            Self.appendUInt16(&cd, UInt16(cdExtra.count))
             Self.appendUInt16(&cd, 0)
             Self.appendUInt16(&cd, 0)
             Self.appendUInt16(&cd, 0)
             Self.appendUInt32(&cd, 0)
-            Self.appendUInt32(&cd, rec.localHeaderOffset)
+            Self.appendUInt32(&cd, rec.usesZip64 ? 0xFFFFFFFF : UInt32(rec.localHeaderOffset))
             cd.append(rec.nameData)
+            cd.append(cdExtra)
 
-            try fh.write(contentsOf: cd)
-            centralDirSize += UInt32(cd.count)
+            try dstFH.write(contentsOf: cd)
+            centralDirSize += UInt64(cd.count)
+        }
+
+        if anyZip64 || centralDirSize >= 0xFFFFFFFF {
+            let zip64EOCDOffset = centralStartOffset + centralDirSize
+            var z64EOCD = Data()
+            Self.appendUInt32(&z64EOCD, 0x06064b50)
+            Self.appendUInt64(&z64EOCD, 44)
+            Self.appendUInt16(&z64EOCD, 45)
+            Self.appendUInt16(&z64EOCD, 45)
+            Self.appendUInt32(&z64EOCD, 0)
+            Self.appendUInt32(&z64EOCD, 0)
+            Self.appendUInt64(&z64EOCD, UInt64(centralRecords.count))
+            Self.appendUInt64(&z64EOCD, UInt64(centralRecords.count))
+            Self.appendUInt64(&z64EOCD, centralDirSize)
+            Self.appendUInt64(&z64EOCD, centralStartOffset)
+            try dstFH.write(contentsOf: z64EOCD)
+
+            var z64Locator = Data()
+            Self.appendUInt32(&z64Locator, 0x07064b50)
+            Self.appendUInt32(&z64Locator, 0)
+            Self.appendUInt64(&z64Locator, zip64EOCDOffset)
+            Self.appendUInt32(&z64Locator, 1)
+            try dstFH.write(contentsOf: z64Locator)
         }
 
         var eocd = Data()
         Self.appendUInt32(&eocd, 0x06054b50)
         Self.appendUInt16(&eocd, 0)
         Self.appendUInt16(&eocd, 0)
-        Self.appendUInt16(&eocd, UInt16(centralRecords.count))
-        Self.appendUInt16(&eocd, UInt16(centralRecords.count))
-        Self.appendUInt32(&eocd, centralDirSize)
-        Self.appendUInt32(&eocd, centralStartOffset)
+        let count16 = UInt16(min(0xFFFF, centralRecords.count))
+        Self.appendUInt16(&eocd, count16)
+        Self.appendUInt16(&eocd, count16)
+        Self.appendUInt32(&eocd, UInt32(min(0xFFFFFFFF, centralDirSize)))
+        Self.appendUInt32(&eocd, UInt32(min(0xFFFFFFFF, centralStartOffset)))
         Self.appendUInt16(&eocd, 0)
-        try fh.write(contentsOf: eocd)
+        try dstFH.write(contentsOf: eocd)
     }
 
     nonisolated private static func appendUInt16(_ data: inout Data, _ val: UInt16) {
@@ -1077,19 +1333,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
     }
 
-    nonisolated private static func crc32(_ data: Data) -> UInt32 {
-        var crc: UInt32 = 0xFFFFFFFF
-        for byte in data {
-            crc ^= UInt32(byte)
-            for _ in 0..<8 {
-                if (crc & 1) != 0 {
-                    crc = (crc >> 1) ^ 0xEDB88320
-                } else {
-                    crc >>= 1
-                }
-            }
-        }
-        return ~crc
+    nonisolated private static func appendUInt64(_ data: inout Data, _ val: UInt64) {
+        var le = val.littleEndian
+        withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
     }
 }
 
@@ -1109,26 +1355,21 @@ extension CaptureSessionRecorder: ARSessionDelegate {
 
     nonisolated public func session(_ session: ARSession, didOutputAudioSampleBuffer audioSampleBuffer: CMSampleBuffer) {
         let pts = CMSampleBufferGetPresentationTimeStamp(audioSampleBuffer).seconds
-        guard let pcm16kData = Self.extractAndResampleTo16kHzMonoPCM(audioSampleBuffer),
-              !pcm16kData.isEmpty
-        else {
-            return
-        }
-
-        Task { @MainActor in
-            guard self.phase == .recording, let dir = self.captureDirURL else { return }
+        let sendableAudio = SendableAudioSampleBuffer(buffer: audioSampleBuffer)
+        Task { @MainActor [weak self] in
+            guard let self, self.phase == .recording, let engine = self.writerEngine else { return }
             if self.audioFirstSampleTS == nil {
                 self.audioFirstSampleTS = pts
             }
-            let wavURL = dir.appendingPathComponent("audio.wav")
-            do {
-                let fh = try FileHandle(forWritingTo: wavURL)
-                try fh.seekToEnd()
-                try fh.write(contentsOf: pcm16kData)
-                try fh.close()
-                self.audioPCMByteCount += UInt32(pcm16kData.count)
-            } catch {
-                self.handleStreamFailure(stream: "audio", message: error.localizedDescription)
+            self.writerQueue.async { [weak self] in
+                do {
+                    try engine.appendAudioSampleBuffer(sendableAudio.buffer)
+                } catch {
+                    let errMsg = error.localizedDescription
+                    Task { @MainActor [weak self] in
+                        self?.handleStreamFailure(stream: "audio", message: errMsg)
+                    }
+                }
             }
         }
     }
@@ -1137,7 +1378,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         let timestampS = frame.timestamp
         let cTransform = frame.camera.transform
         let intrinsics = frame.camera.intrinsics
-        let imgRes = frame.camera.imageResolution
+        let deliveredW = CVPixelBufferGetWidth(frame.capturedImage)
+        let deliveredH = CVPixelBufferGetHeight(frame.capturedImage)
 
         // Compute grip-invariant pitch from optical look ray (-Z_c dot +Y_w, YS-05)
         let lookRayY = Double(-cTransform.columns.2.y)
@@ -1175,7 +1417,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         }
 
         // Synchronously copy RGB pixel buffer and depth/confidence buffers in < 2 ms so `ARFrame` is NEVER retained!
-        let copiedRGBBuffer = Self.clonePixelBuffer(frame.capturedImage, pool: nil)
+        let copiedRGBBufferOpt = Self.clonePixelBuffer(frame.capturedImage, pool: nil).map { SendablePixelBuffer(buffer: $0) }
 
         var centerDepthM: Double? = nil
         var centerWorldPt: SIMD3<Double>? = nil
@@ -1246,10 +1488,21 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             CVPixelBufferUnlockBaseAddress(depthPB, .readOnly)
         }
 
-        Task { @MainActor in
-            guard self.phase == .recording, let dir = self.captureDirURL else { return }
+        let finalDepthCopy = depthCopyMM
+        let finalConfCopy = confCopyU8
+        let finalDepthW = depthW
+        let finalDepthH = depthH
+        let finalCenterDepthM = centerDepthM
+        let finalCenterWorldPt = centerWorldPt
 
-            // Major 11: Record start_clock_pair at the FIRST delivered ARFrame
+        Task { @MainActor [weak self] in
+            guard let self, self.phase == .recording, let dir = self.captureDirURL, let engine = self.writerEngine else { return }
+
+            // Record actual delivered buffer dimensions (`YS-03`, Blocker 5)
+            self.actualWidth = deliveredW
+            self.actualHeight = deliveredH
+
+            // Record start_clock_pair at the FIRST delivered ARFrame (Major 11)
             if self.t0MonotonicS == nil {
                 let formatter = ISO8601DateFormatter()
                 formatter.formatOptions = [.withInternetDateTime]
@@ -1257,7 +1510,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                 self.t0MonotonicS = timestampS
             }
 
-            // Major 14: Detect upstream frame timestamp gaps (> 1.6x frame period) and log dropped rows (YS-02)
+            // Detect upstream frame timestamp gaps (> 1.6x frame period) and prepare gap lines (YS-02, Major 14)
+            var gapLines: [String] = []
             let expectedDt = 1.0 / Double(max(1, self.actualFPS))
             if let prevT = self.lastDeliveredFrameTimestampS {
                 let dt = timestampS - prevT
@@ -1265,15 +1519,14 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     let missedCount = min(30, max(1, Int((dt / expectedDt).rounded()) - 1))
                     for k in 1...missedCount {
                         let interpT = prevT + Double(k) * (dt / Double(missedCount + 1))
-                        self.droppedFrameCount += 1
-                        let gapLine = String(
-                            format: "%.6f,,true,upstream_frame_drop,%@,%@\n",
-                            interpT, trackingStr, reasonStr
+                        gapLines.append(
+                            String(format: "%.6f,,true,upstream_frame_drop,%@,%@\n", interpT, trackingStr, reasonStr)
                         )
-                        self.appendString(gapLine, to: dir.appendingPathComponent("frames.csv"), stream: "frames")
                     }
+                    self.droppedFrameCount += missedCount
                 }
             }
+            let finalGapLines = gapLines
             self.lastDeliveredFrameTimestampS = timestampS
 
             self.latestTimestampS = timestampS
@@ -1281,8 +1534,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.pitchDeg = pitchDegrees
             self.rollDeg = rollDegrees
             self.trackingStateText = trackingStr
-            self.crosshairDepthMeters = centerDepthM
-            self.latestCrosshairWorld = centerWorldPt
+            self.crosshairDepthMeters = finalCenterDepthM
+            self.latestCrosshairWorld = finalCenterWorldPt
 
             // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation
             let camPosW = SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z)
@@ -1314,189 +1567,183 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                 self.northSampleCount = self.northSamples.count
             }
 
-            guard let dPixels = depthCopyMM,
-                  let cPixels = confCopyU8,
-                  let rgbPB = copiedRGBBuffer
-            else {
-                self.droppedFrameCount += 1
-                let dropLine = String(format: "%.6f,,true,missing_depth_buffer,%@,%@\n", timestampS, trackingStr, reasonStr)
-                self.appendString(dropLine, to: dir.appendingPathComponent("frames.csv"), stream: "frames")
-                return
-            }
+            // Backpressure guard before dispatching heavy frame buffers
+            let queueOverloaded = self.pendingWriterJobs > 8
+            let forceArUco = self.pendingForceMarkerDetect
+            self.pendingForceMarkerDetect = false
+            let sizesSnapshot = self.markerSizesMM
 
-            // Backpressure guard so writerQueue never drops a saved_index frame (YS-02)
-            if self.pendingWriterJobs > 8 || (self.videoWriterInput?.isReadyForMoreMediaData == false && self.videoSessionStarted) {
-                self.droppedFrameCount += 1
-                let dropLine = String(format: "%.6f,,true,writer_queue_full,%@,%@\n", timestampS, trackingStr, reasonStr)
-                self.appendString(dropLine, to: dir.appendingPathComponent("frames.csv"), stream: "frames")
-                return
-            }
-
-            let sIdx = self.savedFrameCount
-            self.latestSavedIndex = sIdx
-            self.savedFrameCount += 1
-            self.pendingWriterJobs += 1
-
-            let fLine = String(format: "%.6f,%d,false,,%@,%@\n", timestampS, sIdx, trackingStr, reasonStr)
-            self.appendString(fLine, to: dir.appendingPathComponent("frames.csv"), stream: "frames")
-
-            // Normalize quaternion before writing so poses.csv is guaranteed unit-norm within 1e-7 (YS-23)
             let rawQuat = simd_quatd(cMat)
             let normQuat = simd_normalize(rawQuat)
             let fx = Double(intrinsics.columns.0.x)
             let fy = Double(intrinsics.columns.1.y)
             let cx = Double(intrinsics.columns.2.x)
             let cy = Double(intrinsics.columns.2.y)
-            let rgbW = Int(imgRes.width)
-            let rgbH = Int(imgRes.height)
+            let rgbW = deliveredW
+            let rgbH = deliveredH
+            let wD = finalDepthW
+            let hD = finalDepthH
 
-            let pLine = String(
-                format: "%.6f,%d,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
-                timestampS, sIdx,
-                camPosW.x, camPosW.y, camPosW.z,
-                normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
-                fx, fy, cx, cy, rgbW, rgbH
-            )
-            self.appendString(pLine, to: dir.appendingPathComponent("poses.csv"), stream: "poses")
-
-            let shouldRunArUco = (sIdx % 3 == 0) || self.pendingForceMarkerDetect
-            self.pendingForceMarkerDetect = false
-            let lastStillT = self.lastStillSavedTimeS
-            let shouldConsiderPeriodicStill = (timestampS - lastStillT) >= 2.0
-            let sizesSnapshot = self.markerSizesMM
-
-            let depthURL = dir.appendingPathComponent(String(format: "depth/%06d.png", sIdx))
-            let confURL = dir.appendingPathComponent(String(format: "confidence/%06d.png", sIdx))
-            let wD = depthW
-            let hD = depthH
-            let writer = self.assetWriter
-            let vInput = self.videoWriterInput
-            let adaptor = self.pixelBufferAdaptor
-            let needStartSession = !self.videoSessionStarted
-            if needStartSession {
-                self.videoSessionStarted = true
+            let sessionHeartbeatData: Data?
+            if timestampS - self.lastHeartbeatS >= 5.0 {
+                self.lastHeartbeatS = timestampS
+                sessionHeartbeatData = self.makeSessionJSONData(status: "recording", stopReason: nil, failedStream: nil)
+            } else {
+                sessionHeartbeatData = nil
             }
-            let ciCtx = self.ciContext
 
+            self.pendingWriterJobs += 1
             self.writerQueue.async { [weak self] in
-                guard let self else { return }
+                guard let self, !engine.isClosed else { return }
 
-                // 1. Append frame to rgb.mp4 via AVAssetWriterInputPixelBufferAdaptor (Blocker 1)
-                let pts = CMTime(seconds: timestampS, preferredTimescale: 600)
-                var videoOK = true
-                var writerErrMsg = "AVAssetWriter append failed"
-                if let writer, let vInput, let adaptor, writer.status == .writing {
-                    if needStartSession {
-                        writer.startSession(atSourceTime: pts)
+                do {
+                    // Write any upstream gap rows first
+                    for gLine in finalGapLines {
+                        try engine.appendLine(gLine, to: engine.framesFH)
                     }
-                    if vInput.isReadyForMoreMediaData {
-                        videoOK = adaptor.append(rgbPB, withPresentationTime: pts)
-                        if !videoOK, let err = writer.error {
-                            writerErrMsg = err.localizedDescription
+
+                    guard let dPixels = finalDepthCopy,
+                          let cPixels = finalConfCopy,
+                          let sendableRGB = copiedRGBBufferOpt
+                    else {
+                        let dropLine = String(format: "%.6f,,true,missing_depth_buffer,%@,%@\n", timestampS, trackingStr, reasonStr)
+                        try engine.appendLine(dropLine, to: engine.framesFH)
+                        engine.droppedFrameCount += 1
+                        let totalDropped = engine.droppedFrameCount + finalGapLines.count
+                        Task { @MainActor in
+                            self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
+                            self.droppedFrameCount = max(self.droppedFrameCount, totalDropped)
                         }
-                    } else {
-                        videoOK = false
+                        return
                     }
-                } else {
-                    videoOK = false
-                    if let err = writer?.error {
-                        writerErrMsg = err.localizedDescription
+
+                    if queueOverloaded {
+                        let dropLine = String(format: "%.6f,,true,writer_queue_full,%@,%@\n", timestampS, trackingStr, reasonStr)
+                        try engine.appendLine(dropLine, to: engine.framesFH)
+                        engine.droppedFrameCount += 1
+                        Task { @MainActor in
+                            self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
+                            self.droppedFrameCount += 1
+                        }
+                        return
                     }
-                }
 
-                // 2. Write 16-bit depth PNG and 8-bit confidence PNG (Blocker 2)
-                let depthOK = Self.writeDepth16BitPNG(dPixels, width: wD, height: hD, to: depthURL)
-                let confOK = Self.writeConfidence8BitPNG(cPixels, width: wD, height: hD, to: confURL)
+                    guard let writer = engine.assetWriter,
+                          let vInput = engine.videoWriterInput,
+                          let adaptor = engine.pixelBufferAdaptor
+                    else {
+                        throw NSError(domain: "Yardstick", code: -30, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter not initialized"])
+                    }
 
-                // 3. Run ArUco detector & periodic sharp still selector (Blocker 5 & Major 15)
-                var detected3D: [DetectedMarkerSighting] = []
-                var saveStillNow = false
+                    if writer.status == .failed {
+                        throw writer.error ?? NSError(domain: "Yardstick", code: -31, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter status is failed"])
+                    }
 
-                if shouldRunArUco || shouldConsiderPeriodicStill {
-                    if let luma = Self.extractLumaBytes(from: rgbPB) {
-                        if shouldRunArUco {
-                            let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
-                            for d2 in dets2D {
-                                let pSize = sizesSnapshot[d2.markerID] ?? 250.0
-                                if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
-                                    markerID: d2.markerID,
-                                    cornersUV: d2.cornersUV,
-                                    printedSizeMM: pSize,
-                                    depthMapMM: dPixels,
-                                    confidenceMap: cPixels,
-                                    depthWidth: wD,
-                                    depthHeight: hD,
-                                    rgbWidth: rgbW,
-                                    rgbHeight: rgbH,
-                                    fx: fx,
-                                    fy: fy,
-                                    cx: cx,
-                                    cy: cy,
-                                    cameraToWorld: cMat
-                                ) {
-                                    detected3D.append(s3D)
+                    // Blocker 3: If encoder is temporarily not ready for media data, drop and count the frame;
+                    // do NOT fail the capture unless the writer actually errors!
+                    if engine.videoSessionStarted && !vInput.isReadyForMoreMediaData {
+                        let dropLine = String(format: "%.6f,,true,encoder_not_ready,%@,%@\n", timestampS, trackingStr, reasonStr)
+                        try engine.appendLine(dropLine, to: engine.framesFH)
+                        engine.droppedFrameCount += 1
+                        Task { @MainActor in
+                            self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
+                            self.droppedFrameCount += 1
+                        }
+                        return
+                    }
+
+                    let pts = CMTime(seconds: timestampS, preferredTimescale: 600)
+                    if !engine.videoSessionStarted {
+                        writer.startSession(atSourceTime: pts)
+                        engine.videoSessionStarted = true
+                    }
+
+                    let rgbPB = sendableRGB.buffer
+                    guard adaptor.append(rgbPB, withPresentationTime: pts) else {
+                        throw writer.error ?? NSError(domain: "Yardstick", code: -32, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter adaptor.append failed"])
+                    }
+
+                    let sIdx = engine.savedFrameCount
+                    engine.savedFrameCount += 1
+
+                    let fLine = String(format: "%.6f,%d,false,,%@,%@\n", timestampS, sIdx, trackingStr, reasonStr)
+                    try engine.appendLine(fLine, to: engine.framesFH)
+
+                    let pLine = String(
+                        format: "%.6f,%d,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
+                        timestampS, sIdx,
+                        camPosW.x, camPosW.y, camPosW.z,
+                        normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
+                        fx, fy, cx, cy, rgbW, rgbH
+                    )
+                    try engine.appendLine(pLine, to: engine.posesFH)
+
+                    let depthURL = dir.appendingPathComponent(String(format: "depth/%06d.png", sIdx))
+                    let confURL = dir.appendingPathComponent(String(format: "confidence/%06d.png", sIdx))
+                    guard Self.writeDepth16BitPNG(dPixels, width: wD, height: hD, to: depthURL) else {
+                        throw NSError(domain: "Yardstick", code: -33, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(depthURL.lastPathComponent)"])
+                    }
+                    guard Self.writeConfidence8BitPNG(cPixels, width: wD, height: hD, to: confURL) else {
+                        throw NSError(domain: "Yardstick", code: -34, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(confURL.lastPathComponent)"])
+                    }
+
+                    // Run ArUco detector & periodic sharp still selector on `writerQueue`
+                    let shouldRunArUco = (sIdx % 3 == 0) || forceArUco
+                    let shouldConsiderPeriodicStill = (timestampS - engine.lastStillSavedTimeS) >= 2.0
+                    var detected3D: [DetectedMarkerSighting] = []
+                    var saveStillNow = false
+
+                    if shouldRunArUco || shouldConsiderPeriodicStill {
+                        if let luma = Self.extractLumaBytes(from: rgbPB) {
+                            if shouldRunArUco {
+                                let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
+                                for d2 in dets2D {
+                                    let pSize = sizesSnapshot[d2.markerID] ?? 250.0
+                                    if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
+                                        markerID: d2.markerID,
+                                        cornersUV: d2.cornersUV,
+                                        printedSizeMM: pSize,
+                                        depthMapMM: dPixels,
+                                        confidenceMap: cPixels,
+                                        depthWidth: wD,
+                                        depthHeight: hD,
+                                        rgbWidth: rgbW,
+                                        rgbHeight: rgbH,
+                                        fx: fx,
+                                        fy: fy,
+                                        cx: cx,
+                                        cy: cy,
+                                        cameraToWorld: cMat
+                                    ) {
+                                        detected3D.append(s3D)
+                                    }
+                                }
+                            }
+                            if !detected3D.isEmpty {
+                                saveStillNow = true
+                            } else if shouldConsiderPeriodicStill {
+                                let sharpness = ArUcoDetector.computeLaplacianSharpness(lumaBytes: luma, width: rgbW, height: rgbH)
+                                if sharpness >= 12.0 || (timestampS - engine.lastStillSavedTimeS) >= 3.0 {
+                                    saveStillNow = true
                                 }
                             }
                         }
-                        if !detected3D.isEmpty {
-                            saveStillNow = true
-                        } else if shouldConsiderPeriodicStill {
-                            let sharpness = ArUcoDetector.computeLaplacianSharpness(lumaBytes: luma, width: rgbW, height: rgbH)
-                            if sharpness >= 12.0 || (timestampS - lastStillT) >= 3.0 {
-                                saveStillNow = true
-                            }
-                        }
                     }
-                }
 
-                var stillSavedOK = true
-                let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
-                if saveStillNow {
-                    let stillURL = dir.appendingPathComponent(stillRelPath)
-                    let ciImg = CIImage(cvPixelBuffer: rgbPB)
-                    let cs = CGColorSpaceCreateDeviceRGB()
-                    do {
-                        try ciCtx.writeJPEGRepresentation(
+                    // Write still JPEG AND its `stills.csv` row atomically on `writerQueue` so no still is ever orphaned when sealing starts!
+                    if saveStillNow && !engine.savedStillsIndices.contains(sIdx) {
+                        let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
+                        let stillURL = dir.appendingPathComponent(stillRelPath)
+                        let ciImg = CIImage(cvPixelBuffer: rgbPB)
+                        let cs = CGColorSpaceCreateDeviceRGB()
+                        try engine.ciContext.writeJPEGRepresentation(
                             of: ciImg,
                             to: stillURL,
                             colorSpace: cs,
                             options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]
                         )
-                    } catch {
-                        stillSavedOK = false
-                    }
-                }
-
-                let finalVideoOK = videoOK
-                let finalWriterErr = writerErrMsg
-                let finalSaveStill = saveStillNow
-                let finalStillOK = stillSavedOK
-                let finalDetected3D = detected3D
-
-                Task { @MainActor in
-                    self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
-                    guard self.phase == .recording else { return }
-
-                    if !finalVideoOK {
-                        self.handleStreamFailure(stream: "rgb_video", message: finalWriterErr)
-                        return
-                    }
-                    if !depthOK {
-                        self.handleStreamFailure(stream: "depth", message: "Failed to write \(depthURL.lastPathComponent)")
-                        return
-                    }
-                    if !confOK {
-                        self.handleStreamFailure(stream: "confidence", message: "Failed to write \(confURL.lastPathComponent)")
-                        return
-                    }
-                    if !finalStillOK {
-                        self.handleStreamFailure(stream: "stills", message: "Failed to write \(stillRelPath)")
-                        return
-                    }
-
-                    if finalSaveStill && !self.savedStillsIndices.contains(sIdx) {
-                        self.savedStillsIndices.insert(sIdx)
-                        self.lastStillSavedTimeS = timestampS
+                        engine.savedStillsIndices.insert(sIdx)
+                        engine.lastStillSavedTimeS = timestampS
                         let sLine = String(
                             format: "%.6f,%d,%@,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
                             timestampS, sIdx, stillRelPath,
@@ -1504,11 +1751,10 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
                             fx, fy, cx, cy, rgbW, rgbH
                         )
-                        self.appendString(sLine, to: dir.appendingPathComponent("stills.csv"), stream: "stills")
+                        try engine.appendLine(sLine, to: engine.stillsFH)
                     }
 
-                    for m in finalDetected3D {
-                        self.detectedMarkerIDs.insert(m.markerID)
+                    for m in detected3D {
                         let mq = m.quaternionXYZW
                         let c = m.cornersUV
                         let mLine = String(
@@ -1519,32 +1765,49 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             mq.x, mq.y, mq.z, mq.w,
                             c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y
                         )
-                        self.appendString(mLine, to: dir.appendingPathComponent("markers.csv"), stream: "markers")
+                        try engine.appendLine(mLine, to: engine.markersFH)
+                    }
 
-                        if m.markerID == 0 {
-                            if self.marker0FirstPassPos == nil {
-                                self.marker0FirstPassPos = m.positionWorld
-                                self.marker0FirstPassTimeS = timestampS
-                                self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
-                            } else if let firstT = self.marker0FirstPassTimeS,
-                                      let firstPos = self.marker0FirstPassPos,
-                                      (timestampS - firstT) >= 3.0,
-                                      (self.marker0MaxExcursionM >= 1.0 || (timestampS - firstT) >= 10.0) {
-                                self.marker0LastPassPos = m.positionWorld
-                                self.marker0LastPassTimeS = timestampS
-                                let gap = simd_length(m.positionWorld - firstPos)
-                                self.loopClosureGapMeters = gap
-                                self.updateProvisionalGrade()
-                                self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
+                    if let sessionHeartbeatData {
+                        Self.writeSessionJSONDataOnQueue(sessionHeartbeatData, in: dir)
+                    }
+
+                    let finalDetected = detected3D
+                    let newSavedCount = engine.savedFrameCount
+                    Task { @MainActor in
+                        self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
+                        self.latestSavedIndex = sIdx
+                        self.savedFrameCount = newSavedCount
+
+                        for m in finalDetected {
+                            self.detectedMarkerIDs.insert(m.markerID)
+                            if m.markerID == 0 {
+                                if self.marker0FirstPassPos == nil {
+                                    self.marker0FirstPassPos = m.positionWorld
+                                    self.marker0FirstPassTimeS = timestampS
+                                    self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
+                                } else if let firstT = self.marker0FirstPassTimeS,
+                                          let firstPos = self.marker0FirstPassPos,
+                                          (timestampS - firstT) >= 3.0,
+                                          (self.marker0MaxExcursionM >= 1.0 || (timestampS - firstT) >= 10.0),
+                                          simd_length(camPosW - m.positionWorld) <= 1.50 {
+                                    self.marker0LastPassPos = m.positionWorld
+                                    self.marker0LastPassTimeS = timestampS
+                                    let gap = simd_length(m.positionWorld - firstPos)
+                                    self.loopClosureGapMeters = gap
+                                    self.updateProvisionalGrade()
+                                    self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
+                                }
                             }
                         }
                     }
+                } catch {
+                    let errMsg = error.localizedDescription
+                    Task { @MainActor in
+                        self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
+                        self.handleStreamFailure(stream: "rgb_video", message: errMsg)
+                    }
                 }
-            }
-
-            if timestampS - self.lastHeartbeatS >= 5.0 {
-                self.lastHeartbeatS = timestampS
-                self.writeSessionJSON(in: dir, status: "recording", stopReason: nil, failedStream: nil)
             }
         }
     }

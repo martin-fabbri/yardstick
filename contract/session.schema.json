@@ -383,6 +383,7 @@
             "starting",
             "recording",
             "stopped",
+            "interrupted",
             "failed"
           ],
           "type": "string"
