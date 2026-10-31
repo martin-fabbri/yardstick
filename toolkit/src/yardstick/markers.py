@@ -80,11 +80,15 @@ def measure_marker_corners_3d_on_lidar_plane(
     cv2.fillConvexPoly(mask, poly_int, 1)
 
     valid = (mask > 0) & (depth_mm > 0) & (conf_img >= 1)
-    if int(np.sum(valid)) < 4:
-        # Fallback to uneroded quad if marker is small on 256x192 depth map
-        mask_full = np.zeros((h_d, w_d), dtype=np.uint8)
-        cv2.fillConvexPoly(mask_full, np.rint(corners_d).astype(np.int32), 1)
-        valid = (mask_full > 0) & (depth_mm > 0) & (conf_img >= 1)
+    if int(np.sum(valid)) < 16:
+        # Fallback to uneroded or slightly expanded quad if marker is small on 256x192 depth map
+        for scale_f in (1.0, 1.35):
+            scaled_d = center_d + scale_f * (corners_d - center_d)
+            mask_full = np.zeros((h_d, w_d), dtype=np.uint8)
+            cv2.fillConvexPoly(mask_full, np.rint(scaled_d).astype(np.int32), 1)
+            valid = (mask_full > 0) & (depth_mm > 0) & (conf_img >= 1)
+            if int(np.sum(valid)) >= 16:
+                break
         if int(np.sum(valid)) < 4:
             return None
 
@@ -97,7 +101,7 @@ def measure_marker_corners_3d_on_lidar_plane(
 
     centroid_cam = np.mean(pts_cam, axis=0)
     range_m = float(np.linalg.norm(centroid_cam))
-    if not (0.60 <= range_m <= 2.00):
+    if not (0.50 <= range_m <= 3.50):
         return None
 
     # Fit plane in camera space via SVD
