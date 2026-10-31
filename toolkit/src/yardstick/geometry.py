@@ -224,17 +224,21 @@ def fit_ground_plane_ransac(
     inlier_threshold_m: float = 0.03,
     iterations: int = 250,
     seed: int = 42,
-) -> tuple[np.ndarray, float, float]:
+    *,
+    return_p95: bool = False,
+) -> tuple[np.ndarray, float, float] | tuple[np.ndarray, float, float, float]:
     """Fit ground plane n . p + d = 0 in ARKit world coordinates (+Y up) (YS-51, Q030).
 
     Enforces |n . y_world| >= cos(max_tilt_deg) so walls/fences/steps cannot become the ground.
-    Returns (unit_normal_up, d_offset, median_abs_residual_m).
+    Returns (unit_normal_up, d_offset, median_abs_residual_m[, p95_abs_residual_m]).
     """
     y_up = np.array([0.0, 1.0, 0.0], dtype=np.float64)
     cos_min = math.cos(math.radians(max_tilt_deg))
 
     if points_world.shape[0] < 10:
         ref_y = float(marker_0_pos_world[1]) if marker_0_pos_world is not None else 0.0
+        if return_p95:
+            return y_up, -ref_y, 0.0, 0.0
         return y_up, -ref_y, 0.0
 
     if marker_0_pos_world is not None:
@@ -246,6 +250,22 @@ def fit_ground_plane_ransac(
     else:
         ref_y = float(np.percentile(points_world[:, 1], 15))
         band_mask = np.abs(points_world[:, 1] - ref_y) <= 0.50
+
+    # Exclude vertical wall/obstacle columns (horizontal cells that also contain points > 0.50 m above ref_y)
+    high_pts = points_world[points_world[:, 1] > ref_y + 0.50]
+    if high_pts.shape[0] > 0:
+        cell_size = 0.25
+        high_cells = set(
+            zip(
+                np.floor(high_pts[:, 0] / cell_size).astype(int),
+                np.floor(high_pts[:, 2] / cell_size).astype(int),
+            )
+        )
+        ix = np.floor(points_world[:, 0] / cell_size).astype(int)
+        iz = np.floor(points_world[:, 2] / cell_size).astype(int)
+        in_wall_col = np.array([(x, z) in high_cells for x, z in zip(ix, iz)], dtype=bool)
+        if int(np.sum(band_mask & (~in_wall_col))) >= 10:
+            band_mask = band_mask & (~in_wall_col)
 
     candidates = points_world[band_mask]
     if candidates.shape[0] < 10:
@@ -292,11 +312,14 @@ def fit_ground_plane_ransac(
         if float(np.dot(refined_normal, y_up)) >= cos_min:
             best_normal = refined_normal / np.linalg.norm(refined_normal)
             best_d = -float(np.dot(best_normal, centroid))
-    # Evaluate residual over the entire ground candidate band so a crowned or stepped yard
-    # increases ground_plane_residual_m honestly (YS-51).
+    # Evaluate both median and p95 residuals over the entire ground candidate band so a crowned or
+    # stepped yard increases ground_plane_residual_p95_m and height_m honestly (YS-51).
     residuals = np.abs(candidates @ best_normal + best_d)
     median_residual = float(np.median(residuals)) if residuals.size > 0 else 0.0
+    p95_residual = float(np.percentile(residuals, 95)) if residuals.size > 0 else 0.0
 
+    if return_p95:
+        return best_normal, best_d, median_residual, p95_residual
     return best_normal, best_d, median_residual
 
 
@@ -472,6 +495,7 @@ def build_yard_frame(
     first_camera_pose_world: np.ndarray,
     pose_jumps: list[dict[str, Any]],
     *,
+    ground_residual_p95_m: float | None = None,
     walk_start_t_s: float | None = None,
     walk_end_t_s: float | None = None,
     last_tap_t_s: float | None = None,
@@ -480,6 +504,7 @@ def build_yard_frame(
     max_closing_distance_m: float = 1.50,
 ) -> dict[str, Any]:
     """Construct world_to_yard_transform (4x4) and frame residuals (YS-31, YS-32, YS-51)."""
+    eff_p95 = ground_residual_p95_m if ground_residual_p95_m is not None else (ground_residual_m * 1.96)
     z_yard = ground_normal_world / np.linalg.norm(ground_normal_world)
     jump_sum = sum(float(j["jump_m"]) for j in pose_jumps)
 
@@ -610,6 +635,7 @@ def build_yard_frame(
             "origin_height_m": round(origin_height_m, 6),
             "origin_residual_m": origin_residual_m,
             "ground_plane_residual_m": round(ground_residual_m, 6),
+            "ground_plane_residual_p95_m": round(eff_p95, 6),
             "loop_closure_gaps": loop_closure_gaps,
             "pose_jumps": pose_jumps,
         }
@@ -644,6 +670,7 @@ def build_yard_frame(
         "origin_height_m": round(origin_height_m, 6),
         "origin_residual_m": None,
         "ground_plane_residual_m": round(ground_residual_m, 6),
+        "ground_plane_residual_p95_m": round(eff_p95, 6),
         "loop_closure_gaps": loop_closure_gaps,
         "pose_jumps": pose_jumps,
     }

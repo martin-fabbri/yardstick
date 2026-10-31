@@ -199,13 +199,16 @@ def convert_recording_to_standard(
         )
 
     # 4. Fit ground plane via gravity-gated RANSAC (YS-51)
-    ground_normal_w, ground_d_w, ground_residual_m = fit_ground_plane_ransac(
+    res_ransac = fit_ground_plane_ransac(
         points_world=pts_world,
         camera_positions_world=camera_positions_world,
         marker_0_pos_world=marker_0_pos_world,
         max_tilt_deg=15.0,
         inlier_threshold_m=0.03,
+        return_p95=True,
     )
+    assert len(res_ransac) == 4
+    ground_normal_w, ground_d_w, ground_residual_m, ground_residual_p95_m = res_ransac
 
     first_cam_pose_w = (
         camera_poses_world[min(camera_poses_world.keys())]
@@ -244,6 +247,7 @@ def convert_recording_to_standard(
         ground_normal_world=ground_normal_w,
         ground_d_world=ground_d_w,
         ground_residual_m=ground_residual_m,
+        ground_residual_p95_m=ground_residual_p95_m,
         passes_by_marker=passes_by_marker,
         first_camera_pose_world=first_cam_pose_w,
         pose_jumps=pose_jumps,
@@ -273,6 +277,7 @@ def convert_recording_to_standard(
         "origin_height_m": yard_frame_dict["origin_height_m"],
         "origin_residual_m": yard_frame_dict["origin_residual_m"],
         "ground_plane_residual_m": yard_frame_dict["ground_plane_residual_m"],
+        "ground_plane_residual_p95_m": yard_frame_dict["ground_plane_residual_p95_m"],
         "north_calibration": north_cal,
         "loop_closure_gaps": yard_frame_dict["loop_closure_gaps"],
         "pose_jumps": yard_frame_dict["pose_jumps"],

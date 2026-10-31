@@ -141,7 +141,11 @@ def compute_grade_and_tolerances(
     )
     pos_tol_10m = dist_tol_10m / math.sqrt(2.0)
     ground_res_m = float(frame_info.get("ground_plane_residual_m", 0.0))
+    ground_res_p95_m = float(
+        frame_info.get("ground_plane_residual_p95_m", ground_res_m * 1.96)
+    )
     height_tol_m = max(
+        ground_res_p95_m,
         ground_res_m * 1.96,
         1.96 * math.sqrt(SIGMA_LIDAR_M * SIGMA_LIDAR_M + (scale_error_eff * 3.0) ** 2),
     )
