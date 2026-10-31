@@ -289,6 +289,11 @@ public struct ContentView: View {
                 Text("Capture ID: \(recorder.captureID)")
                 Text("Saved Depth Frames: \(recorder.savedFrameCount)")
                 Text("Tape Checks Logged: \(recorder.tapeCheckCount)")
+                ForEach(recorder.tapeCheckSummaries, id: \.self) { summary in
+                    Text("  • \(summary)")
+                        .font(.caption.monospacedDigit())
+                        .foregroundColor(.white)
+                }
                 if let gap = recorder.loopClosureGapMeters {
                     Text(String(format: "Marker 0 Loop-Closure Gap: %.1f cm", gap * 100.0))
                 } else {

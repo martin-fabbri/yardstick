@@ -330,15 +330,41 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var pendingTapeEndpointAWorld: SIMD3<Double>? = nil
     @Published public private(set) var pendingTapeEndpointBWorld: SIMD3<Double>? = nil
     @Published public private(set) var tapeCheckCount: Int = 0
+    @Published public private(set) var tapeCheckSummaries: [String] = []
     @Published public private(set) var loopClosureGapMeters: Double? = nil
     @Published public private(set) var provisionalGrade: String = "—"
     @Published public private(set) var provisionalReasons: [String] = []
     @Published public private(set) var archiveZipURL: URL? = nil
 
-    /// Per-marker printed size configuration (`250.0` mm Letter/A4 or `180.0` mm clipboard).
-    @Published public var markerSizesMM: [Int: Double] = [
-        0: 250.0, 1: 250.0, 2: 250.0, 3: 250.0, 4: 250.0, 5: 250.0,
-    ]
+    private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM"
+
+    /// Per-marker printed size configuration (`180.0` mm for printed set IDs `0–3`, `250.0` mm for `4–5`), persisted in `UserDefaults`.
+    @Published public var markerSizesMM: [Int: Double] = CaptureSessionRecorder.loadPersistedMarkerSizes()
+
+    public static func loadPersistedMarkerSizes(defaults: UserDefaults = .standard) -> [Int: Double] {
+        var sizes: [Int: Double] = [
+            0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 250.0, 5: 250.0,
+        ]
+        if let saved = defaults.dictionary(forKey: markerSizesDefaultsKey) {
+            for mid in 0..<6 {
+                if let num = saved[String(mid)] as? NSNumber {
+                    let val = num.doubleValue
+                    if val == 180.0 || val == 250.0 {
+                        sizes[mid] = val
+                    }
+                }
+            }
+        }
+        return sizes
+    }
+
+    private func persistMarkerSizes(defaults: UserDefaults = .standard) {
+        var dict: [String: Double] = [:]
+        for (k, v) in markerSizesMM {
+            dict[String(k)] = v
+        }
+        defaults.set(dict, forKey: Self.markerSizesDefaultsKey)
+    }
 
     #if canImport(ARKit)
     public let arSession = ARSession()
@@ -478,6 +504,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     public func toggleMarkerSize(for markerID: Int) {
         let current = markerSizesMM[markerID] ?? 250.0
         markerSizesMM[markerID] = (current == 250.0) ? 180.0 : 250.0
+        persistMarkerSizes()
     }
 
     public func requestPermissionsAndStart() {
@@ -511,6 +538,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         northSampleCount = 0
         tapeChecks.removeAll()
         tapeCheckCount = 0
+        tapeCheckSummaries.removeAll()
         pendingTapeEndpointAWorld = nil
         pendingTapeEndpointBWorld = nil
         loopClosureGapMeters = nil
@@ -668,6 +696,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         ]
         tapeChecks.append(entry)
         tapeCheckCount = tapeChecks.count
+        tapeCheckSummaries.append(
+            String(
+                format: "Tape #%d (%@): tape %.2f m · phone %.2f m (diff %.1f cm)",
+                checkID + 1, role, tapeMeters, measuredM, residualM * 100.0
+            )
+        )
         pendingTapeEndpointAWorld = nil
         pendingTapeEndpointBWorld = nil
         logEvent(kind: "tape_b", detail: String(format: "tape=%.3fm measured=%.3fm res=%.3fm", tapeMeters, measuredM, residualM))

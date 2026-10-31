@@ -79,6 +79,38 @@ Apps signed with a free personal Apple ID remain valid on the device for **7 day
 
 ---
 
+## Yard Walk Protocol (`YS-64`)
+
+1. **Print and verify the markers (`DICT_5X5_250`, IDs `0–3`):**
+   - Print Markers `0–3` at actual size (`100%` scale, no fit-to-page) on matte tabloid foam board (`180 mm` outer black border) or letter/tabloid (`250 mm`).
+   - Verify the printed `100 mm` scale bar on each sheet with a physical ruler before going outside.
+2. **Lay out the yard before starting the app:**
+   - Place **Marker 0 (Origin & Loop Closure)** flat and face-up on level ground at the starting point (e.g., by the back door).
+   - Place **Markers 1–3** flat on the ground (or upright against a flat surface) at least `3 m` apart around the yard. Never move any marker during the walk.
+   - Stake or place cones for **4 tape-measure pairs** (`3–5 m` apart, `1` **Primary** pair + `3` **Held-Out** validation pairs) and measure each pair's exact distance in meters with a physical tape measure before starting.
+3. **Configure the Setup screen (`ContentView.swift`):**
+   - Launch **Yardstick** on the iPhone.
+   - Under **Printed Marker Edge Size (tap to toggle 250 mm / 180 mm)**, ensure **Marker 0 (Origin & Loop Closure)** through **Marker 3** match your printed size (`180 mm` for the standard 4-sheet tabloid set). Sizes persist across app launches in `UserDefaults`.
+   - Tap **Start Yard Walk** and approve the three iOS permission prompts (Location While Using App, Camera, and Microphone).
+4. **Lock Origin & North at Marker 0:**
+   - Stand at **Marker 0**, hold the phone at chest height (`~1.3–1.5 m`) tilted roughly `-30°` downward (`Pitch` between `-45°` and `-15°`, `Roll` within `±15°`), and aim at **Marker 0** from `0.6–2.0 m` away.
+   - Tap **Marker** once to log the operator sighting and force an immediate ArUco + LiDAR plane check (`Markers: 1`, banner: `"Marker 0 Origin locked — walk yard & return to Marker 0 at end"`).
+   - Remain within `2.5 m` of **Marker 0** for `~2 seconds` until the top HUD shows **`North: 10/10`** (the app collects up to `15` compass-to-ARKit yaw samples spaced `>= 0.15 s` while near Marker 0).
+5. **Walk the perimeter, markers, and tape pairs:**
+   - Walk at a steady stroll (`~0.8–1.2 m/s`), keeping the phone at chest height and `1.5–3.5 m` away from fences, walls, and boundaries so both the ground plane and vertical structures stay inside the `0.2–4.5 m` LiDAR range.
+   - At each of **Markers 1–3**, pause `1–2 m` away so the marker lies cleanly inside the frame and tap **Marker** (`Markers` badge increments as each unique ID is sighted).
+   - At each staked **tape pair**:
+     1. Aim the green center crosshair directly at Endpoint A (`0.2–4.5 m` range, live depth shown below the crosshair) and tap **Tape A** (banner: `"Endpoint A locked — aim at Endpoint B and tap Tape B"`).
+     2. Aim the green center crosshair directly at Endpoint B and tap **Tape B**. The 3D world point of Endpoint B locks **immediately on tap** before the keypad opens.
+     3. In the overlay (`Enter Tape-Measure Distance (meters)`), select **Primary** (for the first pair) or **Held-Out** (for the remaining validation pairs), type the physical tape reading in meters (e.g., `3.47`), and tap **Commit Tape B** (`Tapes` counter increments).
+   - Audio is recorded continuously (`16 kHz` mono PCM `audio.wav`) throughout the walk; tap **Note** whenever you speak a timestamped observation so an anchor row (`kind = note`) is written to `events.csv`.
+6. **Close the loop on Marker 0 and finish:**
+   - Walk back to **Marker 0**, stand within `1.5 m` of **Marker 0**, aim at **Marker 0**, and tap **Marker**.
+   - Wait for the banner to confirm `"Marker 0 Loop Closed (gap X.X cm) — tap Done"`, then tap **Done**.
+   - On the **Capture Summary** screen, review the **Provisional Grade**, each logged tape check (`tape` vs `phone` distance and residual), and the **Marker 0 Loop-Closure Gap**, then tap **Export Capture Archive (.zip)** to AirDrop or save the archive to your Mac.
+
+---
+
 ## Laptop Toolkit Quickstart
 
 The laptop toolkit uses Python 3.12+ managed with [`uv`](https://github.com/astral-sh/uv).
