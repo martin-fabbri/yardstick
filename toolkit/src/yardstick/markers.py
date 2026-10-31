@@ -194,29 +194,34 @@ def evaluate_marker_scale_errors(
                         ],
                         dtype=np.float64,
                     )
-                    depth_mm = np.array(Image.open(depth_path), dtype=np.uint16)
-                    conf_img = np.array(Image.open(conf_path), dtype=np.uint8)
-                    T_wc = pose_to_matrix(
-                        float(pose_row["px"]),
-                        float(pose_row["py"]),
-                        float(pose_row["pz"]),
-                        float(pose_row["qx"]),
-                        float(pose_row["qy"]),
-                        float(pose_row["qz"]),
-                        float(pose_row["qw"]),
-                    )
-                    res = measure_marker_corners_3d_on_lidar_plane(
-                        corners_uv=corners_uv,
-                        depth_mm=depth_mm,
-                        conf_img=conf_img,
-                        fx=float(pose_row["fx"]),
-                        fy=float(pose_row["fy"]),
-                        cx=float(pose_row["cx"]),
-                        cy=float(pose_row["cy"]),
-                        rgb_width=int(pose_row["width"]),
-                        rgb_height=int(pose_row["height"]),
-                        T_world_from_cam=T_wc,
-                    )
+                    try:
+                        with Image.open(depth_path) as d_img:
+                            depth_mm = np.array(d_img, dtype=np.uint16)
+                        with Image.open(conf_path) as c_img:
+                            conf_img = np.array(c_img, dtype=np.uint8)
+                        T_wc = pose_to_matrix(
+                            float(pose_row["px"]),
+                            float(pose_row["py"]),
+                            float(pose_row["pz"]),
+                            float(pose_row["qx"]),
+                            float(pose_row["qy"]),
+                            float(pose_row["qz"]),
+                            float(pose_row["qw"]),
+                        )
+                        res = measure_marker_corners_3d_on_lidar_plane(
+                            corners_uv=corners_uv,
+                            depth_mm=depth_mm,
+                            conf_img=conf_img,
+                            fx=float(pose_row["fx"]),
+                            fy=float(pose_row["fy"]),
+                            cx=float(pose_row["cx"]),
+                            cy=float(pose_row["cy"]),
+                            rgb_width=int(pose_row["width"]),
+                            rgb_height=int(pose_row["height"]),
+                            T_world_from_cam=T_wc,
+                        )
+                    except Exception:
+                        res = None
                     if res is not None:
                         corners_w, f_size_mm, _ = res
                         pass_corners_world.append(corners_w)

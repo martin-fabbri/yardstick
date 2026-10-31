@@ -139,17 +139,29 @@ def convert_recording_to_standard(
         if not depth_path.exists() or not conf_path.exists():
             continue
 
-        with Image.open(depth_path) as d_img:
-            depth_mm = np.array(d_img, dtype=np.uint16)
-        with Image.open(conf_path) as c_img:
-            conf_img = np.array(c_img, dtype=np.uint8)
+        try:
+            with Image.open(depth_path) as d_img:
+                depth_mm = np.array(d_img, dtype=np.uint16)
+            with Image.open(conf_path) as c_img:
+                conf_img = np.array(c_img, dtype=np.uint8)
+        except Exception:
+            integrity_status = "invalid"
+            continue
+
+        if depth_mm.ndim != 2 or conf_img.ndim != 2 or depth_mm.shape != conf_img.shape:
+            integrity_status = "invalid"
+            continue
 
         rgb_img: np.ndarray | None = None
         if s_idx in stills_by_saved:
             still_path = capture_dir / stills_by_saved[s_idx]["file"]
             if still_path.exists():
-                with Image.open(still_path) as s_img:
-                    rgb_img = np.array(s_img.convert("RGB"), dtype=np.uint8)
+                try:
+                    with Image.open(still_path) as s_img:
+                        rgb_img = np.array(s_img.convert("RGB"), dtype=np.uint8)
+                except Exception:
+                    integrity_status = "invalid"
+                    rgb_img = None
 
         pts_w, colors_u8, confs_u8, ranges_m = unproject_depth_frame(
             depth_mm=depth_mm,
@@ -298,11 +310,29 @@ def convert_recording_to_standard(
     )
 
     # 7. Compute scanned ground coverage polygon & holes (YS-52)
-    coverage_json_data = compute_scanned_ground_coverage(
-        points_xyz=ds_xyz.astype(np.float64),
-        confidences=ds_conf,
-        ranges_m=ds_ranges.astype(np.float64),
-    )
+    try:
+        coverage_json_data = compute_scanned_ground_coverage(
+            points_xyz=ds_xyz.astype(np.float64),
+            confidences=ds_conf,
+            ranges_m=ds_ranges.astype(np.float64),
+        )
+    except Exception:
+        integrity_status = "invalid"
+        coverage_json_data = {
+            "contract": CONTRACT_VERSION,
+            "polygon_xy_m": [[0.0, 0.0], [0.1, 0.0], [0.1, 0.1], [0.0, 0.1]],
+            "holes_xy_m": [],
+            "area_m2": 0.01,
+            "high_confidence_share": 0.0,
+            "parameters": {
+                "z_max_abs_m": 0.25,
+                "range_max_m": 4.0,
+                "grid_cell_m": 0.20,
+                "closing_cells": 1,
+                "max_filled_hole_m2": 1.0,
+                "simplify_epsilon_m": 0.10,
+            },
+        }
 
     # 8. Build `trajectory.json` and compute total walk length
     traj_poses_list: list[dict[str, Any]] = []
