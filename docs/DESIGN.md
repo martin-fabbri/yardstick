@@ -277,7 +277,8 @@ Every JSON file is UTF-8 with sorted keys, `"contract": "yardstick-capture/1"`, 
   - `world_to_yard_transform`: 16-element array of numbers ($4 \times 4$ row-major homogeneous matrix)
   - `origin_height_m`: number (signed height of Marker 0 above fitted ground plane $z = 0$)
   - `origin_residual_m`: number or `null` (3D distance between Marker 0 start and end sightings in yard frame)
-  - `ground_plane_residual_m`: number (median $|z|$ of ground plane inliers)
+  - `ground_plane_residual_m`: number (median $|z|$ across the ground candidate band)
+  - `ground_plane_residual_p95_m`: number (95th percentile $|z|$ across the ground candidate band, used to bound `tolerances_95pct.height_m`)
   - `north_calibration`: `{ "status": "ok" | "denied" | "accuracy_exceeded" | "insufficient_samples", "north_angle_deg": 92.4, "north_uncertainty_deg": 8.5, "sample_count": 12 }`
   - `loop_closure_gaps`: `[{ "marker_id": 0, "first_t_s": 1.2, "last_t_s": 176.4, "gap_m": 0.038 }]`
   - `pose_jumps`: `[{ "saved_index_from": 2400, "saved_index_to": 2401, "t_s": 80.033, "jump_m": 0.112 }]`

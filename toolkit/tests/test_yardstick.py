@@ -570,3 +570,255 @@ def test_ys50_ys52_1cm_synthetic_accuracy_and_1p2m2_hole_preserved(
     cov = compute_scanned_ground_coverage(pts, confs, ranges)
     assert len(cov["holes_xy_m"]) == 1
 
+
+def test_round4_brisk_walk_snap_across_gap_and_multiframe_ramp(tmp_path: Path) -> None:
+    """Round 4 Blocker 7: Clean 1.4 m/s walk at 30 fps has 0 jumps; 1.0 m gap-snap & 30 cm 15-frame ramp caught."""
+    import math
+    from yardstick.geometry import detect_pose_jumps
+
+    # 1. Clean 1.4 m/s brisk walk at 30 fps (150 frames = 5.0 s)
+    rows_brisk = [
+        {
+            "t": f"{i / 30.0:.6f}",
+            "saved_index": str(i),
+            "px": f"{1.4 * (i / 30.0):.6f}",
+            "py": "0.900000",
+            "pz": f"{0.25 * math.sin(i / 30.0):.6f}",
+        }
+        for i in range(150)
+    ]
+    assert detect_pose_jumps(rows_brisk) == []
+
+    # 2. Single-frame 1.0 m snap across a 0.167 s gap (5 frames at 30 fps)
+    rows_gap = []
+    for i in range(40):
+        t_val = (i / 30.0) if i < 15 else ((i + 4) / 30.0)
+        x_val = 1.1 * t_val + (1.0 if i >= 15 else 0.0)
+        rows_gap.append(
+            {
+                "t": f"{t_val:.6f}",
+                "saved_index": str(i),
+                "px": f"{x_val:.6f}",
+                "py": "0.900000",
+                "pz": "0.000000",
+            }
+        )
+    jumps_gap = detect_pose_jumps(rows_gap)
+    assert len(jumps_gap) == 1
+    assert abs(jumps_gap[0]["jump_m"] - 1.0) < 0.02
+
+    # 3. Multi-frame 30 cm ramp over 15 frames at 30 fps (0.50 s)
+    rows_ramp = []
+    for i in range(45):
+        t_val = i / 30.0
+        ramp_m = 0.0 if i <= 10 else (0.30 * (i - 10) / 15.0 if i <= 25 else 0.30)
+        rows_ramp.append(
+            {
+                "t": f"{t_val:.6f}",
+                "saved_index": str(i),
+                "px": f"{1.0 * t_val + ramp_m:.6f}",
+                "py": "0.900000",
+                "pz": "0.000000",
+            }
+        )
+    jumps_ramp = detect_pose_jumps(rows_ramp)
+    assert len(jumps_ramp) == 1
+    assert abs(jumps_ramp[0]["jump_m"] - 0.30) < 0.02
+
+    # 4. Verify synth.py does not shrink dt on the jump frame
+    cap_jump = tmp_path / "cap_jump_dt"
+    generate_synthetic_capture(cap_jump, SynthOptions(pose_jump_m=0.14))
+    p_rows = list(csv.DictReader((cap_jump / "poses.csv").open()))
+    mid_idx = len(p_rows) // 2
+    dt_jump = float(p_rows[mid_idx]["t"]) - float(p_rows[mid_idx - 1]["t"])
+    assert abs(dt_jump - 0.20) < 1e-5
+
+
+def test_round4_far_or_unconfirmed_closing_sighting_rejected(tmp_path: Path) -> None:
+    """Round 4 Blocker 8: Closing Marker 0 sighting > 1.5 m away or without OpenCV-confirmed still is rejected."""
+    # Case 1: Closing Marker 0 sighting at ~2.56 m distance (> 1.50 m) at saved_index=17 (in last 35% of walk, after Marker 3)
+    cap_far = tmp_path / "cap_far_m0"
+    generate_synthetic_capture(cap_far, SynthOptions(include_loop_closure=False))
+    poses_rows = list(csv.DictReader((cap_far / "poses.csv").open()))
+    m_rows = list(csv.DictReader((cap_far / "markers.csv").open()))
+    far_m0 = dict(m_rows[0])
+    far_m0["saved_index"] = poses_rows[17]["saved_index"]
+    far_m0["t"] = poses_rows[17]["t"]
+    m_rows.append(far_m0)
+    m_rows.sort(key=lambda r: float(r["t"]))
+    with (cap_far / "markers.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(m_rows[0].keys()))
+        w.writeheader()
+        w.writerows(m_rows)
+    seal_manifest(cap_far)
+
+    res_far = convert_recording_to_standard(cap_far)
+    assert res_far["frame"]["origin_residual_m"] is None
+    assert "no_loop_closure" in res_far["grade"]["caps_applied"]
+    assert res_far["grade"]["grade"] == "C"
+
+    # Case 2: Closing Marker 0 sighting within 1.50 m has no still in stills.csv (not confirmed by OpenCV)
+    cap_unconf = tmp_path / "cap_unconf_m0"
+    generate_synthetic_capture(cap_unconf, SynthOptions(include_loop_closure=True))
+    s_rows = list(csv.DictReader((cap_unconf / "stills.csv").open()))
+    kept_s_rows = [r for r in s_rows if int(r["saved_index"]) not in (21, 22, 23)]
+    for s_idx in (21, 22, 23):
+        still_p = cap_unconf / "stills" / f"{s_idx:06d}.jpg"
+        if still_p.exists():
+            still_p.unlink()
+    with (cap_unconf / "stills.csv").open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=list(s_rows[0].keys()))
+        w.writeheader()
+        w.writerows(kept_s_rows)
+    seal_manifest(cap_unconf)
+
+    res_unconf = convert_recording_to_standard(cap_unconf)
+    assert res_unconf["frame"]["origin_residual_m"] is None
+    assert "no_loop_closure" in res_unconf["grade"]["caps_applied"]
+    assert res_unconf["grade"]["grade"] == "C"
+
+
+def test_round4_crowned_yard_p95_and_height_tolerance(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """Round 4 Blocker 9: A 15 cm crown reports both median and p95 ground residual and bases height_m on p95."""
+    from yardstick.geometry import build_yard_frame, fit_ground_plane_ransac
+    from yardstick.grading import compute_grade_and_tolerances
+
+    xs, zs = np.meshgrid(np.linspace(-1.0, 5.0, 60), np.linspace(-3.0, 3.0, 60))
+    r2 = (xs - 2.0) ** 2 + zs**2
+    crown_y = 0.15 * np.clip(1.0 - r2 / (1.8**2), 0.0, 1.0)
+    pts_world = np.column_stack([xs.ravel(), crown_y.ravel(), zs.ravel()])
+    cam_pos = np.array([[0.0, 0.9, 0.0]], dtype=np.float64)
+    m0_pos = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+
+    res_r = fit_ground_plane_ransac(pts_world, cam_pos, m0_pos, return_p95=True)
+    assert len(res_r) == 4
+    n_w, d_w, med_m, p95_m = res_r
+    assert med_m < 0.05
+    assert p95_m >= 0.10
+
+    yf = build_yard_frame(
+        ground_normal_world=n_w,
+        ground_d_world=d_w,
+        ground_residual_m=med_m,
+        ground_residual_p95_m=p95_m,
+        passes_by_marker={},
+        first_camera_pose_world=np.eye(4, dtype=np.float64),
+        pose_jumps=[],
+    )
+    assert yf["ground_plane_residual_p95_m"] >= 0.10
+
+    grade_info = compute_grade_and_tolerances(
+        integrity_status="clean",
+        frame_info=yf,
+        marker_scale_info={"scale_error_ratio": 0.0, "scale_error_se": 0.0, "scale_error_eff": 0.0},
+        tape_checks_world=[],
+        T_yard_from_world=yf["T_matrix"],
+        walk_length_m=20.0,
+        limited_tracking_share=0.0,
+    )
+    assert grade_info["tolerances_95pct"]["height_m"] >= p95_m
+
+
+def test_round4_unaligned_square_and_circular_holes_preserved() -> None:
+    """Round 4 Blocker 10: Unaligned 1.10..1.49 m^2 square and 1.30 m^2 round holes are preserved."""
+    import math
+    from yardstick.geometry import compute_scanned_ground_coverage
+
+    xs, ys = np.meshgrid(np.linspace(0.05, 5.95, 100), np.linspace(0.05, 5.95, 100))
+    base = np.column_stack([xs.ravel(), ys.ravel(), np.zeros(xs.size)])
+    cx, cy = 2.53, 2.57  # Unaligned with 0.20 m cells
+
+    for area in (0.36, 0.80):
+        s = math.sqrt(area)
+        in_h = (np.abs(base[:, 0] - cx) < s / 2.0) & (np.abs(base[:, 1] - cy) < s / 2.0)
+        pts = base[~in_h]
+        cov = compute_scanned_ground_coverage(
+            pts, np.full(len(pts), 2, dtype=np.uint8), np.full(len(pts), 2.0)
+        )
+        assert len(cov["holes_xy_m"]) == 0, f"Expected {area} m^2 hole to be filled"
+
+    for area in (1.10, 1.21, 1.44, 1.49):
+        s = math.sqrt(area)
+        in_h = (np.abs(base[:, 0] - cx) < s / 2.0) & (np.abs(base[:, 1] - cy) < s / 2.0)
+        pts = base[~in_h]
+        cov = compute_scanned_ground_coverage(
+            pts, np.full(len(pts), 2, dtype=np.uint8), np.full(len(pts), 2.0)
+        )
+        assert len(cov["holes_xy_m"]) == 1, f"Expected unaligned {area} m^2 square hole to be preserved"
+
+    # Round 1.30 m^2 hole
+    r_c = math.sqrt(1.30 / math.pi)
+    in_c = ((base[:, 0] - cx) ** 2 + (base[:, 1] - cy) ** 2) < (r_c * r_c)
+    pts_c = base[~in_c]
+    cov_c = compute_scanned_ground_coverage(
+        pts_c, np.full(len(pts_c), 2, dtype=np.uint8), np.full(len(pts_c), 2.0)
+    )
+    assert len(cov_c["holes_xy_m"]) == 1, "Expected 1.30 m^2 circular hole to be preserved"
+
+
+def test_round4_90deg_rotated_marker_corner_order_and_plane_fit() -> None:
+    """Round 4 Blocker 2: 90-deg CW rotated marker corner shift rot % 4 and LiDAR plane fit up to 3.5 m."""
+    import cv2
+    from yardstick.markers import detect_aruco_markers_opencv, measure_marker_corners_3d_on_lidar_plane
+
+    # Render Marker 0 and rotate image 90 deg CW
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250)
+    m_gray = cv2.aruco.generateImageMarker(aruco_dict, 0, 160)
+    canvas = np.full((240, 240), 255, dtype=np.uint8)
+    canvas[40:200, 40:200] = m_gray
+    canvas_rot90_cw = cv2.rotate(canvas, cv2.ROTATE_90_CLOCKWISE)
+
+    dets = detect_aruco_markers_opencv(canvas_rot90_cw)
+    assert 0 in dets
+    c_opencv = dets[0]
+
+    # When a marker is rotated 90 deg CW in the image, its canonical TL corner is at the image's TR corner (index 1)
+    # and the shift `rot % 4` with rot=1 selects index 1 as c0 (TL) and index 2 as c1 (TR):
+    detected_img_quad = np.array(
+        [[40.0, 40.0], [200.0, 40.0], [200.0, 200.0], [40.0, 200.0]], dtype=np.float64
+    )
+    rot = 1
+    shifted = np.array([detected_img_quad[(k + (rot % 4)) % 4] for k in range(4)])
+    assert np.allclose(shifted, c_opencv, atol=2.0)
+
+    # Also test measure_marker_corners_3d_on_lidar_plane at 3.2 m range (within widened 0.50..3.50 m gate)
+    depth_mm = np.full((192, 256), 3200, dtype=np.uint16)
+    conf_img = np.full((192, 256), 2, dtype=np.uint8)
+    corners_uv = np.array(
+        [[280.0, 200.0], [317.5, 200.0], [317.5, 237.5], [280.0, 237.5]], dtype=np.float64
+    )
+    res = measure_marker_corners_3d_on_lidar_plane(
+        corners_uv=corners_uv,
+        depth_mm=depth_mm,
+        conf_img=conf_img,
+        fx=480.0,
+        fy=480.0,
+        cx=320.0,
+        cy=240.0,
+        rgb_width=640,
+        rgb_height=480,
+        T_world_from_cam=np.eye(4, dtype=np.float64),
+    )
+    assert res is not None
+    _, measured_mm, mean_range_m = res
+    assert abs(measured_mm - 250.0) < 5.0
+    assert 3.0 <= mean_range_m <= 3.5
+
+
+def test_round4_converter_handles_truncated_png_with_fail_grade(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """Round 4 Blocker 11: Converter catches truncated PNG and writes a fail grade.json instead of crashing."""
+    cap = _clone_capture(base_synth_dir, tmp_path / "cap_trunc_png")
+    dp = cap / "depth" / "000000.png"
+    raw = dp.read_bytes()
+    dp.write_bytes(raw[:12])  # Truncated PNG
+
+    res = convert_recording_to_standard(cap)
+    assert res["grade"]["grade"] == "fail"
+    assert "integrity_invalid" in res["grade"]["caps_applied"]
+    assert (cap / "standard" / "grade.json").exists()
+
+
