@@ -1,0 +1,67 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/events.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "audio_file": {
+      "const": "audio.wav"
+    },
+    "audio_first_sample_t_s": {
+      "type": "number"
+    },
+    "audio_sample_rate_hz": {
+      "enum": [
+        16000
+      ],
+      "type": "integer"
+    },
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "events": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "marker",
+              "tape_a",
+              "tape_b",
+              "done",
+              "note"
+            ],
+            "type": "string"
+          },
+          "saved_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "t": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "t",
+          "saved_index",
+          "kind",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "audio_file",
+    "audio_first_sample_t_s",
+    "audio_sample_rate_hz",
+    "events"
+  ],
+  "title": "Yardstick Level 2 Timed Events & Audio Anchor",
+  "type": "object"
+}

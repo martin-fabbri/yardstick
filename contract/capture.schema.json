@@ -1,0 +1,238 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/capture.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capture_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "captured_at_utc": {
+      "type": "string"
+    },
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "files": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "size_bytes",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "integrity": {
+      "additionalProperties": false,
+      "properties": {
+        "findings": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "code": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "severity": {
+                "enum": [
+                  "info",
+                  "warning",
+                  "error"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "severity",
+              "message"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "clean",
+            "warnings",
+            "partial",
+            "invalid"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "findings"
+      ],
+      "type": "object"
+    },
+    "location": {
+      "additionalProperties": false,
+      "properties": {
+        "heading_accuracy_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "horizontal_accuracy_m": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "latitude_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "longitude_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "magnetic_heading_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "north_samples": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "camera_yaw_world_deg": {
+                "type": "number"
+              },
+              "heading_accuracy_deg": {
+                "type": "number"
+              },
+              "t_s": {
+                "type": "number"
+              },
+              "true_heading_deg": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "t_s",
+              "camera_yaw_world_deg",
+              "true_heading_deg",
+              "heading_accuracy_deg"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "denied",
+            "accuracy_exceeded",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "true_heading_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "latitude_deg",
+        "longitude_deg",
+        "horizontal_accuracy_m",
+        "true_heading_deg",
+        "magnetic_heading_deg",
+        "heading_accuracy_deg",
+        "north_samples"
+      ],
+      "type": "object"
+    },
+    "recording_manifest_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "source": {
+      "additionalProperties": false,
+      "properties": {
+        "app": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "app_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "device_model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "device_name": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "ios_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "sensor": {
+          "const": "lidar"
+        }
+      },
+      "required": [
+        "app",
+        "app_version",
+        "device_model",
+        "device_name",
+        "ios_version",
+        "sensor"
+      ],
+      "type": "object"
+    },
+    "voxel_size_m": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+    }
+  },
+  "required": [
+    "contract",
+    "capture_id",
+    "recording_manifest_sha256",
+    "captured_at_utc",
+    "source",
+    "location",
+    "voxel_size_m",
+    "integrity",
+    "files"
+  ],
+  "title": "Yardstick Level 2 Standard Capture Metadata",
+  "type": "object"
+}

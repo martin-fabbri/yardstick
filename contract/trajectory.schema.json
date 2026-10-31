@@ -1,0 +1,47 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/trajectory.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "poses": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "pose": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 16,
+            "minItems": 16,
+            "type": "array"
+          },
+          "saved_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "t": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "t",
+          "saved_index",
+          "pose"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "poses"
+  ],
+  "title": "Yardstick Level 2 Camera Trajectory in Yard Frame",
+  "type": "object"
+}

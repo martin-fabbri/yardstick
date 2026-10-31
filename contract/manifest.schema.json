@@ -1,0 +1,74 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/manifest.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "capture_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "files": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "size_bytes": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "size_bytes",
+          "sha256"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "sealed_at_utc": {
+      "type": "string"
+    },
+    "streams_declared": {
+      "items": {
+        "enum": [
+          "session",
+          "frames",
+          "rgb_video",
+          "depth",
+          "confidence",
+          "poses",
+          "audio",
+          "events",
+          "stills",
+          "markers",
+          "health"
+        ],
+        "type": "string"
+      },
+      "type": "array",
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "contract",
+    "capture_id",
+    "sealed_at_utc",
+    "streams_declared",
+    "files"
+  ],
+  "title": "Yardstick Level 1 Sealed Manifest",
+  "type": "object"
+}
