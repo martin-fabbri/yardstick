@@ -905,20 +905,51 @@ def compute_scanned_ground_coverage(
     largest_label = int(np.argmax(sizes))
     region = labeled == largest_label
 
-    # Identify interior holes: fill only small occlusion holes <= max_filled_hole_m2 (<= 25 cells)
+    # Identify interior holes using a fine 0.025 m grid stamped with each point's local cell footprint
+    # so 1.0..1.5 m^2 square and circular holes are measured by their true area regardless of 20 cm alignment.
     filled_all = binary_fill_holes(region)
-    holes_mask = filled_all & (~region)
 
-    hole_labels, n_holes = label(holes_mask)
-    large_holes_mask = np.zeros_like(region)
-    large_hole_components: list[np.ndarray] = []
-    for h_id in range(1, n_holes + 1):
-        h_comp = hole_labels == h_id
-        if int(np.sum(h_comp)) <= max_hole_cells:
-            region = region | h_comp
-        else:
-            large_holes_mask = large_holes_mask | h_comp
-            large_hole_components.append(h_comp)
+    f_cell = 0.025
+    pts_xy = ground_pts[:, :2]
+    if pts_xy.shape[0] >= 4:
+        from scipy.spatial import cKDTree
+
+        tree = cKDTree(pts_xy)
+        nn_dists, _ = tree.query(pts_xy, k=2)
+        d_step = float(np.percentile(nn_dists[:, 1], 75))
+    else:
+        d_step = 0.05
+    stamp_k = max(2, min(10, int(round(d_step / f_cell))))
+    fx = np.rint(pts_xy[:, 0] / f_cell).astype(np.int32)
+    fy = np.rint(pts_xy[:, 1] / f_cell).astype(np.int32)
+    f_pad = stamp_k + 8
+    min_fx, max_fx = int(np.min(fx)) - f_pad, int(np.max(fx)) + f_pad
+    min_fy, max_fy = int(np.min(fy)) - f_pad, int(np.max(fy)) + f_pad
+    f_occ = np.zeros((max_fy - min_fy + 1, max_fx - min_fx + 1), dtype=np.uint8)
+    f_occ[fy - min_fy, fx - min_fx] = 255
+    k_stamp = cv2.getStructuringElement(cv2.MORPH_RECT, (stamp_k, stamp_k))
+    f_stamped = cv2.dilate(f_occ, k_stamp)
+    k_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    f_closed = cv2.morphologyEx(f_stamped, cv2.MORPH_CLOSE, k_close) > 0
+
+    f_labeled, n_f_comp = label(f_closed)
+    if n_f_comp > 0:
+        f_sizes = np.bincount(f_labeled.ravel())
+        f_sizes[0] = 0
+        f_region = f_labeled == int(np.argmax(f_sizes))
+    else:
+        f_region = f_closed
+
+    f_filled_all = binary_fill_holes(f_region)
+    f_holes_mask = f_filled_all & (~f_region)
+    f_hole_labels, n_f_holes = label(f_holes_mask)
+
+    fine_large_hole_components: list[tuple[np.ndarray, float]] = []
+    for fh_id in range(1, n_f_holes + 1):
+        fh_comp = f_hole_labels == fh_id
+        true_hole_area_m2 = float(np.sum(fh_comp)) * (f_cell * f_cell)
+        if true_hole_area_m2 > max_filled_hole_m2:
+            fine_large_hole_components.append((fh_comp, true_hole_area_m2))
 
     def _cells_to_corner_mask(cell_mask: np.ndarray) -> np.ndarray:
         """Expand (h, w) cell mask to (h+1, w+1) cell-corner vertex mask so findContours traces exact cell edges."""
@@ -936,12 +967,19 @@ def compute_scanned_ground_coverage(
         raise ValueError("Could not extract outer boundary contour")
     outer_contour = max(contours, key=cv2.contourArea)
 
-    def _contour_to_xy(cnt: np.ndarray, eps_m: float, ccw: bool) -> list[list[float]]:
+    def _contour_to_xy(
+        cnt: np.ndarray,
+        eps_m: float,
+        ccw: bool,
+        cell_m: float = grid_cell_m,
+        off_x: int = min_ix,
+        off_y: int = min_iy,
+    ) -> list[list[float]]:
         pts_grid = cnt[:, 0, :].astype(np.float64)
         pts_m = np.column_stack(
             [
-                (pts_grid[:, 0] + min_ix) * grid_cell_m,
-                (pts_grid[:, 1] + min_iy) * grid_cell_m,
+                (pts_grid[:, 0] + off_x) * cell_m,
+                (pts_grid[:, 1] + off_y) * cell_m,
             ]
         )
         for factor in [1.0, 0.7, 0.5, 0.25, 0.1, 0.0]:
@@ -966,15 +1004,16 @@ def compute_scanned_ground_coverage(
 
     holes_xy_m: list[list[list[float]]] = []
     holes_area = 0.0
-    for h_comp in large_hole_components:
-        h_uint8 = _cells_to_corner_mask(h_comp)
+    hole_eps_m = min(simplify_epsilon_m, 0.04)
+    for fh_comp, true_hole_area_m2 in fine_large_hole_components:
+        h_uint8 = _cells_to_corner_mask(fh_comp)
         h_contours, _ = cv2.findContours(h_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         if not h_contours:
             continue
         hc = max(h_contours, key=cv2.contourArea)
-        h_poly = _contour_to_xy(hc, simplify_epsilon_m, ccw=False)
+        h_poly = _contour_to_xy(hc, hole_eps_m, ccw=False, cell_m=f_cell, off_x=min_fx, off_y=min_fy)
         h_a = abs(_polygon_signed_area(np.array(h_poly, dtype=np.float64)))
-        if h_a >= max_filled_hole_m2 or int(np.sum(h_comp)) > max_hole_cells:
+        if true_hole_area_m2 > max_filled_hole_m2:
             holes_xy_m.append(h_poly)
             holes_area += h_a
 
