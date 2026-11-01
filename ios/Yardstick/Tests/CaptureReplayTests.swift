@@ -259,6 +259,9 @@ final class CaptureReplayTests: XCTestCase {
         )
         state.ingestSightings([m0CloseA], timestampS: 22.0, savedIndex: 30, cameraPositionWorld: SIMD3<Double>(0.05, 1.2, 0.5))
         XCTAssertFalse(state.unifiedLoopClosed, "YS-71: Without Marker 3 (and without End Early), loop must not close")
+        XCTAssertNil(state.unifiedLoopClosureGapMeters, "YS-71: unifiedLoopClosureGapMeters must be nil before Marker 3 is seen")
+        XCTAssertNil(state.loopClosureGapMeters, "YS-71: active loopClosureGapMeters must ALSO be nil when unifiedLoopClosed == false")
+        XCTAssertNotNil(state.legacyPreYS71GapMeters, "YS-66: legacyPreYS71GapMeters retains the pre-YS-71 single-sighting gap")
 
         // Now lock Marker 3 and return to Marker 0 (closing pass median x = 0.06 -> spread = |0.06 - 0.01| = 0.05 m)
         let m3 = DetectedMarkerSighting(
@@ -285,6 +288,7 @@ final class CaptureReplayTests: XCTestCase {
 
         XCTAssertTrue(state.unifiedLoopClosed, "YS-71: Loop closes after Markers 1–3 and return hold at Marker 0")
         XCTAssertEqual(state.unifiedLoopClosureGapMeters ?? -1.0, 0.05, accuracy: 1e-6, "YS-71: Spread is distance between pass medians (0.06 - 0.01 = 0.05 m)")
+        XCTAssertEqual(state.loopClosureGapMeters ?? -1.0, 0.05, accuracy: 1e-6, "YS-71: active loopClosureGapMeters equals unifiedLoopClosureGapMeters")
     }
 
     /// `YS-70` / `YS-73`: Always-on unit test verifying OpenCV Apache-2.0 attribution, predicted motion blur,

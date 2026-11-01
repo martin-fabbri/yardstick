@@ -172,12 +172,14 @@ public struct PhoneLoopRuleState: Sendable {
         if lastOperatorTapTimeS == nil || timestampS > lastOperatorTapTimeS! {
             lastOperatorTapTimeS = timestampS
         }
+        evaluateUnifiedLoopClosure()
     }
 
     public mutating func recordLoopClosedEvent(at timestampS: Double) {
         if loopClosedEventTimeS == nil || timestampS > loopClosedEventTimeS! {
             loopClosedEventTimeS = timestampS
         }
+        evaluateUnifiedLoopClosure()
     }
 
     /// Ingest 3D marker sightings detected on a frame at `timestampS` with camera position `camPosW`.
@@ -205,13 +207,8 @@ public struct PhoneLoopRuleState: Sendable {
                           (timestampS - firstT) >= 3.0,
                           (marker0MaxExcursionM >= 1.0 || (timestampS - firstT) >= 10.0),
                           simd_length(camPosW - m.positionWorld) <= 1.50 {
-                    marker0LastPassPos = m.positionWorld
-                    marker0LastPassTimeS = timestampS
                     let legacyGap = simd_length(m.positionWorld - firstPos)
                     legacyPreYS71GapMeters = legacyGap
-                    if loopClosureGapMeters == nil {
-                        loopClosureGapMeters = legacyGap
-                    }
                 }
             }
         }
@@ -297,6 +294,9 @@ public struct PhoneLoopRuleState: Sendable {
         guard let m0Passes = passesByMarker[0], m0Passes.count >= 2 else {
             unifiedLoopClosed = false
             unifiedLoopClosureGapMeters = nil
+            loopClosureGapMeters = nil
+            marker0LastPassPos = nil
+            marker0LastPassTimeS = nil
             return
         }
 
@@ -306,6 +306,9 @@ public struct PhoneLoopRuleState: Sendable {
             if !hasM123 {
                 unifiedLoopClosed = false
                 unifiedLoopClosureGapMeters = nil
+                loopClosureGapMeters = nil
+                marker0LastPassPos = nil
+                marker0LastPassTimeS = nil
                 return
             }
         }
@@ -383,6 +386,9 @@ public struct PhoneLoopRuleState: Sendable {
         guard !validClosingRows.isEmpty else {
             unifiedLoopClosed = false
             unifiedLoopClosureGapMeters = nil
+            loopClosureGapMeters = nil
+            marker0LastPassPos = nil
+            marker0LastPassTimeS = nil
             return
         }
 
@@ -394,6 +400,7 @@ public struct PhoneLoopRuleState: Sendable {
 
         unifiedLoopClosed = true
         unifiedLoopClosureGapMeters = effGap
+        loopClosureGapMeters = effGap
         marker0FirstPassPos = pFirst
         marker0FirstPassTimeS = firstPass.first?.timestampS
         marker0LastPassPos = pLast

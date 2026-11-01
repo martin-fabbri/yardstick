@@ -91,14 +91,22 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         detectedMarkerIDs: [Int],
         forceOperatorMarkerTap: Bool,
         sharpness: Double?
-    ) -> (shouldSave: Bool, reason: String?) {
+    ) -> (shouldSave: Bool, reason: String?, snapshotBefore: StillCaptureGate) {
         stillGateLock.withLock { gate in
-            gate.evaluateFrame(
+            let before = gate
+            let res = gate.evaluateFrame(
                 timestampS: timestampS,
                 detectedMarkerIDs: detectedMarkerIDs,
                 forceOperatorMarkerTap: forceOperatorMarkerTap,
                 sharpness: sharpness
             )
+            return (res.shouldSave, res.reason, before)
+        }
+    }
+
+    func restoreStillGate(_ snapshot: StillCaptureGate) {
+        stillGateLock.withLock { gate in
+            gate = snapshot
         }
     }
 
@@ -773,8 +781,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let sIdx = max(0, latestSavedIndex)
         if ["marker", "note", "tape_a", "tape_b"].contains(kind) {
             phoneLoopState.recordOperatorTap(at: t)
+            isLoopClosed = phoneLoopState.unifiedLoopClosed
+            loopClosureGapMeters = phoneLoopState.unifiedLoopClosureGapMeters
         } else if kind == "loop_closed" {
             phoneLoopState.recordLoopClosedEvent(at: t)
+            isLoopClosed = phoneLoopState.unifiedLoopClosed
+            loopClosureGapMeters = phoneLoopState.unifiedLoopClosureGapMeters
         }
         let safeDetail = detail.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
         let line = String(format: "%.6f,%d,%@,%@\n", t, sIdx, kind, safeDetail)
@@ -1078,7 +1090,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                 "ios_version": UIDevice.current.systemVersion,
                 "lidar_supported": Self.isLiDARSupported,
             ],
-            "app_version": "0.1.0",
+            "app_version": "0.2.0",
             "clock": [
                 "started_at_utc": startedAtUTC,
                 "t0_monotonic_s": t0,
@@ -2114,7 +2126,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     // rate-limited still gate (`YS-68`), and OpenCV JPEG confirmation (`YS-70`) onto the
                     // single-slot `detectionScheduler` so `writerQueue` is never blocked!
                     let shouldRunArUco = (sIdx % 3 == 0) || forceArUco
-                    let shouldConsiderPeriodicStill = (timestampS - engine.lastAnyStillTimeS) >= 2.0
+                    let isSteadyEnoughForStill = (predictedBlurPx <= ExposureAndStillnessGate.maxPredictedBlurPx)
+                        && (turnRateRadS <= ExposureAndStillnessGate.maxTurnRateRadS)
+                    let shouldConsiderPeriodicStill = isSteadyEnoughForStill && ((timestampS - engine.lastAnyStillTimeS) >= 2.0)
                     if shouldRunArUco || shouldConsiderPeriodicStill {
                         self.detectionScheduler.submitIfIdle { [weak self] in
                             guard let self, !engine.isClosed else { return }
@@ -2194,7 +2208,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                 let stillState = sp.beginInterval("StillJPEGEncode")
                                 let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
                                 let ciImg = CIImage(cvPixelBuffer: sendableRGB.buffer)
-                                let cs = CGColorSpaceCreateDeviceRGB()
+                                let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
                                 if let jpegData = engine.detectionCIContext.jpegRepresentation(
                                     of: ciImg,
                                     colorSpace: cs,
@@ -2232,7 +2246,12 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                             exposureDurationS, isoVal
                                         )
                                         encodedStill = (stillRelPath, jpegData, meta, sLine)
+                                    } else {
+                                        // Roll back the hold still counter if OpenCV rejected the marker on the encoded JPEG (`YS-68`, `YS-70`)
+                                        engine.restoreStillGate(gateDecision.snapshotBefore)
                                     }
+                                } else {
+                                    engine.restoreStillGate(gateDecision.snapshotBefore)
                                 }
                                 sp.endInterval("StillJPEGEncode", stillState)
                             }
@@ -2291,6 +2310,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     )
                                     self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
                                     self.isLoopClosed = self.phoneLoopState.unifiedLoopClosed
+                                    self.loopClosureGapMeters = self.phoneLoopState.unifiedLoopClosureGapMeters
 
                                     // YS-73: After 3 sightings of a marker, check if median measured size is > 3% off
                                     for m in finalDetected {
