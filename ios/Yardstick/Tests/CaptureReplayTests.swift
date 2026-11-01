@@ -369,6 +369,429 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertTrue(row.hasPrefix("100.250000,42,frame,recording,Turn a little slower,true,"))
     }
 
+    /// `YS-74`: Always-on unit test verifying the deterministic `GuidedCaptureEngine` state machine:
+    /// - `0.7 s` debounce and `1.5 s` minimum dwell,
+    /// - 3-still lock rule (`>= 1.0 s` span, `trackingState == "normal"`, `YS-73` gates met, viewing angle `<= 40°`,
+    ///   3D position spread `<= 2.5 cm`, size within `±3%` of printed),
+    /// - pauses rather than resets when a condition breaks,
+    /// - rising haptic tick (`0.5 -> 0.7 -> 0.9`), `nil` haptic on corrections, `nil` haptic during voice note recording,
+    /// - Markers 1–3 can be locked in any order (`2 -> 1 -> 3`),
+    /// - `"Fix now"` (`requestFixNow`) requires Marker 0 to be locked again at the end before `Finish` becomes available.
+    func testYS74_GuidedCaptureEngine_3StillLockPauseHapticsAndFixNowReturnToMarker0() {
+        var engine = GuidedCaptureEngine(requireLookUpStep: true)
+        XCTAssertEqual(engine.phase, .openingMarker0)
+        XCTAssertEqual(engine.activeInstruction, "Stand over marker 0 and point at it")
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: false))
+
+        func makeSighting(
+            id: Int,
+            pos: SIMD3<Double> = SIMD3<Double>(0, 0, 0),
+            printedMM: Double = 180.0,
+            measuredMM: Double = 179.8,
+            angleDeg: Double = 22.0,
+            rangeM: Double = 1.05
+        ) -> DetectedMarkerSighting {
+            DetectedMarkerSighting(
+                markerID: id,
+                cornersUV: [
+                    SIMD2<Double>(900, 660),
+                    SIMD2<Double>(1020, 660),
+                    SIMD2<Double>(1020, 780),
+                    SIMD2<Double>(900, 780),
+                ],
+                positionWorld: pos,
+                quaternionXYZW: SIMD4<Double>(0, 0, 0, 1),
+                sizeMMPrinted: printedMM,
+                sizeMMMeasured: measuredMM,
+                rangeMeters: rangeM,
+                viewingAngleDeg: angleDeg
+            )
+        }
+
+        let camAtM0 = SIMD3<Double>(0, 1.2, 0.5)
+
+        // 1. First confirmed still on Marker 0 at t = 1.0 s -> segment 1 confirmed, haptic intensity 0.5
+        let s1 = engine.step(
+            timestampS: 1.0,
+            savedIndex: 10,
+            dt: 0.033,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.04,
+            predictedBlurPx: 0.5,
+            cameraPositionWorld: camAtM0,
+            confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.0, 0.0, 0.0))],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.0, 0.0, 0.0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.activeRingState?.confirmedSegments, 1)
+        XCTAssertEqual(engine.activeRingState?.isPaused, false)
+        XCTAssertEqual(s1.haptic, .holdSegmentConfirmed(markerID: 0, segment: 1, intensity: 0.5))
+
+        // 2. Condition breaks at t = 1.2 s (fast turn / blur) -> ring PAUSES at 1 segment (does NOT reset to 0!)
+        // and correction does NOT emit a haptic
+        let sPause = engine.step(
+            timestampS: 1.2,
+            savedIndex: 16,
+            dt: 0.20,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.35,
+            predictedBlurPx: 3.2,
+            cameraPositionWorld: camAtM0,
+            confirmedSightings: [],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.0, 0.0, 0.0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.activeRingState?.confirmedSegments, 1, "YS-74: Hold must pause rather than reset when a condition breaks")
+        XCTAssertEqual(engine.activeRingState?.isPaused, true)
+        XCTAssertNil(sPause.haptic, "YS-74: Corrections must never trigger a haptic")
+
+        // 3. Second confirmed still at t = 1.6 s -> segment 2 confirmed, haptic intensity 0.7
+        let s2 = engine.step(
+            timestampS: 1.6,
+            savedIndex: 28,
+            dt: 0.40,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.04,
+            predictedBlurPx: 0.5,
+            cameraPositionWorld: camAtM0,
+            confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.01, 0.0, 0.0))],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.01, 0.0, 0.0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.activeRingState?.confirmedSegments, 2)
+        XCTAssertEqual(engine.activeRingState?.isPaused, false)
+        XCTAssertEqual(s2.haptic, .holdSegmentConfirmed(markerID: 0, segment: 2, intensity: 0.7))
+
+        // 4. Reject a sample whose viewing angle > 40° or size > ±3% off -> stays at 2 segments
+        _ = engine.step(
+            timestampS: 2.0,
+            savedIndex: 40,
+            dt: 0.40,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.04,
+            predictedBlurPx: 0.5,
+            cameraPositionWorld: camAtM0,
+            confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.01, 0.0, 0.0), measuredMM: 190.0, angleDeg: 45.0)],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.01, 0.0, 0.0), measuredMM: 190.0, angleDeg: 45.0)],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.activeRingState?.confirmedSegments, 2, "YS-74: Sample failing 40° viewing angle or ±3% size must not advance hold")
+        XCTAssertFalse(engine.lockedMarkerIDs.contains(0))
+
+        // 5. Third confirmed still at t = 2.2 s (span = 1.2 s >= 1.0 s, 3D spread <= 2.5 cm) -> locks Marker 0!
+        let s3 = engine.step(
+            timestampS: 2.2,
+            savedIndex: 46,
+            dt: 0.20,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.04,
+            predictedBlurPx: 0.5,
+            cameraPositionWorld: camAtM0,
+            confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.015, 0.0, 0.0))],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.015, 0.0, 0.0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertTrue(engine.lockedMarkerIDs.contains(0))
+        XCTAssertEqual(engine.phase, .markers1To3)
+        XCTAssertEqual(s3.haptic, .markerLocked(markerID: 0))
+        XCTAssertEqual(engine.activeInstruction, "Got marker 0. Every marker works like that.")
+
+        // 6. Verify voice-note recording suppresses all haptics (YS-74)
+        engine.setRecordingVoiceNote(true, at: 3.9)
+        let sMuted = engine.step(
+            timestampS: 4.0,
+            savedIndex: 100,
+            dt: 0.033,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.04,
+            predictedBlurPx: 0.5,
+            cameraPositionWorld: SIMD3<Double>(4.0, 1.2, 0.5),
+            confirmedSightings: [makeSighting(id: 2, pos: SIMD3<Double>(4.0, 0, 0))],
+            rawSightings: [makeSighting(id: 2, pos: SIMD3<Double>(4.0, 0, 0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertNil(sMuted.haptic, "YS-74: No haptics may fire while a voice note is recording")
+        engine.setRecordingVoiceNote(false, at: 4.1)
+
+        // 7. Lock Markers 2, 1, 3 in out-of-sequence order (2 -> 1 -> 3)
+        var t = 4.5
+        var sIdx = 115
+        for mid in [2, 1, 3] {
+            let mPos = SIMD3<Double>(Double(mid) * 2.0, 0, 0)
+            let cPos = SIMD3<Double>(Double(mid) * 2.0, 1.2, 0.5)
+            for k in 0..<3 {
+                t += 0.55
+                sIdx += 16
+                _ = engine.step(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    dt: 0.55,
+                    trackingState: "normal",
+                    pitchDeg: -30.0,
+                    turnRateRadS: 0.03,
+                    predictedBlurPx: 0.4,
+                    cameraPositionWorld: cPos,
+                    confirmedSightings: [makeSighting(id: mid, pos: mPos + SIMD3<Double>(Double(k) * 0.005, 0, 0))],
+                    rawSightings: [makeSighting(id: mid, pos: mPos)],
+                    unifiedLoopClosed: false
+                )
+            }
+            XCTAssertTrue(engine.lockedMarkerIDs.contains(mid), "YS-74: Marker \(mid) must lock after 3 confirmed stills spanning >= 1.0 s")
+        }
+
+        // After Markers 1–3 are locked, phase transitions to `.houseWallLookUp` (YS-79)
+        XCTAssertEqual(engine.phase, .houseWallLookUp)
+        engine.skipLookUpStep(at: t + 0.5)
+        XCTAssertEqual(engine.phase, .closingMarker0)
+        XCTAssertEqual(engine.activeInstruction, "Head back to marker 0")
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: false))
+
+        // 8. Lock Marker 0 on return -> transitions to `.readyToFinish` ("All done. Tap Finish.")
+        var lastHaptic: GuidedHapticEvent? = nil
+        for k in 0..<3 {
+            t += 0.55
+            sIdx += 16
+            let res = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 0.55,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.03,
+                predictedBlurPx: 0.4,
+                cameraPositionWorld: camAtM0,
+                confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(Double(k) * 0.004, 0, 0))],
+                rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0, 0, 0))],
+                unifiedLoopClosed: k == 2
+            )
+            lastHaptic = res.haptic
+        }
+        XCTAssertTrue(engine.isClosingMarker0Locked)
+        XCTAssertTrue(engine.isFinishAvailable(unifiedLoopClosed: true))
+        XCTAssertEqual(engine.phase, .readyToFinish)
+        XCTAssertEqual(engine.activeInstruction, "All done. Tap Finish.")
+        XCTAssertEqual(lastHaptic, .loopClosedPathComplete)
+
+        // 9. Trigger "Fix now" -> requires closing Marker 0 to be locked again!
+        engine.beginFixNowRequiringReturnToMarker0(at: t + 1.0)
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-74: Fix now must require re-locking Marker 0 at the end")
+        XCTAssertEqual(engine.phase, .closingMarker0)
+    }
+
+    /// `YS-78`: Always-on unit test verifying the `0.25 m` `GroundCoverageGrid` filters depth to
+    /// `range 0.5–4.0 m`, within `±0.25 m` of the marker plane, surface normal within `35°` of vertical,
+    /// and matches toolkit ground cells `>= 90%`.
+    func testYS78_GroundCoverageGrid_FiltersRangeHeightNormalAndMatchesToolkitCellsAtLeast90Percent() throws {
+        var grid = GroundCoverageGrid(cellSizeM: 0.25)
+        grid.anchorGroundPlaneY(0.0)
+
+        // Create a synthetic 64x48 depth map where the camera is at (0, 1.30, 0) pitched down -30°
+        let dW = 64
+        let dH = 48
+        let rgbW = 1920
+        let rgbH = 1440
+        let fx = 1440.0
+        let fy = 1440.0
+        let cx = 960.0
+        let cy = 720.0
+
+        // Camera pitched -30° around X axis at height y = 1.30 m
+        let pitchRad = -30.0 * Double.pi / 180.0
+        let c = cos(pitchRad)
+        let s = sin(pitchRad)
+        let camToWorld = simd_double4x4(
+            SIMD4<Double>(1, 0, 0, 0),
+            SIMD4<Double>(0, c, s, 0),
+            SIMD4<Double>(0, -s, c, 0),
+            SIMD4<Double>(0, 1.30, 0, 1)
+        )
+
+        let scaleX = Double(dW) / Double(rgbW)
+        let scaleY = Double(dH) / Double(rgbH)
+        let fxD = fx * scaleX
+        let fyD = fy * scaleY
+        let cxD = cx * scaleX
+        let cyD = cy * scaleY
+
+        var depthMM = [UInt16](repeating: 0, count: dW * dH)
+        let confMap = [UInt8](repeating: 2, count: dW * dH)
+        var toolkitGroundSamples: [(positionWorld: SIMD3<Double>, confidence: UInt8, rangeM: Double)] = []
+
+        for v in 0..<dH {
+            for u in 0..<dW {
+                // Ray in camera space through (u, v): dirCam = ((u+0.5-cxD)/fxD, -(v+0.5-cyD)/fyD, -1)
+                let rx = (Double(u) + 0.5 - cxD) / fxD
+                let ry = -(Double(v) + 0.5 - cyD) / fyD
+                let rz = -1.0
+                let dirW4 = camToWorld * SIMD4<Double>(rx, ry, rz, 0.0)
+                let dirW = SIMD3<Double>(dirW4.x, dirW4.y, dirW4.z)
+                guard dirW.y < -0.05 else { continue }
+                // Intersect with flat ground plane y = 0: 1.30 + tRay * dirW.y = 0 -> tRay = -1.30 / dirW.y
+                let zCamDepth = -1.30 / dirW.y
+                guard zCamDepth > 0.3 && zCamDepth < 5.0 else { continue }
+                depthMM[v * dW + u] = UInt16(clamping: Int((zCamDepth * 1000.0).rounded()))
+
+                let ptW = SIMD3<Double>(0, 1.30, 0) + zCamDepth * dirW
+                let rng = simd_length(SIMD3<Double>(rx * zCamDepth, ry * zCamDepth, -zCamDepth))
+                if rng >= 0.50 && rng <= 4.00 && abs(ptW.y) <= 0.25 && u >= 4 && u < dW - 4 && v >= 4 && v < dH - 4 && (u % 4 == 0) && (v % 4 == 0) {
+                    toolkitGroundSamples.append((positionWorld: ptW, confidence: 2, rangeM: rng))
+                }
+            }
+        }
+
+        let stats = grid.ingestDepthFrame(
+            timestampS: 1.0,
+            depthMapMM: depthMM,
+            confidenceMap: confMap,
+            depthWidth: dW,
+            depthHeight: dH,
+            rgbWidth: rgbW,
+            rgbHeight: rgbH,
+            fx: fx,
+            fy: fy,
+            cx: cx,
+            cy: cy,
+            cameraToWorld: camToWorld,
+            sampleStep: 4
+        )
+        XCTAssertGreaterThan(stats.addedCells, 10, "YS-78: Flat ground plane must populate 0.25 m coverage cells")
+        XCTAssertGreaterThan(grid.coveredAreaM2, 0.5)
+
+        let agreement = GroundCoverageGrid.computeCellAgreementWithToolkitGroundPoints(
+            worldGroundPoints: toolkitGroundSamples,
+            groundYWorld: 0.0
+        )
+        XCTAssertGreaterThanOrEqual(
+            agreement.agreementRatio,
+            0.90,
+            String(format: "YS-78: Phone ground grid must match toolkit cells >= 90%% (got %.1f%%)", agreement.agreementRatio * 100.0)
+        )
+        let gridVsToolkitUnion = max(1, grid.coveredCells.union(agreement.toolkitCells).count)
+        let gridVsToolkitRatio = Double(grid.coveredCells.intersection(agreement.toolkitCells).count) / Double(gridVsToolkitUnion)
+        XCTAssertGreaterThanOrEqual(
+            gridVsToolkitRatio,
+            0.90,
+            String(format: "YS-78: Ingested depth grid cells must match toolkit cells >= 90%% (got %.1f%%)", gridVsToolkitRatio * 100.0)
+        )
+
+        // Verify out-of-height plane (y = +0.80 m, > 0.25 m above marker plane) adds 0 ground cells
+        var highGrid = GroundCoverageGrid(cellSizeM: 0.25)
+        highGrid.anchorGroundPlaneY(0.80)
+        let highStats = highGrid.ingestDepthFrame(
+            timestampS: 2.0,
+            depthMapMM: depthMM,
+            confidenceMap: confMap,
+            depthWidth: dW,
+            depthHeight: dH,
+            rgbWidth: rgbW,
+            rgbHeight: rgbH,
+            fx: fx,
+            fy: fy,
+            cx: cx,
+            cy: cy,
+            cameraToWorld: camToWorld,
+            sampleStep: 4
+        )
+        XCTAssertEqual(highStats.addedCells, 0, "YS-78: Surface > 0.25 m from marker ground plane must be excluded")
+    }
+
+    /// `YS-79`: Always-on unit test verifying the House-Wall Look-Up step:
+    /// - tilting `+15°` to `+35°` with valid depth for `>= 3.0 s` and points `> 2 m` above ground completes the step,
+    /// - tilting above `+45°` with no depth warns `"Point at the roof edge, not the sky"`,
+    /// - one-tap `Skip` transitions to `"Head back to marker 0"`.
+    func testYS79_HouseWallLookUpStep_Accumulates3SecondsWarnsOnSkyAndLogsSkipToGuidanceCSV() {
+        var tracker = HouseWallLookUpTracker()
+        XCTAssertFalse(tracker.isDone)
+
+        // 1. Tilt above +45° (+52°) with no valid depth -> warns "Point at the roof edge, not the sky"
+        tracker.update(
+            dt: 0.5,
+            pitchDeg: 52.0,
+            hasValidDepth: false,
+            elevatedPointsAbove2m: 0,
+            trackingState: "normal",
+            trackingReason: ""
+        )
+        XCTAssertTrue(tracker.skyWarningActive)
+        XCTAssertEqual(tracker.accumulatedValidDurationS, 0.0, accuracy: 1e-6)
+
+        // 2. Tilt within +15°..+35° (+24°) with valid depth and elevated points > 2 m for 20 x 0.20 s = 4.0 s -> completes!
+        for _ in 0..<20 {
+            tracker.update(
+                dt: 0.20,
+                pitchDeg: 24.0,
+                hasValidDepth: true,
+                elevatedPointsAbove2m: 14,
+                trackingState: "normal",
+                trackingReason: ""
+            )
+        }
+        XCTAssertFalse(tracker.skyWarningActive)
+        XCTAssertTrue(tracker.isCompleted, "YS-79: >= 3.0 s of +24° tilt with valid depth must complete Look-Up step")
+        XCTAssertTrue(tracker.isDone)
+        XCTAssertGreaterThan(tracker.elevatedPointsAbove2mCount, 0, "YS-79: Points > 2 m above ground must be recorded")
+        XCTAssertEqual(tracker.insufficientFeaturesLossCount, 0, "YS-79: 0 tracking losses for insufficient features")
+
+        // 3. Verify GuidedCaptureEngine one-tap Skip transitions to .closingMarker0 and formats guidance.csv row
+        var engine = GuidedCaptureEngine(requireLookUpStep: true)
+        engine.skipLookUpStep(at: 50.0)
+        XCTAssertTrue(engine.lookUpTracker.isSkipped)
+        let skipRow = ExposureAndStillnessGate.formatGuidanceCSVRow(
+            timestampS: 50.0,
+            savedIndex: 500,
+            event: "lookup_skipped",
+            phase: "house_wall_lookup",
+            instruction: "Head back to marker 0",
+            spoken: false,
+            pitchDeg: 10.0,
+            rollDeg: 0.0,
+            trackingState: "normal",
+            exposureDurationS: 0.008,
+            iso: 100.0,
+            turnRateRadS: 0.0,
+            predictedBlurPx: 0.0,
+            thermalState: "nominal",
+            coverageCells: 20
+        )
+        XCTAssertTrue(skipRow.contains(",lookup_skipped,house_wall_lookup,Head back to marker 0,"), "YS-79: One-tap Skip must format into guidance.csv")
+    }
+
+    /// `YS-85`: Always-on unit test verifying thermal adaptation at `.serious` thermal state:
+    /// - detection drops from `10 Hz` to `5 Hz` when no marker is being held (`10 Hz` during a hold),
+    /// - ground coverage drops from `2.0 Hz` to `0.5 Hz`,
+    /// - animations become static (`animationsStatic == true`),
+    /// - RGB and depth recording at `30 Hz` is never reduced (`recordingFPS == 30`).
+    func testYS85_ThermalAdaptation_DropsDetectionTo5HzCoverageTo0_5HzAndStaticAnimationsWhileKeeping30HzRecording() {
+        let nominal = ThermalAdaptationSchedule.evaluate(thermalLevel: .nominal, isMarkerHoldActive: false)
+        XCTAssertEqual(nominal.detectionHz, 10.0)
+        XCTAssertEqual(nominal.detectionFrameStrideAt30FPS, 3)
+        XCTAssertEqual(nominal.coverageHz, 2.0)
+        XCTAssertEqual(nominal.coverageMinIntervalS, 0.5)
+        XCTAssertFalse(nominal.animationsStatic)
+        XCTAssertEqual(nominal.recordingFPS, 30)
+
+        let seriousIdle = ThermalAdaptationSchedule.evaluate(thermalLevel: .serious, isMarkerHoldActive: false)
+        XCTAssertEqual(seriousIdle.detectionHz, 5.0, "YS-85: Detection drops from 10 Hz to 5 Hz outside holds at serious thermal")
+        XCTAssertEqual(seriousIdle.detectionFrameStrideAt30FPS, 6)
+        XCTAssertEqual(seriousIdle.coverageHz, 0.5, "YS-85: Coverage drops from 2 Hz to 0.5 Hz at serious thermal")
+        XCTAssertEqual(seriousIdle.coverageMinIntervalS, 2.0)
+        XCTAssertTrue(seriousIdle.animationsStatic, "YS-85: Animations become static at serious thermal")
+        XCTAssertEqual(seriousIdle.recordingFPS, 30, "YS-85: 30 Hz recording is never reduced")
+
+        let seriousHolding = ThermalAdaptationSchedule.evaluate(thermalLevel: .serious, isMarkerHoldActive: true)
+        XCTAssertEqual(seriousHolding.detectionHz, 10.0, "YS-85: Detection stays at 10 Hz during an active marker hold")
+        XCTAssertEqual(seriousHolding.detectionFrameStrideAt30FPS, 3)
+        XCTAssertEqual(seriousHolding.coverageHz, 0.5)
+        XCTAssertTrue(seriousHolding.animationsStatic)
+        XCTAssertEqual(seriousHolding.recordingFPS, 30)
+    }
+
     // MARK: - Full Walk 1–5 Local Suite (`YARDSTICK_REPLAY_ROOT`)
 
     /// `YS-66` / `YS-69` / `YS-70` / `YS-73`: Full Walk 5 (`2,865` frames, `455` stills) replay in `.liveDetectorOnStills` mode under `< 15 s`.
@@ -464,6 +887,20 @@ final class CaptureReplayTests: XCTestCase {
                 "YS-73: Marker \(markerID) must keep at least 25 good sightings on Walk 5 (got \(kept))"
             )
         }
+
+        // YS-74: On Walk 5, all 4 markers (0, 1, 2, 3) lock on their opening holds, and the walk stops in
+        // `.closingMarker0` ("Head back to marker 0") with `isFinishAvailable == false`!
+        XCTAssertEqual(result.guidedEngine.lockedMarkerIDs, [0, 1, 2, 3], "YS-74: Walk 5 must lock Markers 0, 1, 2, 3")
+        XCTAssertFalse(result.guidedEngine.isClosingMarker0Locked, "YS-74: Walk 5 must not lock closing Marker 0")
+        XCTAssertFalse(
+            result.guidedEngine.isFinishAvailable(unifiedLoopClosed: result.phoneLoopState.unifiedLoopClosed),
+            "YS-74: Finish must remain unavailable on Walk 5"
+        )
+        XCTAssertEqual(result.guidedEngine.phase, .closingMarker0, "YS-74: Walk 5 must stop in .closingMarker0 phase")
+        XCTAssertTrue(
+            result.guidedEngine.instructionHistory.contains { $0.text == "Head back to marker 0" },
+            "YS-74: Walk 5 must reach 'Head back to marker 0'"
+        )
     }
 
     /// `YS-66`: Full Walk 5 (`432` sightings) replay in `.recordedCornersFromCSV` mode.
@@ -576,11 +1013,31 @@ final class CaptureReplayTests: XCTestCase {
                 XCTAssertNil(resRecorded.phoneLoopState.unifiedLoopClosureGapMeters, "YS-71: \(exp.walkKey) unified gap must be nil")
             }
 
-            // 2. Live OpenCV detector on stills check (YS-69 <= 0.3% size parity + YS-71 5/5 loop verdict parity)
+            // 2. Live OpenCV detector on stills check (YS-69 <= 0.3% size parity + YS-71 5/5 loop verdict parity + YS-74 determinism)
             let resLive = try CaptureReplayHarness.replayCaptureDirectory(
                 at: walkURL,
                 mode: .liveDetectorOnStills
             )
+            let resLiveSecondRun = try CaptureReplayHarness.replayCaptureDirectory(
+                at: walkURL,
+                mode: .liveDetectorOnStills
+            )
+            XCTAssertEqual(
+                resLive.guidedEngine.instructionHistory.map(\.text),
+                resLiveSecondRun.guidedEngine.instructionHistory.map(\.text),
+                "YS-74: Instruction sequence for \(exp.walkKey) must be 100% deterministic across runs"
+            )
+            // Across Walks 1–5, Walks 1–4 had 250 mm configured for 180 mm sheets (failing YS-74 ±3% size gate),
+            // and Walk 5 never returned to Marker 0, so Finish is unavailable on all 5 legacy walks.
+            XCTAssertFalse(
+                resLive.guidedEngine.isFinishAvailable(unifiedLoopClosed: resLive.phoneLoopState.unifiedLoopClosed),
+                "YS-74: Finish must remain unavailable on \(exp.walkKey)"
+            )
+            if exp.walkKey == "walk-5" {
+                XCTAssertEqual(resLive.guidedEngine.lockedMarkerIDs, [0, 1, 2, 3])
+                XCTAssertEqual(resLive.guidedEngine.phase, .closingMarker0)
+                XCTAssertTrue(resLive.guidedEngine.instructionHistory.contains { $0.text == "Head back to marker 0" })
+            }
             XCTAssertEqual(
                 resLive.phoneLoopState.unifiedLoopClosed,
                 exp.expectedToolkitFrameClosed,

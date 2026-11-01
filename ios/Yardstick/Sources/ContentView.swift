@@ -221,6 +221,23 @@ public struct ContentView: View {
                 .ignoresSafeArea()
             #endif
 
+            // 3-Segment Marker Lock Ring drawn on the marker in the camera view (YS-74)
+            if let ringState = recorder.activeRingState {
+                GeometryReader { proxy in
+                    let normCenter = MarkerRingOverlayView.normalizedCenter(for: ringState)
+                    MarkerRingOverlayView(
+                        ringState: ringState,
+                        animationsStatic: recorder.thermalSchedule.animationsStatic
+                    )
+                    .position(
+                        x: normCenter.x * proxy.size.width,
+                        y: normCenter.y * proxy.size.height
+                    )
+                }
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+            }
+
             // Center Crosshair for 5x5 LiDAR depth patch tape checks (YS-40)
             VStack {
                 Spacer()
@@ -280,12 +297,28 @@ public struct ContentView: View {
 
                     HStack(spacing: 12) {
                         Label("Frames: \(recorder.savedFrameCount)", systemImage: "video.fill")
-                        Label("Markers: \(recorder.detectedMarkerIDs.count)", systemImage: "qrcode.viewfinder")
-                        Label("North: \(recorder.northSampleCount)/10", systemImage: "location.north.line.fill")
+                        Label("Markers: \(recorder.lockedMarkerIDs.count)/4", systemImage: "qrcode.viewfinder")
+                        Label(String(format: "Ground: %.1f m²", recorder.coveredGroundAreaM2), systemImage: "square.grid.3x3.fill")
                         Label("Tapes: \(recorder.tapeCheckCount)", systemImage: "ruler.fill")
                     }
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.green)
+
+                    if recorder.guidedWalkPhase == .houseWallLookUp {
+                        HStack(spacing: 12) {
+                            ProgressView(value: recorder.lookUpProgressFraction, total: 1.0)
+                                .tint(.green)
+                            Button("Skip") {
+                                recorder.skipLookUpStep()
+                            }
+                            .font(.caption.bold())
+                            .foregroundStyle(.white)
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4)
+                            .background(Color.white.opacity(0.2))
+                            .clipShape(.rect(cornerRadius: 6))
+                        }
+                    }
 
                     HStack(spacing: 16) {
                         Text(String(format: "Pitch: %.1f° (target -30°)", recorder.pitchDeg))
@@ -298,6 +331,15 @@ public struct ContentView: View {
                 .padding(12)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color.black.opacity(0.75))
+
+                if !recorder.coveredGroundCells.isEmpty {
+                    HStack {
+                        Spacer()
+                        GroundCoverageMiniMapView(cells: recorder.coveredGroundCells)
+                            .frame(width: 96, height: 96)
+                            .padding(8)
+                    }
+                }
 
                 Spacer()
 
@@ -409,6 +451,11 @@ public struct ContentView: View {
             VStack(alignment: .leading, spacing: 8) {
                 Text("Capture ID: \(recorder.captureID)")
                 Text("Saved Depth Frames: \(recorder.savedFrameCount)")
+                Text(String(format: "Ground Coverage: %.1f m² (%d cells)", recorder.coveredGroundAreaM2, recorder.coveredGroundCellCount))
+                if !recorder.coveredGroundCells.isEmpty {
+                    GroundCoverageMiniMapView(cells: recorder.coveredGroundCells)
+                        .frame(height: 120)
+                }
                 Text("Tape Checks Logged: \(recorder.tapeCheckCount)")
                 ForEach(recorder.tapeCheckSummaries, id: \.self) { summary in
                     Text("  • \(summary)")
@@ -473,5 +520,133 @@ public struct ContentView: View {
             .background(color.opacity(0.8))
             .clipShape(.rect(cornerRadius: 8))
         }
+    }
+}
+
+/// 3-segment Marker Lock Ring drawn on the marker in the camera view (`YS-74`, `YS-85`).
+///
+/// States (`DESIGN-SPEC-NATIVE.md` §3a):
+/// - **Seen, not counting**: thin outline
+/// - **Counting**: each OpenCV-confirmed still fills one of the 3 segments
+/// - **Paused**: filled segments stay, nothing resets, empty segments dim; when too far (`showStepCloserChevron`), shows a chevron pointing toward the operator
+/// - **Done**: solid disc with a checkmark
+public struct MarkerRingOverlayView: View {
+    public let ringState: MarkerRingVisualState
+    public let animationsStatic: Bool
+
+    public init(ringState: MarkerRingVisualState, animationsStatic: Bool = false) {
+        self.ringState = ringState
+        self.animationsStatic = animationsStatic
+    }
+
+    public static func normalizedCenter(for ringState: MarkerRingVisualState, rgbWidth: Double = 1920.0, rgbHeight: Double = 1440.0) -> CGPoint {
+        guard !ringState.cornersUV.isEmpty else {
+            return CGPoint(x: 0.5, y: 0.5)
+        }
+        let sumU = ringState.cornersUV.reduce(0.0) { $0 + $1.x }
+        let sumV = ringState.cornersUV.reduce(0.0) { $0 + $1.y }
+        let avgU = sumU / Double(ringState.cornersUV.count)
+        let avgV = sumV / Double(ringState.cornersUV.count)
+        let normX = avgU > 1.5 ? min(0.9, max(0.1, avgU / rgbWidth)) : min(0.9, max(0.1, avgU))
+        let normY = avgV > 1.5 ? min(0.9, max(0.1, avgV / rgbHeight)) : min(0.9, max(0.1, avgV))
+        return CGPoint(x: normX, y: normY)
+    }
+
+    public var body: some View {
+        ZStack {
+            if ringState.isLocked {
+                Circle()
+                    .fill(Color.green.opacity(0.88))
+                    .frame(width: 78, height: 78)
+                Image(systemName: "checkmark")
+                    .font(.title.bold())
+                    .foregroundStyle(.white)
+            } else {
+                ForEach(0..<3, id: \.self) { segIndex in
+                    let isFilled = segIndex < ringState.confirmedSegments
+                    let startDeg = -90.0 + Double(segIndex) * 120.0 + 8.0
+                    let endDeg = startDeg + 104.0
+                    Circle()
+                        .trim(
+                            from: CGFloat((startDeg + 90.0) / 360.0),
+                            to: CGFloat((endDeg + 90.0) / 360.0)
+                        )
+                        .stroke(
+                            isFilled
+                                ? Color.green
+                                : Color.white.opacity(ringState.isPaused ? 0.25 : 0.55),
+                            style: StrokeStyle(
+                                lineWidth: isFilled ? 7.0 : (ringState.confirmedSegments == 0 ? 3.5 : 5.5),
+                                lineCap: .round
+                            )
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 84, height: 84)
+                }
+
+                VStack(spacing: 2) {
+                    Text("\(ringState.markerID)")
+                        .font(.headline.monospacedDigit().bold())
+                        .foregroundStyle(.white)
+                    if ringState.showStepCloserChevron {
+                        Image(systemName: "chevron.compact.down")
+                            .font(.caption.bold())
+                            .foregroundStyle(.orange)
+                    }
+                }
+            }
+        }
+        .animation(animationsStatic ? nil : .easeInOut(duration: 0.2), value: ringState)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            ringState.isLocked
+                ? "Marker \(ringState.markerID) captured"
+                : "Marker \(ringState.markerID), \(ringState.confirmedSegments) of 3 photos confirmed"
+        )
+    }
+}
+
+/// Top-down `0.25 m` ground coverage grid view (`YS-78`).
+public struct GroundCoverageMiniMapView: View {
+    public let cells: Set<GroundGridCell>
+
+    public init(cells: Set<GroundGridCell>) {
+        self.cells = cells
+    }
+
+    public var body: some View {
+        Canvas { context, size in
+            guard !cells.isEmpty else { return }
+            let xs = cells.map(\.ix)
+            let zs = cells.map(\.iz)
+            guard let minX = xs.min(), let maxX = xs.max(),
+                  let minZ = zs.min(), let maxZ = zs.max()
+            else { return }
+
+            let spanX = max(1, maxX - minX + 1)
+            let spanZ = max(1, maxZ - minZ + 1)
+            let maxSpan = CGFloat(max(spanX, spanZ))
+            let padding: CGFloat = 8.0
+            let usableW = max(1.0, size.width - 2.0 * padding)
+            let usableH = max(1.0, size.height - 2.0 * padding)
+            let cellPx = min(usableW / maxSpan, usableH / maxSpan)
+            let offsetX = padding + (usableW - CGFloat(spanX) * cellPx) * 0.5
+            let offsetY = padding + (usableH - CGFloat(spanZ) * cellPx) * 0.5
+
+            for cell in cells {
+                let col = CGFloat(cell.ix - minX)
+                let row = CGFloat(cell.iz - minZ)
+                let rect = CGRect(
+                    x: offsetX + col * cellPx,
+                    y: offsetY + row * cellPx,
+                    width: max(1.5, cellPx - 0.5),
+                    height: max(1.5, cellPx - 0.5)
+                )
+                context.fill(Path(rect), with: .color(.green.opacity(0.75)))
+            }
+        }
+        .background(.regularMaterial)
+        .clipShape(.rect(cornerRadius: 10))
+        .accessibilityHidden(true)
     }
 }

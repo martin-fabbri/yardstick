@@ -14,12 +14,14 @@
 		A10000050000000000000001 /* ArUcoDictionaryData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000050000000000000001 /* ArUcoDictionaryData.swift */; };
 		A10000060000000000000001 /* CaptureReplayHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000070000000000000001 /* CaptureReplayHarness.swift */; };
 		A10000070000000000000001 /* CapturePipelinePrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000090000000000000001 /* CapturePipelinePrimitives.swift */; };
+		A10000080000000000000001 /* GuidedCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000110000000000000001 /* GuidedCaptureEngine.swift */; };
 		B10000010000000000000001 /* ArUcoDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000040000000000000001 /* ArUcoDetector.swift */; };
 		B10000020000000000000001 /* ArUcoDictionaryData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000050000000000000001 /* ArUcoDictionaryData.swift */; };
 		B10000030000000000000001 /* CaptureReplayHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000070000000000000001 /* CaptureReplayHarness.swift */; };
 		B10000040000000000000001 /* CaptureReplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000080000000000000001 /* CaptureReplayTests.swift */; };
 		B10000050000000000000001 /* CapturePipelinePrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000090000000000000001 /* CapturePipelinePrimitives.swift */; };
 		B10000060000000000000001 /* CapturePipelineStep3Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000100000000000000001 /* CapturePipelineStep3Tests.swift */; };
+		B10000070000000000000001 /* GuidedCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000110000000000000001 /* GuidedCaptureEngine.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -35,6 +37,7 @@
 		A20000080000000000000001 /* CaptureReplayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureReplayTests.swift; sourceTree = "<group>"; };
 		A20000090000000000000001 /* CapturePipelinePrimitives.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapturePipelinePrimitives.swift; sourceTree = "<group>"; };
 		A20000100000000000000001 /* CapturePipelineStep3Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapturePipelineStep3Tests.swift; sourceTree = "<group>"; };
+		A20000110000000000000001 /* GuidedCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuidedCaptureEngine.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -75,6 +78,7 @@
 				A20000050000000000000001 /* ArUcoDictionaryData.swift */,
 				A20000070000000000000001 /* CaptureReplayHarness.swift */,
 				A20000090000000000000001 /* CapturePipelinePrimitives.swift */,
+				A20000110000000000000001 /* GuidedCaptureEngine.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -181,6 +185,7 @@
 				A10000050000000000000001 /* ArUcoDictionaryData.swift in Sources */,
 				A10000060000000000000001 /* CaptureReplayHarness.swift in Sources */,
 				A10000070000000000000001 /* CapturePipelinePrimitives.swift in Sources */,
+				A10000080000000000000001 /* GuidedCaptureEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -194,6 +199,7 @@
 				B10000040000000000000001 /* CaptureReplayTests.swift in Sources */,
 				B10000050000000000000001 /* CapturePipelinePrimitives.swift in Sources */,
 				B10000060000000000000001 /* CapturePipelineStep3Tests.swift in Sources */,
+				B10000070000000000000001 /* GuidedCaptureEngine.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

@@ -471,6 +471,7 @@ public struct CaptureReplayResult: Sendable {
     public let originalSightings: [ReplayMarkerSighting]
     public let replayedSightings: [ReplayMarkerSighting]
     public let phoneLoopState: PhoneLoopRuleState
+    public let guidedEngine: GuidedCaptureEngine
     public let elapsedSeconds: Double
     /// Count of still-backed rows in `originalSightings` rejected by OpenCV `DICT_5X5_250` + sub-pixel corner shift (`YS-70`, `YS-73`).
     public let openCVRejectedOriginalSightingsCount: Int
@@ -869,18 +870,26 @@ public enum CaptureReplayHarness {
         }
         phoneLoopState.lastOperatorTapTimeS = filteredTaps.max()
 
+        let hasGuidanceStream = FileManager.default.fileExists(atPath: guidanceURL.path)
+        var guidedEngine = GuidedCaptureEngine(requireLookUpStep: hasGuidanceStream)
         var replayedSightings: [ReplayMarkerSighting] = []
+        var prevFrameT: Double? = nil
+
         for frame in frames {
             guard !frame.dropped,
-                  let sIdx = frame.savedIndex,
-                  let camPosW = frame.cameraPositionWorld
+                   let sIdx = frame.savedIndex,
+                   let camPosW = frame.cameraPositionWorld
             else { continue }
+            let dt = prevFrameT.map { max(1e-4, frame.timestampS - $0) } ?? (1.0 / 30.0)
+            prevFrameT = frame.timestampS
+
             phoneLoopState.updateCameraExcursion(
                 cameraPositionWorld: camPosW,
                 savedIndex: sIdx,
                 timestampS: frame.timestampS
             )
-            if let dets = detectionsBySavedIndex[sIdx] {
+            let dets = detectionsBySavedIndex[sIdx] ?? []
+            if !dets.isEmpty {
                 phoneLoopState.ingestSightings(
                     dets,
                     timestampS: frame.timestampS,
@@ -891,6 +900,34 @@ public enum CaptureReplayHarness {
                     replayedSightings.append(ReplayMarkerSighting(timestampS: frame.timestampS, savedIndex: sIdx, sighting: d))
                 }
             }
+
+            let pose = posesByIdx[sIdx]
+            let cMat = pose?.cMat ?? matrix_identity_double4x4
+            let lookRayY = Double(-cMat.columns.2.y)
+            let pitchDeg = asin(min(1.0, max(-1.0, lookRayY))) * 180.0 / .pi
+            let tr = pose?.turnRateRadS ?? 0.0
+            let expS = stillExposureByIdx[sIdx] ?? (1.0 / 120.0)
+            let meanF = pose.map { 0.5 * ($0.fx + $0.fy) } ?? 1440.0
+            let predBlur = ExposureAndStillnessGate.computePredictedBlurPx(
+                focalLengthPx: meanF,
+                turnRateRadS: tr,
+                exposureDurationS: expS
+            )
+            _ = guidedEngine.step(
+                timestampS: frame.timestampS,
+                savedIndex: sIdx,
+                dt: dt,
+                trackingState: frame.trackingState,
+                trackingReason: frame.trackingReason,
+                pitchDeg: pitchDeg,
+                turnRateRadS: tr,
+                predictedBlurPx: predBlur,
+                cameraPositionWorld: camPosW,
+                confirmedSightings: dets,
+                rawSightings: dets,
+                unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
+                relaxViewingAngleAndSizeForLegacyReplay: !hasGuidanceStream
+            )
         }
 
         // Finalize unified YS-71 loop closure evaluation at the end of the walk
@@ -901,6 +938,25 @@ public enum CaptureReplayHarness {
             confirmedMarker0StillIndices: confirmedM0Stills,
             requireAllFourMarkersOrEndEarly: true
         )
+        if let lastFrame = frames.last(where: { !$0.dropped }),
+           let sIdx = lastFrame.savedIndex,
+           let camPosW = lastFrame.cameraPositionWorld {
+            _ = guidedEngine.step(
+                timestampS: lastFrame.timestampS + 0.01,
+                savedIndex: sIdx,
+                dt: 0.01,
+                trackingState: lastFrame.trackingState,
+                trackingReason: lastFrame.trackingReason,
+                pitchDeg: -30.0,
+                turnRateRadS: 0.0,
+                predictedBlurPx: 0.0,
+                cameraPositionWorld: camPosW,
+                confirmedSightings: [],
+                rawSightings: [],
+                unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
+                relaxViewingAngleAndSizeForLegacyReplay: !hasGuidanceStream
+            )
+        }
 
         // 7. Evaluate YS-70 confirmation and YS-73 stillness & distance gate across sightings
         var openCVRejectedCount = 0
@@ -960,6 +1016,7 @@ public enum CaptureReplayHarness {
             originalSightings: originalSightings,
             replayedSightings: replayedSightings,
             phoneLoopState: phoneLoopState,
+            guidedEngine: guidedEngine,
             elapsedSeconds: CFAbsoluteTimeGetCurrent() - tStart,
             openCVRejectedOriginalSightingsCount: openCVRejectedCount,
             ys73FlaggedOfOpenCVRejectedCount: ys73FlaggedOfRejectedCount,

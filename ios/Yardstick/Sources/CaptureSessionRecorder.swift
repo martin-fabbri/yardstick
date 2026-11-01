@@ -45,6 +45,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     let detectionCIContext = CIContext(options: [.useSoftwareRenderer: false])
     let digestRegistry = PrecomputedDigestRegistry()
     private let stillGateLock = OSAllocatedUnfairLock(initialState: StillCaptureGate())
+    private let coverageGridLock = OSAllocatedUnfairLock(initialState: GroundCoverageGrid())
 
     var assetWriter: AVAssetWriter?
     var videoWriterInput: AVAssetWriterInput?
@@ -107,6 +108,53 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     func restoreStillGate(_ snapshot: StillCaptureGate) {
         stillGateLock.withLock { gate in
             gate = snapshot
+        }
+    }
+
+    var coveredCellCount: Int {
+        coverageGridLock.withLock { $0.coveredCellCount }
+    }
+
+    func anchorGroundPlaneY(_ yWorld: Double) {
+        coverageGridLock.withLock { grid in
+            grid.anchorGroundPlaneY(yWorld)
+        }
+    }
+
+    func updateCoverageGridIfDue(
+        timestampS: Double,
+        minIntervalS: Double,
+        depthMapMM: [UInt16],
+        confidenceMap: [UInt8],
+        depthWidth: Int,
+        depthHeight: Int,
+        rgbWidth: Int,
+        rgbHeight: Int,
+        fx: Double,
+        fy: Double,
+        cx: Double,
+        cy: Double,
+        cameraToWorld: simd_double4x4
+    ) -> (didUpdate: Bool, snapshot: GroundCoverageGrid, validDepthSamples: Int, elevatedPointsAbove2m: Int)? {
+        coverageGridLock.withLock { grid in
+            guard grid.shouldUpdate(at: timestampS, minIntervalS: minIntervalS) else {
+                return nil
+            }
+            let stats = grid.ingestDepthFrame(
+                timestampS: timestampS,
+                depthMapMM: depthMapMM,
+                confidenceMap: confidenceMap,
+                depthWidth: depthWidth,
+                depthHeight: depthHeight,
+                rgbWidth: rgbWidth,
+                rgbHeight: rgbHeight,
+                fx: fx,
+                fy: fy,
+                cx: cx,
+                cy: cy,
+                cameraToWorld: cameraToWorld
+            )
+            return (true, grid, stats.validDepthSamples, stats.elevatedPointsAbove2m)
         }
     }
 
@@ -433,6 +481,22 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var latestPredictedBlurPx: Double = 0.0
     @Published public private(set) var liveMarkerSizeWarning: String? = nil
     @Published public private(set) var isLoopClosed: Bool = false
+    @Published public private(set) var guidedWalkPhase: GuidedWalkPhase = .openingMarker0
+    @Published public private(set) var activeRingState: MarkerRingVisualState? = nil
+    @Published public private(set) var lockedMarkerIDs: Set<Int> = []
+    @Published public private(set) var isFinishAvailable: Bool = false
+    @Published public private(set) var coveredGroundCellCount: Int = 0
+    @Published public private(set) var coveredGroundAreaM2: Double = 0.0
+    @Published public private(set) var coveredGroundCells: Set<GroundGridCell> = []
+    @Published public private(set) var lookUpProgressFraction: Double = 0.0
+    @Published public private(set) var isLookUpDone: Bool = false
+    @Published public private(set) var thermalSchedule = ThermalAdaptationSchedule.evaluate(
+        thermalLevel: .nominal,
+        isMarkerHoldActive: false
+    )
+    @Published public private(set) var latestHapticEvent: GuidedHapticEvent? = nil
+    /// Injectable thermal level for deterministic testing of `YS-85` serious-thermal adaptation.
+    public var injectedThermalLevelForTesting: CaptureThermalLevel? = nil
 
     private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM"
 
@@ -512,6 +576,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var locationAuthStatus: String = "unavailable"
     private var northSamples: [[String: Double]] = []
     private var phoneLoopState = PhoneLoopRuleState()
+    private var guidedEngine = GuidedCaptureEngine()
+    private var latestValidDepthSamplesCount: Int = 100
+    private var latestElevatedPointsAbove2m: Int = 0
     private var marker0FirstPassPos: SIMD3<Double>? {
         get { phoneLoopState.marker0FirstPassPos }
         set { phoneLoopState.marker0FirstPassPos = newValue }
@@ -690,6 +757,20 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         latestPredictedBlurPx = 0.0
         liveMarkerSizeWarning = nil
         isLoopClosed = false
+        guidedEngine = GuidedCaptureEngine()
+        guidedWalkPhase = .openingMarker0
+        activeRingState = nil
+        lockedMarkerIDs = []
+        isFinishAvailable = false
+        coveredGroundCellCount = 0
+        coveredGroundAreaM2 = 0.0
+        coveredGroundCells = []
+        lookUpProgressFraction = 0.0
+        isLookUpDone = false
+        thermalSchedule = ThermalAdaptationSchedule.evaluate(thermalLevel: .nominal, isMarkerHoldActive: false)
+        latestHapticEvent = .sessionStart
+        latestValidDepthSamplesCount = 100
+        latestElevatedPointsAbove2m = 0
 
         #if canImport(ARKit) && !targetEnvironment(simulator)
         let config = ARWorldTrackingConfiguration()
@@ -742,7 +823,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                 Self.writeSessionJSONDataOnQueue(snapData, in: dir, registry: engine.digestRegistry)
             }
             phase = .recording
-            statusBanner = "Recording (\(actualWidth)×\(actualHeight)@\(actualFPS)fps) — hold on Marker 0"
+            statusBanner = guidedEngine.activeInstruction
             _ = checkMidWalkDiskSpace(recordedBytes: 0)
         } catch {
             UIApplication.shared.isIdleTimerDisabled = false
@@ -796,6 +877,45 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             } catch {
                 Task { @MainActor in
                     self?.handleStreamFailure(stream: "events", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// One-tap `Skip` for the `YS-79` house-wall and roof-edge look-up step, recorded in `guidance.csv`.
+    public func skipLookUpStep() {
+        guard phase == .recording, let engine = writerEngine else { return }
+        let t = latestTimestampS
+        let sIdx = max(0, latestSavedIndex)
+        guidedEngine.skipLookUpStep(at: t)
+        guidedWalkPhase = guidedEngine.phase
+        isLookUpDone = guidedEngine.lookUpTracker.isDone
+        lookUpProgressFraction = guidedEngine.lookUpTracker.progressFraction
+        statusBanner = guidedEngine.activeInstruction
+
+        let gLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
+            timestampS: t,
+            savedIndex: sIdx,
+            event: "lookup_skipped",
+            phase: guidedEngine.phase.rawValue,
+            instruction: guidedEngine.activeInstruction,
+            spoken: false,
+            pitchDeg: pitchDeg,
+            rollDeg: rollDeg,
+            trackingState: trackingStateText,
+            exposureDurationS: latestExposureDurationS,
+            iso: latestISO,
+            turnRateRadS: latestTurnRateRadS,
+            predictedBlurPx: latestPredictedBlurPx,
+            thermalState: thermalSchedule.thermalLevel.rawValue,
+            coverageCells: coveredGroundCellCount
+        )
+        writerQueue.async { [weak self] in
+            do {
+                try engine.appendLine(gLine, to: engine.guidanceFH)
+            } catch {
+                Task { @MainActor in
+                    self?.handleStreamFailure(stream: "guidance", message: error.localizedDescription)
                 }
             }
         }
@@ -1919,7 +2039,45 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.latestISO = isoVal
             self.latestTurnRateRadS = turnRateRadS
             self.latestPredictedBlurPx = predictedBlurPx
+
+            let activeThermalLevel = self.injectedThermalLevelForTesting ?? CaptureThermalLevel.fromSystem(ProcessInfo.processInfo.thermalState)
+            let effectiveThermalStr = activeThermalLevel.rawValue
+            let stepOut = self.guidedEngine.step(
+                timestampS: timestampS,
+                savedIndex: self.savedFrameCount,
+                dt: frameDt,
+                trackingState: trackingStr,
+                trackingReason: reasonStr,
+                pitchDeg: pitchDegrees,
+                turnRateRadS: turnRateRadS,
+                predictedBlurPx: predictedBlurPx,
+                cameraPositionWorld: SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z),
+                confirmedSightings: [],
+                rawSightings: [],
+                unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed,
+                thermalLevel: activeThermalLevel,
+                lowDiskSpaceWarning: self.lowDiskSpaceWarning != nil,
+                hasValidDepthForLookUp: self.latestValidDepthSamplesCount >= 8 || finalCenterDepthM != nil,
+                elevatedPointsAbove2m: self.latestElevatedPointsAbove2m
+            )
+            self.latestElevatedPointsAbove2m = 0
+            self.guidedWalkPhase = self.guidedEngine.phase
+            self.activeRingState = self.guidedEngine.activeRingState
+            self.lockedMarkerIDs = self.guidedEngine.lockedMarkerIDs
+            self.isFinishAvailable = self.guidedEngine.isFinishAvailable(unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed)
+            self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
+            self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
+            self.thermalSchedule = stepOut.thermalSchedule
+            if let hap = stepOut.haptic {
+                self.latestHapticEvent = hap
+            }
+            if self.lowDiskSpaceWarning == nil {
+                self.statusBanner = stepOut.instruction
+            }
             let currentInstruction = self.statusBanner
+            let currentGuidedPhaseStr = self.guidedEngine.phase.rawValue
+            let detectionStride = stepOut.thermalSchedule.detectionFrameStrideAt30FPS
+            let coverageMinIntervalS = stepOut.thermalSchedule.coverageMinIntervalS
 
             // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation (`YS-66`, `YS-71`)
             let camPosW = SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z)
@@ -2067,7 +2225,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         timestampS: timestampS,
                         savedIndex: sIdx,
                         event: "frame",
-                        phase: "recording",
+                        phase: currentGuidedPhaseStr,
                         instruction: currentInstruction,
                         spoken: false,
                         pitchDeg: pitchDegrees,
@@ -2077,8 +2235,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         iso: isoVal,
                         turnRateRadS: turnRateRadS,
                         predictedBlurPx: predictedBlurPx,
-                        thermalState: thermalStr,
-                        coverageCells: 0
+                        thermalState: effectiveThermalStr,
+                        coverageCells: engine.coveredCellCount
                     )
                     try engine.appendLine(gLine, to: engine.guidanceFH)
                     sp.endInterval("CSVAppend", csvState)
@@ -2123,15 +2281,31 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     }
 
                     // Offload ArUco detection, 3D plane measurement, stillness/distance gate (`YS-73`),
-                    // rate-limited still gate (`YS-68`), and OpenCV JPEG confirmation (`YS-70`) onto the
-                    // single-slot `detectionScheduler` so `writerQueue` is never blocked!
-                    let shouldRunArUco = (sIdx % 3 == 0) || forceArUco
+                    // rate-limited still gate (`YS-68`), OpenCV JPEG confirmation (`YS-70`), and 2 Hz ground coverage
+                    // (`YS-78`, adapted by `YS-85` thermal schedule) onto the single-slot `detectionScheduler`!
+                    let shouldRunArUco = (sIdx % detectionStride == 0) || forceArUco
                     let isSteadyEnoughForStill = (predictedBlurPx <= ExposureAndStillnessGate.maxPredictedBlurPx)
                         && (turnRateRadS <= ExposureAndStillnessGate.maxTurnRateRadS)
                     let shouldConsiderPeriodicStill = isSteadyEnoughForStill && ((timestampS - engine.lastAnyStillTimeS) >= 2.0)
-                    if shouldRunArUco || shouldConsiderPeriodicStill {
+                    let shouldConsiderCoverage = (sIdx % 6 == 0)
+                    if shouldRunArUco || shouldConsiderPeriodicStill || shouldConsiderCoverage {
                         self.detectionScheduler.submitIfIdle { [weak self] in
                             guard let self, !engine.isClosed else { return }
+                            let covResult = engine.updateCoverageGridIfDue(
+                                timestampS: timestampS,
+                                minIntervalS: coverageMinIntervalS,
+                                depthMapMM: dPixels,
+                                confidenceMap: cPixels,
+                                depthWidth: wD,
+                                depthHeight: hD,
+                                rgbWidth: rgbW,
+                                rgbHeight: rgbH,
+                                fx: fx,
+                                fy: fy,
+                                cx: cx,
+                                cy: cy,
+                                cameraToWorld: cMat
+                            )
                             let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
                             var rawDetected3D: [DetectedMarkerSighting] = []
                             var eligibleSightings: [DetectedMarkerSighting] = []
@@ -2272,8 +2446,12 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             }
 
                             let finalDetected = confirmedSightings
+                            let finalRawDetected = rawDetected3D
                             let finalEncodedStill = encodedStill
                             let finalMarkerLines = markerLines
+                            if let m0 = finalDetected.first(where: { $0.markerID == 0 }) {
+                                engine.anchorGroundPlaneY(m0.positionWorld.y)
+                            }
 
                             if finalEncodedStill != nil || !finalMarkerLines.isEmpty {
                                 self.writerQueue.async { [weak self] in
@@ -2298,49 +2476,81 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                 }
                             }
 
-                            if !finalDetected.isEmpty {
+                            if !finalDetected.isEmpty || !finalRawDetected.isEmpty || covResult != nil {
                                 Task { @MainActor [weak self] in
                                     guard let self, self.phase == .recording else { return }
-                                    let hadM0First = (self.phoneLoopState.marker0FirstPassPos != nil)
-                                    let updatedLoop = self.phoneLoopState.ingestSightings(
-                                        finalDetected,
+                                    if let cov = covResult {
+                                        self.coveredGroundCellCount = cov.snapshot.coveredCellCount
+                                        self.coveredGroundAreaM2 = cov.snapshot.coveredAreaM2
+                                        self.coveredGroundCells = cov.snapshot.coveredCells
+                                        self.latestValidDepthSamplesCount = cov.validDepthSamples
+                                        self.latestElevatedPointsAbove2m += cov.elevatedPointsAbove2m
+                                    }
+                                    if !finalDetected.isEmpty {
+                                        let updatedLoop = self.phoneLoopState.ingestSightings(
+                                            finalDetected,
+                                            timestampS: timestampS,
+                                            savedIndex: sIdx,
+                                            cameraPositionWorld: camPosW
+                                        )
+                                        self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
+                                        self.isLoopClosed = self.phoneLoopState.unifiedLoopClosed
+                                        self.loopClosureGapMeters = self.phoneLoopState.unifiedLoopClosureGapMeters
+
+                                        // YS-73: After 3 sightings of a marker, check if median measured size is > 3% off
+                                        for m in finalDetected {
+                                            let markerMeas = self.phoneLoopState.allSightings
+                                                .filter { $0.sighting.markerID == m.markerID }
+                                                .map(\.sighting.sizeMMMeasured)
+                                            let sizeCheck = ExposureAndStillnessGate.evaluateLiveMarkerSizeDeviation(
+                                                measuredSizesMM: markerMeas,
+                                                printedSizeMM: m.sizeMMPrinted
+                                            )
+                                            if sizeCheck.flagged, let medMM = sizeCheck.medianMM {
+                                                self.liveMarkerSizeWarning = String(
+                                                    format: "Marker %d size %.1f mm differs from %.0f mm setting (> 3%%)",
+                                                    m.markerID, medMM, m.sizeMMPrinted
+                                                )
+                                            }
+                                        }
+
+                                        if updatedLoop, let gap = self.phoneLoopState.unifiedLoopClosureGapMeters {
+                                            self.loopClosureGapMeters = gap
+                                            self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
+                                            self.updateProvisionalGrade()
+                                        }
+                                    }
+
+                                    let detStep = self.guidedEngine.step(
                                         timestampS: timestampS,
                                         savedIndex: sIdx,
-                                        cameraPositionWorld: camPosW
+                                        dt: 0.0,
+                                        trackingState: trackingStr,
+                                        trackingReason: reasonStr,
+                                        pitchDeg: pitchDegrees,
+                                        turnRateRadS: turnRateRadS,
+                                        predictedBlurPx: predictedBlurPx,
+                                        cameraPositionWorld: camPosW,
+                                        confirmedSightings: finalDetected,
+                                        rawSightings: finalRawDetected,
+                                        unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed,
+                                        thermalLevel: activeThermalLevel,
+                                        lowDiskSpaceWarning: self.lowDiskSpaceWarning != nil,
+                                        hasValidDepthForLookUp: self.latestValidDepthSamplesCount >= 8,
+                                        elevatedPointsAbove2m: 0
                                     )
-                                    self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
-                                    self.isLoopClosed = self.phoneLoopState.unifiedLoopClosed
-                                    self.loopClosureGapMeters = self.phoneLoopState.unifiedLoopClosureGapMeters
-
-                                    // YS-73: After 3 sightings of a marker, check if median measured size is > 3% off
-                                    for m in finalDetected {
-                                        let markerMeas = self.phoneLoopState.allSightings
-                                            .filter { $0.sighting.markerID == m.markerID }
-                                            .map(\.sighting.sizeMMMeasured)
-                                        let sizeCheck = ExposureAndStillnessGate.evaluateLiveMarkerSizeDeviation(
-                                            measuredSizesMM: markerMeas,
-                                            printedSizeMM: m.sizeMMPrinted
-                                        )
-                                        if sizeCheck.flagged, let medMM = sizeCheck.medianMM {
-                                            self.liveMarkerSizeWarning = String(
-                                                format: "Marker %d size %.1f mm differs from %.0f mm setting (> 3%%)",
-                                                m.markerID, medMM, m.sizeMMPrinted
-                                            )
-                                        }
+                                    self.guidedWalkPhase = self.guidedEngine.phase
+                                    self.activeRingState = self.guidedEngine.activeRingState
+                                    self.lockedMarkerIDs = self.guidedEngine.lockedMarkerIDs
+                                    self.isFinishAvailable = self.guidedEngine.isFinishAvailable(unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed)
+                                    self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
+                                    self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
+                                    self.thermalSchedule = detStep.thermalSchedule
+                                    if let hap = detStep.haptic {
+                                        self.latestHapticEvent = hap
                                     }
-
-                                    if !hadM0First && self.phoneLoopState.marker0FirstPassPos != nil {
-                                        if self.lowDiskSpaceWarning == nil {
-                                            self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
-                                        }
-                                    }
-                                    if updatedLoop, let gap = self.phoneLoopState.unifiedLoopClosureGapMeters {
-                                        self.loopClosureGapMeters = gap
-                                        self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
-                                        self.updateProvisionalGrade()
-                                        if self.lowDiskSpaceWarning == nil {
-                                            self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
-                                        }
+                                    if self.lowDiskSpaceWarning == nil {
+                                        self.statusBanner = detStep.instruction
                                     }
                                 }
                             }
