@@ -866,4 +866,258 @@ def test_ys65_symlinked_var_path_manifest_seal_and_180mm_persistence(
     assert "io.buildnexus.yardstick.markerSizesMM" in swift_src
 
 
+def test_ys67_manifest_with_guidance_csv_and_stills_exposure_validates(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-67: A manifest declaring `guidance` with `guidance.csv` on disk and `stills.csv` with `exposure_duration_s`/`iso` validates."""
+    cap = _clone_capture(base_synth_dir, tmp_path / "cap_ys67_guidance")
+
+    # 1. Write guidance.csv and add exposure_duration_s & iso to stills.csv
+    poses_rows = list(csv.DictReader((cap / "poses.csv").open()))
+    t0 = float(poses_rows[0]["t"])
+    t1 = float(poses_rows[-1]["t"])
+    with (cap / "guidance.csv").open("w", encoding="utf-8", newline="") as gf:
+        gw = csv.DictWriter(
+            gf,
+            fieldnames=["t", "saved_index", "kind", "detail", "exposure_duration_s", "iso", "turn_rate_rad_s", "predicted_blur_px"],
+            lineterminator="\n",
+        )
+        gw.writeheader()
+        gw.writerow(
+            {
+                "t": f"{t0:.6f}",
+                "saved_index": "0",
+                "kind": "instruction",
+                "detail": "Hold steady on marker 0",
+                "exposure_duration_s": "0.004000",
+                "iso": "80.0",
+                "turn_rate_rad_s": "0.020",
+                "predicted_blur_px": "0.115",
+            }
+        )
+        gw.writerow(
+            {
+                "t": f"{t1:.6f}",
+                "saved_index": str(poses_rows[-1]["saved_index"]),
+                "kind": "loop_closed",
+                "detail": "Marker 0 closing hold locked",
+                "exposure_duration_s": "0.005000",
+                "iso": "100.0",
+                "turn_rate_rad_s": "0.015",
+                "predicted_blur_px": "0.108",
+            }
+        )
+
+    stills_rows = list(csv.DictReader((cap / "stills.csv").open()))
+    new_still_cols = list(stills_rows[0].keys()) + ["exposure_duration_s", "iso"]
+    for srow in stills_rows:
+        srow["exposure_duration_s"] = "0.004167"
+        srow["iso"] = "125.0"
+    with (cap / "stills.csv").open("w", encoding="utf-8", newline="") as sf:
+        sw = csv.DictWriter(sf, fieldnames=new_still_cols, lineterminator="\n")
+        sw.writeheader()
+        sw.writerows(stills_rows)
+
+    seal_manifest(cap)
+    manifest = json.loads((cap / "manifest.json").read_text())
+    assert "guidance" in manifest["streams_declared"]
+
+    rep = validate_recording(cap)
+    assert rep["status"] == "clean", f"Expected clean validation for YS-67 capture, got {rep['findings']}"
+
+    # 2. Negative exposure_duration_s is caught
+    cap_bad_exp = _clone_capture(cap, tmp_path / "cap_ys67_bad_exp")
+    s_bad = list(csv.DictReader((cap_bad_exp / "stills.csv").open()))
+    s_bad[0]["exposure_duration_s"] = "-0.005"
+    with (cap_bad_exp / "stills.csv").open("w", encoding="utf-8", newline="") as sf:
+        sw = csv.DictWriter(sf, fieldnames=new_still_cols, lineterminator="\n")
+        sw.writeheader()
+        sw.writerows(s_bad)
+    seal_manifest(cap_bad_exp)
+    rep_bad_exp = validate_recording(cap_bad_exp)
+    assert rep_bad_exp["status"] == "invalid"
+    assert any(f["code"] == "still_invalid_exposure_or_iso" for f in rep_bad_exp["findings"])
+
+
+def test_ys67_guidance_event_after_close_leaves_last_tap_unchanged(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-67: Only operator kinds (`marker`, `note`, `tape_*`) count as taps; guidance events after the close leave the last tap unchanged."""
+    from yardstick.converter import _is_operator_tap_kind
+
+    assert _is_operator_tap_kind("marker") is True
+    assert _is_operator_tap_kind("note") is True
+    assert _is_operator_tap_kind("tape_a") is True
+    assert _is_operator_tap_kind("tape_b") is True
+    assert _is_operator_tap_kind("done") is False
+    assert _is_operator_tap_kind("loop_closed") is False
+    assert _is_operator_tap_kind("guidance_prompt") is False
+
+    # Clone baseline Grade A capture and append a post-close guidance/loop_closed event at the very last frame
+    cap = _clone_capture(base_synth_dir, tmp_path / "cap_ys67_post_guidance")
+    poses_rows = list(csv.DictReader((cap / "poses.csv").open()))
+    last_pose = poses_rows[-1]
+    t_last = float(last_pose["t"])
+
+    with (cap / "guidance.csv").open("w", encoding="utf-8", newline="") as gf:
+        gw = csv.DictWriter(gf, fieldnames=["t", "saved_index", "kind", "detail"], lineterminator="\n")
+        gw.writeheader()
+        gw.writerow(
+            {
+                "t": f"{t_last + 0.05:.6f}",
+                "saved_index": str(last_pose["saved_index"]),
+                "kind": "instruction",
+                "detail": "Walk ready to review",
+            }
+        )
+    seal_manifest(cap)
+
+    res = convert_recording_to_standard(cap)
+    assert res["grade"]["grade"] == "A"
+    assert "no_loop_closure" not in res["grade"]["caps_applied"]
+    assert res["frame"]["origin_residual_m"] is not None
+    assert res["frame"]["origin_residual_m"] <= 0.05
+
+
+def test_ys67_60s_lookup_after_loop_closed_with_stray_marker2_keeps_loop(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-67: A 60 s look-up after `loop_closed`, including a stray sighting of marker 2, keeps the loop closed."""
+    from yardstick.geometry import build_yard_frame, cluster_marker_passes
+
+    poses_rows = list(csv.DictReader((base_synth_dir / "poses.csv").open()))
+    markers_rows = list(csv.DictReader((base_synth_dir / "markers.csv").open()))
+    camera_poses_world = {
+        int(r["saved_index"]): pose_to_matrix(
+            float(r["px"]),
+            float(r["py"]),
+            float(r["pz"]),
+            float(r["qx"]),
+            float(r["qy"]),
+            float(r["qz"]),
+            float(r["qw"]),
+        )
+        for r in poses_rows
+    }
+
+    walk_start_t_s = float(poses_rows[0]["t"])
+    loop_closed_t_s = float(poses_rows[-1]["t"])
+    # Simulate 60 s of post-close look-up frames + a stray sighting of Marker 2 at loop_closed_t_s + 45 s
+    walk_end_after_lookup_t_s = loop_closed_t_s + 60.0
+    stray_m2_t_s = loop_closed_t_s + 45.0
+    stray_m2_idx = int(poses_rows[-1]["saved_index"]) + 100
+    camera_poses_world[stray_m2_idx] = camera_poses_world[int(poses_rows[10]["saved_index"])]
+
+    m2_template = next(r for r in markers_rows if int(r["marker_id"]) == 2)
+    stray_m2_row = dict(m2_template)
+    stray_m2_row["t"] = f"{stray_m2_t_s:.6f}"
+    stray_m2_row["saved_index"] = str(stray_m2_idx)
+
+    augmented_markers = sorted(markers_rows + [stray_m2_row], key=lambda r: float(r["t"]))
+    passes_by_marker = cluster_marker_passes(augmented_markers, camera_poses_world)
+    confirmed_m0 = {int(r["saved_index"]) for r in markers_rows if int(r["marker_id"]) == 0}
+
+    # 1. With loop_closed_t_s set: the 60 s look-up and stray Marker 2 sighting keep the loop closed
+    yf_with_close = build_yard_frame(
+        ground_normal_world=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        ground_d_world=0.0,
+        ground_residual_m=0.002,
+        ground_residual_p95_m=0.004,
+        passes_by_marker=passes_by_marker,
+        first_camera_pose_world=camera_poses_world[0],
+        pose_jumps=[],
+        walk_start_t_s=walk_start_t_s,
+        walk_end_t_s=walk_end_after_lookup_t_s,
+        last_tap_t_s=walk_start_t_s + 0.8,
+        loop_closed_t_s=loop_closed_t_s,
+        camera_poses_by_index=camera_poses_world,
+        confirmed_marker0_still_indices=confirmed_m0,
+    )
+    assert yf_with_close["origin_residual_m"] is not None
+    assert any(g["marker_id"] == 0 for g in yf_with_close["loop_closure_gaps"])
+
+    # 2. Without loop_closed_t_s (legacy behavior): the 60 s look-up and stray Marker 2 void the loop
+    yf_without_close = build_yard_frame(
+        ground_normal_world=np.array([0.0, 1.0, 0.0], dtype=np.float64),
+        ground_d_world=0.0,
+        ground_residual_m=0.002,
+        ground_residual_p95_m=0.004,
+        passes_by_marker=passes_by_marker,
+        first_camera_pose_world=camera_poses_world[0],
+        pose_jumps=[],
+        walk_start_t_s=walk_start_t_s,
+        walk_end_t_s=walk_end_after_lookup_t_s,
+        last_tap_t_s=walk_start_t_s + 0.8,
+        loop_closed_t_s=None,
+        camera_poses_by_index=camera_poses_world,
+        confirmed_marker0_still_indices=confirmed_m0,
+    )
+    assert yf_without_close["origin_residual_m"] is None
+    assert not any(g["marker_id"] == 0 for g in yf_without_close["loop_closure_gaps"])
+
+
+def test_ys69_subpixel_refinement_window5_and_quad_rejection_gates() -> None:
+    """YS-69: OpenCV DICT_5X5_250 uses sub-pixel corner refinement (window 5), rejects > 3% corner shift, and rejects > 4% 3D edge disagreement."""
+    import cv2
+    from yardstick.markers import (
+        check_refined_corner_shift,
+        detect_aruco_markers_opencv,
+        measure_marker_corners_3d_on_lidar_plane,
+    )
+
+    # 1. Sub-pixel corner refinement on rendered marker
+    aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_5X5_250)
+    m_gray = cv2.aruco.generateImageMarker(aruco_dict, 0, 160)
+    canvas = np.full((240, 240), 255, dtype=np.uint8)
+    canvas[40:200, 40:200] = m_gray
+    dets = detect_aruco_markers_opencv(canvas)
+    assert 0 in dets
+
+    # 2. > 3% refined corner movement is rejected
+    raw_quad = np.array([[40.0, 40.0], [200.0, 40.0], [200.0, 200.0], [40.0, 200.0]], dtype=np.float64)
+    # 1.5% corner shift (2.4 px on 160 px edge) -> accepted
+    ref_ok = raw_quad.copy()
+    ref_ok[0, 0] += 2.4
+    assert check_refined_corner_shift(raw_quad, ref_ok, max_corner_shift_ratio=0.03) is True
+    # 4.0% corner shift (6.4 px on 160 px edge) -> rejected
+    ref_bad = raw_quad.copy()
+    ref_bad[0, 0] += 6.4
+    assert check_refined_corner_shift(raw_quad, ref_bad, max_corner_shift_ratio=0.03) is False
+
+    # 3. > 4% 3D edge length disagreement is rejected
+    depth_mm = np.full((192, 256), 2000, dtype=np.uint16)
+    conf_img = np.full((192, 256), 2, dtype=np.uint8)
+    square_uv = np.array([[280.0, 200.0], [320.0, 200.0], [320.0, 240.0], [280.0, 240.0]], dtype=np.float64)
+    res_ok = measure_marker_corners_3d_on_lidar_plane(
+        corners_uv=square_uv,
+        depth_mm=depth_mm,
+        conf_img=conf_img,
+        fx=480.0,
+        fy=480.0,
+        cx=320.0,
+        cy=240.0,
+        rgb_width=640,
+        rgb_height=480,
+        T_world_from_cam=np.eye(4, dtype=np.float64),
+    )
+    assert res_ok is not None
+
+    # Stretch horizontal edges by 8% (43.2 px vs 40.0 px -> > 4% 3D edge disagreement) -> rejected (None)
+    skewed_uv = np.array([[280.0, 200.0], [323.2, 200.0], [323.2, 240.0], [280.0, 240.0]], dtype=np.float64)
+    res_bad = measure_marker_corners_3d_on_lidar_plane(
+        corners_uv=skewed_uv,
+        depth_mm=depth_mm,
+        conf_img=conf_img,
+        fx=480.0,
+        fy=480.0,
+        cx=320.0,
+        cy=240.0,
+        rgb_width=640,
+        rgb_height=480,
+        T_world_from_cam=np.eye(4, dtype=np.float64),
+    )
+    assert res_bad is None
+
+
+
 

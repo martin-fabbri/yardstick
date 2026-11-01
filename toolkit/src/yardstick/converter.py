@@ -63,6 +63,12 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
     path.write_text(json.dumps(data, indent=2, sort_keys=False) + "\n", encoding="utf-8")
 
 
+def _is_operator_tap_kind(kind: str) -> bool:
+    """Return True only for operator tap event kinds (`marker`, `note`, `tape_*`) (YS-67)."""
+    k = kind.strip()
+    return k in ("marker", "note") or k.startswith("tape_")
+
+
 def convert_recording_to_standard(
     capture_dir: Path,
     *,
@@ -84,6 +90,7 @@ def convert_recording_to_standard(
     stills_rows = _read_csv(capture_dir / "stills.csv")
     markers_rows = _read_csv(capture_dir / "markers.csv")
     events_rows = _read_csv(capture_dir / "events.csv")
+    guidance_rows = _read_csv(capture_dir / "guidance.csv")
 
     # 1. Index camera poses by saved_index and compute tracking stats
     poses_by_index: dict[int, dict[str, Any]] = {}
@@ -230,12 +237,21 @@ def convert_recording_to_standard(
 
     walk_start_t_s: float | None = float(poses_rows[0]["t"]) if poses_rows else None
     walk_end_t_s: float | None = float(poses_rows[-1]["t"]) if poses_rows else None
-    non_done_tap_times = [
-        float(er["t"]) for er in events_rows if er.get("kind", "").strip() not in ("", "done")
+    loop_closed_times = [
+        float(r["t"])
+        for r in (events_rows + guidance_rows)
+        if (r.get("kind") or r.get("event") or "").strip() == "loop_closed"
     ]
-    last_tap_t_s: float | None = max(non_done_tap_times) if non_done_tap_times else None
+    loop_closed_t_s: float | None = max(loop_closed_times) if loop_closed_times else None
+    operator_tap_times = [
+        float(er["t"])
+        for er in events_rows
+        if _is_operator_tap_kind(er.get("kind", ""))
+        and (loop_closed_t_s is None or float(er["t"]) <= loop_closed_t_s + 1e-6)
+    ]
+    last_tap_t_s: float | None = max(operator_tap_times) if operator_tap_times else None
 
-    # 5. Build Yard Frame transform & calibrate North (YS-31, YS-32, YS-14)
+    # 5. Build Yard Frame transform & calibrate North (YS-31, YS-32, YS-14, YS-67)
     confirmed_marker0_still_indices: set[int] = set()
     m0_candidate_indices = {
         int(mr["saved_index"]) for mr in markers_rows if int(mr["marker_id"]) == 0
@@ -266,6 +282,7 @@ def convert_recording_to_standard(
         walk_start_t_s=walk_start_t_s,
         walk_end_t_s=walk_end_t_s,
         last_tap_t_s=last_tap_t_s,
+        loop_closed_t_s=loop_closed_t_s,
         camera_poses_by_index=camera_poses_world,
         confirmed_marker0_still_indices=confirmed_marker0_still_indices,
         max_closing_distance_m=1.50,

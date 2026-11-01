@@ -499,11 +499,12 @@ def build_yard_frame(
     walk_start_t_s: float | None = None,
     walk_end_t_s: float | None = None,
     last_tap_t_s: float | None = None,
+    loop_closed_t_s: float | None = None,
     camera_poses_by_index: dict[int, np.ndarray] | None = None,
     confirmed_marker0_still_indices: set[int] | None = None,
     max_closing_distance_m: float = 1.50,
 ) -> dict[str, Any]:
-    """Construct world_to_yard_transform (4x4) and frame residuals (YS-31, YS-32, YS-51)."""
+    """Construct world_to_yard_transform (4x4) and frame residuals (YS-31, YS-32, YS-51, YS-67)."""
     eff_p95 = ground_residual_p95_m if ground_residual_p95_m is not None else (ground_residual_m * 1.96)
     z_yard = ground_normal_world / np.linalg.norm(ground_normal_world)
     jump_sum = sum(float(j["jump_m"]) for j in pose_jumps)
@@ -511,29 +512,48 @@ def build_yard_frame(
     latest_other_marker_t_s: float | None = None
     for mid, m_passes in passes_by_marker.items():
         if mid != 0 and m_passes:
-            t_last_other = float(m_passes[-1][-1]["t"])
-            if latest_other_marker_t_s is None or t_last_other > latest_other_marker_t_s:
-                latest_other_marker_t_s = t_last_other
+            for m_pass in m_passes:
+                for r in m_pass:
+                    t_other = float(r["t"])
+                    if loop_closed_t_s is not None and t_other > loop_closed_t_s + 1e-6:
+                        continue
+                    if latest_other_marker_t_s is None or t_other > latest_other_marker_t_s:
+                        latest_other_marker_t_s = t_other
+
+    effective_end_t_s = loop_closed_t_s if loop_closed_t_s is not None else walk_end_t_s
+    effective_last_tap_t_s = (
+        None
+        if (last_tap_t_s is not None and loop_closed_t_s is not None and last_tap_t_s > loop_closed_t_s + 1e-6)
+        else last_tap_t_s
+    )
 
     walk_span_s = (
-        (walk_end_t_s - walk_start_t_s)
-        if (walk_end_t_s is not None and walk_start_t_s is not None and walk_end_t_s >= walk_start_t_s)
+        (effective_end_t_s - walk_start_t_s)
+        if (effective_end_t_s is not None and walk_start_t_s is not None and effective_end_t_s >= walk_start_t_s)
         else 0.0
     )
 
     m0_has_valid_closing_pass = False
     valid_closing_m0_rows: list[dict[str, Any]] = []
     if 0 in passes_by_marker and len(passes_by_marker[0]) >= 2:
-        last_pass_m0 = passes_by_marker[0][-1]
+        if loop_closed_t_s is not None:
+            return_passes_up_to_close = [
+                [r for r in mp if float(r["t"]) <= loop_closed_t_s + 1e-6]
+                for mp in passes_by_marker[0][1:]
+            ]
+            return_passes_up_to_close = [mp for mp in return_passes_up_to_close if mp]
+            last_pass_m0 = return_passes_up_to_close[-1] if return_passes_up_to_close else []
+        else:
+            last_pass_m0 = passes_by_marker[0][-1]
         for r in last_pass_m0:
             r_t = float(r["t"])
             r_idx = int(r["saved_index"])
-            if walk_end_t_s is not None:
-                if (walk_end_t_s - r_t) > 30.0:
+            if effective_end_t_s is not None:
+                if (effective_end_t_s - r_t) > 30.0:
                     continue
-                if walk_span_s > 5.0 and (walk_end_t_s - r_t) > min(30.0, 0.35 * walk_span_s):
+                if walk_span_s > 5.0 and (effective_end_t_s - r_t) > min(30.0, 0.35 * walk_span_s):
                     continue
-            if last_tap_t_s is not None and r_t < last_tap_t_s - 1e-6:
+            if effective_last_tap_t_s is not None and r_t < effective_last_tap_t_s - 1e-6:
                 continue
             if latest_other_marker_t_s is not None and r_t < latest_other_marker_t_s - 1e-6:
                 continue

@@ -54,7 +54,8 @@
           "events",
           "stills",
           "markers",
-          "health"
+          "health",
+          "guidance"
         ],
         "type": "string"
       },

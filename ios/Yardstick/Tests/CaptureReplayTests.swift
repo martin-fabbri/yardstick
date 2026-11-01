@@ -360,11 +360,12 @@ final class CaptureReplayTests: XCTestCase {
                 XCTAssertNil(gWalk.grade_coeff_loop_closure_gap_m)
             }
 
-            // Verify per-marker sighting counts match between phone replay and Python toolkit golden file
+            // Verify toolkit golden sightings_count (after YS-69 OpenCV sub-pixel + 3%/4% gates) is non-empty and <= raw phone sightings
             for (midStr, markerEntry) in gWalk.per_marker {
                 guard let mid = Int(midStr) else { continue }
                 let count = res.replayedSightings.filter { $0.sighting.markerID == mid }.count
-                XCTAssertEqual(count, markerEntry.sightings_count, "YS-66: \(exp.walkKey) marker \(mid) sighting count mismatch")
+                XCTAssertGreaterThan(markerEntry.sightings_count, 0, "YS-66: \(exp.walkKey) marker \(mid) toolkit sightings must be > 0")
+                XCTAssertGreaterThanOrEqual(count, markerEntry.sightings_count, "YS-66: \(exp.walkKey) marker \(mid) raw sightings must be >= toolkit filtered sightings")
             }
         }
     }

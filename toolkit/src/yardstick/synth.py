@@ -368,12 +368,14 @@ def generate_synthetic_capture(
                     patch = marker_patches[mid]
                     ph, pw = patch.shape[:2]
                     pad_q = float(pw) * 0.1
+                    lo_px = pad_q - 0.44
+                    hi_px = float(pw) - pad_q - 0.56
                     src_pts = np.array(
                         [
-                            [pad_q, pad_q],
-                            [pw - pad_q, pad_q],
-                            [pw - pad_q, ph - pad_q],
-                            [pad_q, ph - pad_q],
+                            [lo_px, lo_px],
+                            [hi_px, lo_px],
+                            [hi_px, hi_px],
+                            [lo_px, hi_px],
                         ],
                         dtype=np.float32,
                     )
@@ -718,6 +720,8 @@ def seal_manifest(capture_dir: Path, capture_id: str | None = None) -> Path:
         "stills",
         "markers",
     ]
+    if (capture_dir / "guidance.csv").exists():
+        streams_declared.append("guidance")
     manifest_data = {
         "contract": CONTRACT_VERSION,
         "capture_id": capture_id,

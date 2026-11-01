@@ -55,9 +55,15 @@ WALK_SPECS: list[tuple[str, str, str]] = [
 TRIMMED_SAVED_INDICES: list[int] = [0, 381, 438, 1020, 1929, 2652]
 
 
-def _extract_walk_summary(walk_key: str, rel_path: str, capture_dir: Path) -> dict[str, Any]:
+def _extract_walk_summary(
+    walk_key: str,
+    rel_path: str,
+    capture_dir: Path,
+    *,
+    reconvert: bool = False,
+) -> dict[str, Any]:
     std_dir = capture_dir / "standard"
-    if not (std_dir / "frame.json").exists() or not (std_dir / "grade.json").exists():
+    if reconvert or not (std_dir / "frame.json").exists() or not (std_dir / "grade.json").exists():
         convert_recording_to_standard(capture_dir)
 
     session_data = json.loads((capture_dir / "session.json").read_text(encoding="utf-8"))
@@ -150,13 +156,14 @@ def main() -> int:
     replay_root = Path(replay_root_env).resolve()
     FIXTURES_DIR.mkdir(parents=True, exist_ok=True)
 
+    reconvert = "--reconvert" in sys.argv[1:]
     walks_out: dict[str, Any] = {}
     for walk_key, rel_path, _ in WALK_SPECS:
         cap_dir = replay_root / rel_path
         if not cap_dir.exists():
             print(f"ERROR: Missing capture directory {cap_dir}", file=sys.stderr)
             return 1
-        walks_out[walk_key] = _extract_walk_summary(walk_key, rel_path, cap_dir)
+        walks_out[walk_key] = _extract_walk_summary(walk_key, rel_path, cap_dir, reconvert=reconvert)
 
     walk5_dir = replay_root / "walk-5/20261101T012134Z_yardstick"
     _build_trimmed_walk5_sample(walk5_dir, TRIMMED_WALK5_DIR)

@@ -32,7 +32,8 @@
               "tape_a",
               "tape_b",
               "done",
-              "note"
+              "note",
+              "loop_closed"
             ],
             "type": "string"
           },

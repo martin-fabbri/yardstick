@@ -499,7 +499,31 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     if int(r["saved_index"]) not in poses_by_idx:
                         add_finding("event_invalid_saved_index", "error", f"Event references unknown saved_index {r['saved_index']}")
 
-    # Validate stills.csv & stills/*.jpg (YS-13)
+    # Validate optional guidance.csv stream (YS-67)
+    guidance_path = capture_dir / "guidance.csv"
+    if "guidance" in declared_streams and not guidance_path.exists():
+        add_finding("missing_guidance_csv", "error", "guidance stream declared in manifest.json but guidance.csv is missing (YS-67)")
+    if guidance_path.exists():
+        with open(guidance_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or reader.fieldnames[0] != "t":
+                add_finding("guidance_csv_header", "error", f"Invalid guidance.csv header: {reader.fieldnames} (YS-67)")
+            else:
+                prev_t = -1.0
+                for r in reader:
+                    try:
+                        t_val = float(r["t"])
+                    except Exception:
+                        add_finding("guidance_invalid_timestamp", "error", f"Invalid guidance.csv timestamp: {r.get('t')} (YS-67)")
+                        continue
+                    if t_val < prev_t:
+                        add_finding("guidance_non_monotonic", "error", "guidance.csv timestamps not monotonic (YS-67)")
+                    prev_t = t_val
+                    s_idx_raw = (r.get("saved_index") or "").strip()
+                    if s_idx_raw != "" and int(s_idx_raw) not in poses_by_idx:
+                        add_finding("guidance_invalid_saved_index", "error", f"Guidance row references unknown saved_index {s_idx_raw} (YS-67)")
+
+    # Validate stills.csv & stills/*.jpg (YS-13, YS-67)
     stills_path = capture_dir / "stills.csv"
     stills_by_idx: dict[int, str] = {}
     if not stills_path.exists():
@@ -508,8 +532,9 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
         with open(stills_path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
             expected_cols = ["t", "saved_index", "file", "px", "py", "pz", "qx", "qy", "qz", "qw", "fx", "fy", "cx", "cy", "width", "height"]
-            if reader.fieldnames != expected_cols:
-                add_finding("stills_csv_header", "error", f"stills.csv header {reader.fieldnames} != {expected_cols}")
+            expected_cols_with_exposure = expected_cols + ["exposure_duration_s", "iso"]
+            if reader.fieldnames not in (expected_cols, expected_cols_with_exposure):
+                add_finding("stills_csv_header", "error", f"stills.csv header {reader.fieldnames} != {expected_cols} (or + ['exposure_duration_s', 'iso'])")
             else:
                 prev_t = -1.0
                 for r in reader:
@@ -520,6 +545,15 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     s_idx = int(r["saved_index"])
                     rel_f = r["file"]
                     stills_by_idx[s_idx] = rel_f
+                    for opt_col in ("exposure_duration_s", "iso"):
+                        raw_opt = (r.get(opt_col) or "").strip()
+                        if raw_opt != "":
+                            try:
+                                val_opt = float(raw_opt)
+                                if not np.isfinite(val_opt) or val_opt < 0.0:
+                                    add_finding("still_invalid_exposure_or_iso", "error", f"stills.csv {opt_col}={raw_opt} at saved_index={s_idx} must be >= 0 (YS-67)")
+                            except ValueError:
+                                add_finding("still_invalid_exposure_or_iso", "error", f"stills.csv {opt_col}={raw_opt} at saved_index={s_idx} is not a number (YS-67)")
                     sqx, sqy, sqz, sqw = float(r["qx"]), float(r["qy"]), float(r["qz"]), float(r["qw"])
                     T_s = pose_to_matrix(
                         float(r["px"]),
