@@ -1,0 +1,168 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/frame.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "ground_plane_residual_m": {
+      "minimum": 0,
+      "type": "number"
+    },
+    "ground_plane_residual_p95_m": {
+      "minimum": 0,
+      "type": "number"
+    },
+    "loop_closure_gaps": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "first_t_s": {
+            "type": "number"
+          },
+          "gap_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "last_t_s": {
+            "type": "number"
+          },
+          "marker_id": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "marker_id",
+          "first_t_s",
+          "last_t_s",
+          "gap_m"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "marker_0_normal_ok": {
+      "type": "boolean"
+    },
+    "marker_id": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "method": {
+      "enum": [
+        "marker",
+        "first_pose"
+      ],
+      "type": "string"
+    },
+    "north_calibration": {
+      "additionalProperties": false,
+      "properties": {
+        "north_angle_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "north_uncertainty_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "sample_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "denied",
+            "accuracy_exceeded",
+            "insufficient_samples"
+          ],
+          "type": "string"
+        }
+      },
+      "required": [
+        "status",
+        "north_angle_deg",
+        "north_uncertainty_deg",
+        "sample_count"
+      ],
+      "type": "object"
+    },
+    "origin_height_m": {
+      "type": "number"
+    },
+    "origin_residual_m": {
+      "type": [
+        "number",
+        "null"
+      ]
+    },
+    "pose_convention": {
+      "const": "yard_right_handed_z_up"
+    },
+    "pose_jumps": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "jump_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "saved_index_from": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "saved_index_to": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "t_s": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "saved_index_from",
+          "saved_index_to",
+          "t_s",
+          "jump_m"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "world_to_yard_transform": {
+      "items": {
+        "type": "number"
+      },
+      "maxItems": 16,
+      "minItems": 16,
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "method",
+    "marker_id",
+    "marker_0_normal_ok",
+    "pose_convention",
+    "world_to_yard_transform",
+    "origin_height_m",
+    "origin_residual_m",
+    "ground_plane_residual_m",
+    "ground_plane_residual_p95_m",
+    "north_calibration",
+    "loop_closure_gaps",
+    "pose_jumps"
+  ],
+  "title": "Yardstick Level 2 Yard Frame Transform & Residuals",
+  "type": "object"
+}

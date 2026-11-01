@@ -1,0 +1,287 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/grade.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "caps_applied": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "grade": {
+      "enum": [
+        "A",
+        "B",
+        "C",
+        "fail"
+      ],
+      "type": "string"
+    },
+    "grading_version": {
+      "const": "yardstick-grade/1"
+    },
+    "marker_scale": {
+      "additionalProperties": false,
+      "properties": {
+        "per_marker": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "marker_id": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "scale_error_ratio": {
+                "type": "number"
+              },
+              "scale_error_se": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "sightings_count": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "size_mm_measured": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "size_mm_printed": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              }
+            },
+            "required": [
+              "marker_id",
+              "size_mm_printed",
+              "size_mm_measured",
+              "scale_error_ratio",
+              "scale_error_se",
+              "sightings_count"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "scale_error_eff": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "scale_error_ratio": {
+          "type": "number"
+        },
+        "scale_error_se": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "sightings_used": {
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "scale_error_ratio",
+        "scale_error_se",
+        "scale_error_eff",
+        "sightings_used",
+        "per_marker"
+      ],
+      "type": "object"
+    },
+    "reasons": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "tape_checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "measured_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "point_a_yard_m": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
+          },
+          "point_b_yard_m": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
+          },
+          "residual_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "role": {
+            "enum": [
+              "primary",
+              "held_out"
+            ],
+            "type": "string"
+          },
+          "tape_m": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "tolerance_at_tape_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "within_tolerance": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "point_a_yard_m",
+          "point_b_yard_m",
+          "tape_m",
+          "measured_m",
+          "residual_m",
+          "tolerance_at_tape_m",
+          "within_tolerance"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "tolerances_95pct": {
+      "additionalProperties": false,
+      "properties": {
+        "coefficients": {
+          "additionalProperties": false,
+          "properties": {
+            "limited_tracking_share": {
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "loop_closure_gap_m": {
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "loop_gap_per_m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "max_tape_residual_m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "primary_tape_floor_10m_m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "scale_error_eff": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "scale_error_ratio": {
+              "type": "number"
+            },
+            "scale_error_se": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "sigma_lidar_m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "sigma_tracking_m": {
+              "minimum": 0,
+              "type": "number"
+            },
+            "walk_length_m": {
+              "minimum": 0,
+              "type": "number"
+            }
+          },
+          "required": [
+            "max_tape_residual_m",
+            "primary_tape_floor_10m_m",
+            "sigma_lidar_m",
+            "scale_error_ratio",
+            "scale_error_se",
+            "scale_error_eff",
+            "loop_closure_gap_m",
+            "walk_length_m",
+            "loop_gap_per_m",
+            "sigma_tracking_m",
+            "limited_tracking_share"
+          ],
+          "type": "object"
+        },
+        "distance_m": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "evidence_basis": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "formula": {
+          "type": "string"
+        },
+        "height_m": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "position_m": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "reference_range_m": {
+          "const": 10.0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "distance_m",
+        "height_m",
+        "position_m",
+        "reference_range_m",
+        "formula",
+        "coefficients",
+        "evidence_basis"
+      ],
+      "type": "object"
+    }
+  },
+  "required": [
+    "contract",
+    "grading_version",
+    "grade",
+    "tolerances_95pct",
+    "tape_checks",
+    "marker_scale",
+    "caps_applied",
+    "reasons"
+  ],
+  "title": "Yardstick Level 2 Capture Grade & Tolerances",
+  "type": "object"
+}

@@ -1,0 +1,500 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/session.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "app_version": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "camera_format": {
+      "additionalProperties": false,
+      "properties": {
+        "actual": {
+          "additionalProperties": false,
+          "properties": {
+            "fps": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "height": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "width": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "fps"
+          ],
+          "type": "object"
+        },
+        "requested": {
+          "additionalProperties": false,
+          "properties": {
+            "fps": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "height": {
+              "minimum": 1,
+              "type": "integer"
+            },
+            "width": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "width",
+            "height",
+            "fps"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "requested",
+        "actual"
+      ],
+      "type": "object"
+    },
+    "capture_id": {
+      "minLength": 1,
+      "type": "string"
+    },
+    "clock": {
+      "additionalProperties": false,
+      "properties": {
+        "audio_first_sample_t_s": {
+          "type": "number"
+        },
+        "audio_sample_rate_hz": {
+          "enum": [
+            16000
+          ],
+          "type": "integer"
+        },
+        "start_clock_pair": {
+          "additionalProperties": false,
+          "properties": {
+            "t_s": {
+              "type": "number"
+            },
+            "utc": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "t_s",
+            "utc"
+          ],
+          "type": "object"
+        },
+        "started_at_utc": {
+          "type": "string"
+        },
+        "stop_clock_pair": {
+          "additionalProperties": false,
+          "properties": {
+            "t_s": {
+              "type": "number"
+            },
+            "utc": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "t_s",
+            "utc"
+          ],
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "t0_monotonic_s": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "started_at_utc",
+        "t0_monotonic_s",
+        "start_clock_pair",
+        "stop_clock_pair",
+        "audio_first_sample_t_s",
+        "audio_sample_rate_hz"
+      ],
+      "type": "object"
+    },
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "device": {
+      "additionalProperties": false,
+      "properties": {
+        "ios_version": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "lidar_supported": {
+          "type": "boolean"
+        },
+        "model": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "name": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "model",
+        "name",
+        "ios_version",
+        "lidar_supported"
+      ],
+      "type": "object"
+    },
+    "guide_thresholds": {
+      "additionalProperties": false,
+      "properties": {
+        "pitch_max_deg": {
+          "type": "number"
+        },
+        "pitch_min_deg": {
+          "type": "number"
+        },
+        "roll_max_abs_deg": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "pitch_min_deg",
+        "pitch_max_deg",
+        "roll_max_abs_deg"
+      ],
+      "type": "object"
+    },
+    "location": {
+      "additionalProperties": false,
+      "properties": {
+        "heading_accuracy_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "horizontal_accuracy_m": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "latitude_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "longitude_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "magnetic_heading_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "north_samples": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "camera_yaw_world_deg": {
+                "type": "number"
+              },
+              "heading_accuracy_deg": {
+                "type": "number"
+              },
+              "t_s": {
+                "type": "number"
+              },
+              "true_heading_deg": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "t_s",
+              "camera_yaw_world_deg",
+              "true_heading_deg",
+              "heading_accuracy_deg"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "denied",
+            "accuracy_exceeded",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "true_heading_deg": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "latitude_deg",
+        "longitude_deg",
+        "horizontal_accuracy_m",
+        "true_heading_deg",
+        "magnetic_heading_deg",
+        "heading_accuracy_deg",
+        "north_samples"
+      ],
+      "type": "object"
+    },
+    "loop_closure_gaps": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "first_t_s": {
+            "type": "number"
+          },
+          "gap_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "last_t_s": {
+            "type": "number"
+          },
+          "marker_id": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "marker_id",
+          "first_t_s",
+          "last_t_s",
+          "gap_m"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "marker_config": {
+      "additionalProperties": false,
+      "properties": {
+        "dictionary": {
+          "const": "DICT_5X5_250"
+        },
+        "printed_sizes_mm": {
+          "additionalProperties": {
+            "enum": [
+              180.0,
+              250.0
+            ],
+            "type": "number"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "dictionary",
+        "printed_sizes_mm"
+      ],
+      "type": "object"
+    },
+    "pose_convention": {
+      "const": "arkit_right_handed_y_up"
+    },
+    "provisional_grade": {
+      "additionalProperties": false,
+      "properties": {
+        "distance_tolerance_10m_m": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "grade": {
+          "enum": [
+            "A",
+            "B",
+            "C",
+            "fail"
+          ],
+          "type": "string"
+        },
+        "loop_closure_gap_m": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "reasons": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "grade",
+        "distance_tolerance_10m_m",
+        "loop_closure_gap_m",
+        "reasons"
+      ],
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "state": {
+      "additionalProperties": false,
+      "properties": {
+        "failed_stream": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_heartbeat_t_s": {
+          "minimum": 0,
+          "type": "number"
+        },
+        "status": {
+          "enum": [
+            "starting",
+            "recording",
+            "stopped",
+            "interrupted",
+            "failed"
+          ],
+          "type": "string"
+        },
+        "stop_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "status",
+        "last_heartbeat_t_s",
+        "stop_reason",
+        "failed_stream"
+      ],
+      "type": "object"
+    },
+    "tape_checks": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "measured_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "point_a_world_m": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
+          },
+          "point_b_world_m": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
+          },
+          "residual_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "role": {
+            "enum": [
+              "primary",
+              "held_out"
+            ],
+            "type": "string"
+          },
+          "saved_index_a": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "saved_index_b": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "t_a_s": {
+            "type": "number"
+          },
+          "t_b_s": {
+            "type": "number"
+          },
+          "tape_m": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "t_a_s",
+          "t_b_s",
+          "saved_index_a",
+          "saved_index_b",
+          "point_a_world_m",
+          "point_b_world_m",
+          "tape_m",
+          "measured_m",
+          "residual_m"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "capture_id",
+    "device",
+    "app_version",
+    "clock",
+    "camera_format",
+    "pose_convention",
+    "state",
+    "location",
+    "marker_config",
+    "guide_thresholds",
+    "loop_closure_gaps",
+    "tape_checks",
+    "provisional_grade"
+  ],
+  "title": "Yardstick Level 1 Session Metadata",
+  "type": "object"
+}

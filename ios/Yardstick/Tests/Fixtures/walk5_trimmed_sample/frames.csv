@@ -1,0 +1,16 @@
+t,saved_index,dropped,drop_reason,tracking_state,tracking_reason
+711.774082,,true,missing_depth_buffer,limited,initializing
+711.806526,,true,missing_depth_buffer,limited,initializing
+711.839870,,true,missing_depth_buffer,limited,initializing
+711.873200,,true,missing_depth_buffer,limited,initializing
+711.906532,,true,missing_depth_buffer,limited,initializing
+711.939873,,true,missing_depth_buffer,limited,initializing
+711.973209,,true,missing_depth_buffer,limited,initializing
+712.006539,,true,missing_depth_buffer,limited,initializing
+712.039860,,true,missing_depth_buffer,limited,initializing
+712.073208,0,false,,limited,initializing
+724.773532,381,false,,normal,
+726.673596,438,false,,normal,
+746.074095,1020,false,,normal,
+776.374900,1929,false,,normal,
+800.475520,2652,false,,normal,

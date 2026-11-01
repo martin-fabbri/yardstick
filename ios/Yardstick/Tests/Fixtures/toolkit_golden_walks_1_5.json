@@ -1,0 +1,273 @@
+{
+  "schema": "yardstick.ys66.toolkit_golden.v1",
+  "contract_version": "yardstick-capture/1",
+  "grading_version": "yardstick-grade/1",
+  "generated_by_command": "cd toolkit && YARDSTICK_REPLAY_ROOT=$YARDSTICK_REPLAY_ROOT PYTHONPATH=src .venv/bin/python scripts/generate_ys66_replay_fixtures.py",
+  "trimmed_walk5_saved_indices": [
+    0,
+    381,
+    438,
+    1020,
+    1929,
+    2652
+  ],
+  "walks": {
+    "walk-1": {
+      "walk_key": "walk-1",
+      "relative_path": "walks-1-4/20261101T003322Z_yardstick",
+      "capture_id": "20261101T003322Z_yardstick",
+      "grade": "fail",
+      "caps_applied": [
+        "integrity_invalid",
+        "no_tape_check"
+      ],
+      "grade_coeff_loop_closure_gap_m": 0.246154,
+      "grade_coeff_reports_closed": true,
+      "frame_marker0_loop_closure_gap_m": 0.246154,
+      "frame_marker0_loop_closed": true,
+      "pose_jumps": [
+        {
+          "saved_index_from": 1537,
+          "saved_index_to": 1554,
+          "t_s": 290037.5669,
+          "jump_m": 0.097643
+        }
+      ],
+      "reasons": [
+        "distance_tolerance_10m_m=5.6441m",
+        "loop_closure_gap_m=0.2462m",
+        "primary_tape_checks=0",
+        "marker_scale_error_ratio=-0.2895 (se=0.0009, eff=0.2878)",
+        "pose_jump_detected: 0.0976m at t=290037.567s (frames 1537->1554)",
+        "fail_threshold: distance_tolerance_10m_m (5.6441m) > 0.20m",
+        "cap_applied: integrity=invalid -> fail",
+        "cap_applied: no_tape_check -> max grade C"
+      ],
+      "per_marker": {
+        "0": {
+          "sightings_count": 114,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 179.084,
+          "scale_error_ratio": -0.283663,
+          "scale_error_se": 0.00066
+        },
+        "1": {
+          "sightings_count": 49,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 177.992,
+          "scale_error_ratio": -0.288031,
+          "scale_error_se": 0.00095
+        },
+        "2": {
+          "sightings_count": 43,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 177.616,
+          "scale_error_ratio": -0.289534,
+          "scale_error_se": 0.000852
+        },
+        "3": {
+          "sightings_count": 27,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 178.609,
+          "scale_error_ratio": -0.285565,
+          "scale_error_se": 0.001171
+        }
+      }
+    },
+    "walk-2": {
+      "walk_key": "walk-2",
+      "relative_path": "walks-1-4/20261101T003455Z_yardstick",
+      "capture_id": "20261101T003455Z_yardstick",
+      "grade": "fail",
+      "caps_applied": [
+        "integrity_invalid",
+        "no_loop_closure",
+        "no_tape_check"
+      ],
+      "grade_coeff_loop_closure_gap_m": null,
+      "grade_coeff_reports_closed": false,
+      "frame_marker0_loop_closure_gap_m": null,
+      "frame_marker0_loop_closed": false,
+      "pose_jumps": [],
+      "reasons": [
+        "distance_tolerance_10m_m=5.6975m",
+        "loop_closure_gap_m=null (Marker 0 not revisited at end of walk)",
+        "primary_tape_checks=0",
+        "marker_scale_error_ratio=-0.3006 (se=0.0050, eff=0.2906)",
+        "fail_threshold: distance_tolerance_10m_m (5.6975m) > 0.20m",
+        "cap_applied: integrity=invalid -> fail",
+        "cap_applied: no_loop_closure (Marker 0 not revisited at end) -> max grade C",
+        "cap_applied: no_tape_check -> max grade C"
+      ],
+      "per_marker": {
+        "0": {
+          "sightings_count": 53,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 177.963,
+          "scale_error_ratio": -0.288147,
+          "scale_error_se": 0.00165
+        },
+        "1": {
+          "sightings_count": 9,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 175.624,
+          "scale_error_ratio": -0.297503,
+          "scale_error_se": 0.001698
+        },
+        "2": {
+          "sightings_count": 8,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 176.898,
+          "scale_error_ratio": -0.292408,
+          "scale_error_se": 0.001305
+        },
+        "3": {
+          "sightings_count": 1,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 174.856,
+          "scale_error_ratio": -0.300575,
+          "scale_error_se": 0.005
+        }
+      }
+    },
+    "walk-3": {
+      "walk_key": "walk-3",
+      "relative_path": "walks-1-4/20261101T003609Z_yardstick",
+      "capture_id": "20261101T003609Z_yardstick",
+      "grade": "fail",
+      "caps_applied": [
+        "integrity_invalid",
+        "no_marker_0",
+        "no_tape_check"
+      ],
+      "grade_coeff_loop_closure_gap_m": null,
+      "grade_coeff_reports_closed": false,
+      "frame_marker0_loop_closure_gap_m": null,
+      "frame_marker0_loop_closed": false,
+      "pose_jumps": [],
+      "reasons": [
+        "distance_tolerance_10m_m=0.1602m",
+        "loop_closure_gap_m=null (Marker 0 not revisited at end of walk)",
+        "primary_tape_checks=0",
+        "marker_scale_error_ratio=0.0000 (se=0.0000, eff=0.0000)",
+        "cap_applied: integrity=invalid -> fail",
+        "cap_applied: no_marker_0 -> max grade C",
+        "cap_applied: no_tape_check -> max grade C"
+      ],
+      "per_marker": {}
+    },
+    "walk-4": {
+      "walk_key": "walk-4",
+      "relative_path": "walks-1-4/20261101T003631Z_yardstick",
+      "capture_id": "20261101T003631Z_yardstick",
+      "grade": "fail",
+      "caps_applied": [
+        "integrity_invalid",
+        "no_loop_closure",
+        "no_tape_check"
+      ],
+      "grade_coeff_loop_closure_gap_m": 0.208437,
+      "grade_coeff_reports_closed": true,
+      "frame_marker0_loop_closure_gap_m": null,
+      "frame_marker0_loop_closed": false,
+      "pose_jumps": [
+        {
+          "saved_index_from": 2088,
+          "saved_index_to": 2091,
+          "t_s": 290239.688251,
+          "jump_m": 0.208437
+        }
+      ],
+      "reasons": [
+        "distance_tolerance_10m_m=5.7503m",
+        "loop_closure_gap_m=null (Marker 0 not revisited at end of walk)",
+        "primary_tape_checks=0",
+        "marker_scale_error_ratio=-0.2980 (se=0.0023, eff=0.2933)",
+        "pose_jump_detected: 0.2084m at t=290239.688s (frames 2088->2091)",
+        "fail_threshold: distance_tolerance_10m_m (5.7503m) > 0.20m",
+        "cap_applied: integrity=invalid -> fail",
+        "cap_applied: no_loop_closure (Marker 0 not revisited at end) -> max grade C",
+        "cap_applied: no_tape_check -> max grade C"
+      ],
+      "per_marker": {
+        "0": {
+          "sightings_count": 28,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 177.454,
+          "scale_error_ratio": -0.290183,
+          "scale_error_se": 0.00172
+        },
+        "1": {
+          "sightings_count": 11,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 175.505,
+          "scale_error_ratio": -0.29798,
+          "scale_error_se": 0.002341
+        },
+        "2": {
+          "sightings_count": 14,
+          "size_mm_printed": 250.0,
+          "size_mm_measured": 176.692,
+          "scale_error_ratio": -0.29323,
+          "scale_error_se": 0.001516
+        }
+      }
+    },
+    "walk-5": {
+      "walk_key": "walk-5",
+      "relative_path": "walk-5/20261101T012134Z_yardstick",
+      "capture_id": "20261101T012134Z_yardstick",
+      "grade": "fail",
+      "caps_applied": [
+        "integrity_invalid",
+        "no_loop_closure",
+        "no_tape_check"
+      ],
+      "grade_coeff_loop_closure_gap_m": null,
+      "grade_coeff_reports_closed": false,
+      "frame_marker0_loop_closure_gap_m": null,
+      "frame_marker0_loop_closed": false,
+      "pose_jumps": [],
+      "reasons": [
+        "distance_tolerance_10m_m=0.2013m",
+        "loop_closure_gap_m=null (Marker 0 not revisited at end of walk)",
+        "primary_tape_checks=0",
+        "marker_scale_error_ratio=-0.0085 (se=0.0011, eff=0.0062)",
+        "fail_threshold: distance_tolerance_10m_m (0.2013m) > 0.20m",
+        "cap_applied: integrity=invalid -> fail",
+        "cap_applied: no_loop_closure (Marker 0 not revisited at end) -> max grade C",
+        "cap_applied: no_tape_check -> max grade C"
+      ],
+      "per_marker": {
+        "0": {
+          "sightings_count": 130,
+          "size_mm_printed": 180.0,
+          "size_mm_measured": 178.701,
+          "scale_error_ratio": -0.007216,
+          "scale_error_se": 0.001515
+        },
+        "1": {
+          "sightings_count": 89,
+          "size_mm_printed": 180.0,
+          "size_mm_measured": 180.057,
+          "scale_error_ratio": 0.000318,
+          "scale_error_se": 0.001013
+        },
+        "2": {
+          "sightings_count": 44,
+          "size_mm_printed": 180.0,
+          "size_mm_measured": 178.475,
+          "scale_error_ratio": -0.008471,
+          "scale_error_se": 0.001117
+        },
+        "3": {
+          "sightings_count": 73,
+          "size_mm_printed": 180.0,
+          "size_mm_measured": 178.846,
+          "scale_error_ratio": -0.006411,
+          "scale_error_se": 0.000861
+        }
+      }
+    }
+  }
+}

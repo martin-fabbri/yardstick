@@ -1,0 +1,89 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/coverage.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "area_m2": {
+      "exclusiveMinimum": 0,
+      "type": "number"
+    },
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "high_confidence_share": {
+      "maximum": 1,
+      "minimum": 0,
+      "type": "number"
+    },
+    "holes_xy_m": {
+      "items": {
+        "items": {
+          "items": {
+            "type": "number"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        },
+        "minItems": 3,
+        "type": "array"
+      },
+      "type": "array"
+    },
+    "parameters": {
+      "additionalProperties": false,
+      "properties": {
+        "closing_cells": {
+          "type": "integer"
+        },
+        "grid_cell_m": {
+          "type": "number"
+        },
+        "max_filled_hole_m2": {
+          "type": "number"
+        },
+        "range_max_m": {
+          "type": "number"
+        },
+        "simplify_epsilon_m": {
+          "type": "number"
+        },
+        "z_max_abs_m": {
+          "type": "number"
+        }
+      },
+      "required": [
+        "z_max_abs_m",
+        "range_max_m",
+        "grid_cell_m",
+        "closing_cells",
+        "max_filled_hole_m2",
+        "simplify_epsilon_m"
+      ],
+      "type": "object"
+    },
+    "polygon_xy_m": {
+      "items": {
+        "items": {
+          "type": "number"
+        },
+        "maxItems": 2,
+        "minItems": 2,
+        "type": "array"
+      },
+      "minItems": 3,
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "polygon_xy_m",
+    "holes_xy_m",
+    "area_m2",
+    "high_confidence_share",
+    "parameters"
+  ],
+  "title": "Yardstick Level 2 Scanned Ground Coverage Polygon",
+  "type": "object"
+}

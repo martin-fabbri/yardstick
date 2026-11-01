@@ -1,0 +1,93 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/keyframes.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "keyframes": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "file": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "id": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "intrinsics": {
+            "additionalProperties": false,
+            "properties": {
+              "cx": {
+                "type": "number"
+              },
+              "cy": {
+                "type": "number"
+              },
+              "fx": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "fy": {
+                "exclusiveMinimum": 0,
+                "type": "number"
+              },
+              "height": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "width": {
+                "minimum": 1,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "fx",
+              "fy",
+              "cx",
+              "cy",
+              "width",
+              "height"
+            ],
+            "type": "object"
+          },
+          "pose": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 16,
+            "minItems": 16,
+            "type": "array"
+          },
+          "saved_index": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "t": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "id",
+          "t",
+          "saved_index",
+          "file",
+          "pose",
+          "intrinsics"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "keyframes"
+  ],
+  "title": "Yardstick Level 2 Keyframes in Yard Frame",
+  "type": "object"
+}

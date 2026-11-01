@@ -1,0 +1,378 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000010000000000000001 /* YardstickApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000010000000000000001 /* YardstickApp.swift */; };
+		A10000020000000000000001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000020000000000000001 /* ContentView.swift */; };
+		A10000030000000000000001 /* CaptureSessionRecorder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000030000000000000001 /* CaptureSessionRecorder.swift */; };
+		A10000040000000000000001 /* ArUcoDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000040000000000000001 /* ArUcoDetector.swift */; };
+		A10000050000000000000001 /* ArUcoDictionaryData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000050000000000000001 /* ArUcoDictionaryData.swift */; };
+		A10000060000000000000001 /* CaptureReplayHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000070000000000000001 /* CaptureReplayHarness.swift */; };
+		A10000070000000000000001 /* CapturePipelinePrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000090000000000000001 /* CapturePipelinePrimitives.swift */; };
+		A10000080000000000000001 /* GuidedCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000110000000000000001 /* GuidedCaptureEngine.swift */; };
+		B10000010000000000000001 /* ArUcoDetector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000040000000000000001 /* ArUcoDetector.swift */; };
+		B10000020000000000000001 /* ArUcoDictionaryData.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000050000000000000001 /* ArUcoDictionaryData.swift */; };
+		B10000030000000000000001 /* CaptureReplayHarness.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000070000000000000001 /* CaptureReplayHarness.swift */; };
+		B10000040000000000000001 /* CaptureReplayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000080000000000000001 /* CaptureReplayTests.swift */; };
+		B10000050000000000000001 /* CapturePipelinePrimitives.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000090000000000000001 /* CapturePipelinePrimitives.swift */; };
+		B10000060000000000000001 /* CapturePipelineStep3Tests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000100000000000000001 /* CapturePipelineStep3Tests.swift */; };
+		B10000070000000000000001 /* GuidedCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000110000000000000001 /* GuidedCaptureEngine.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A00000010000000000000001 /* Yardstick.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Yardstick.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B00000010000000000000001 /* YardstickTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = YardstickTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A20000010000000000000001 /* YardstickApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = YardstickApp.swift; sourceTree = "<group>"; };
+		A20000020000000000000001 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A20000030000000000000001 /* CaptureSessionRecorder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureSessionRecorder.swift; sourceTree = "<group>"; };
+		A20000040000000000000001 /* ArUcoDetector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArUcoDetector.swift; sourceTree = "<group>"; };
+		A20000050000000000000001 /* ArUcoDictionaryData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArUcoDictionaryData.swift; sourceTree = "<group>"; };
+		A20000060000000000000001 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A20000070000000000000001 /* CaptureReplayHarness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureReplayHarness.swift; sourceTree = "<group>"; };
+		A20000080000000000000001 /* CaptureReplayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CaptureReplayTests.swift; sourceTree = "<group>"; };
+		A20000090000000000000001 /* CapturePipelinePrimitives.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapturePipelinePrimitives.swift; sourceTree = "<group>"; };
+		A20000100000000000000001 /* CapturePipelineStep3Tests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CapturePipelineStep3Tests.swift; sourceTree = "<group>"; };
+		A20000110000000000000001 /* GuidedCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuidedCaptureEngine.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A30000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B30000010000000000000001 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A40000010000000000000001 = {
+			isa = PBXGroup;
+			children = (
+				A20000060000000000000001 /* Info.plist */,
+				A40000020000000000000001 /* Sources */,
+				A40000040000000000000001 /* Tests */,
+				A40000030000000000000001 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A40000020000000000000001 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				A20000010000000000000001 /* YardstickApp.swift */,
+				A20000020000000000000001 /* ContentView.swift */,
+				A20000030000000000000001 /* CaptureSessionRecorder.swift */,
+				A20000040000000000000001 /* ArUcoDetector.swift */,
+				A20000050000000000000001 /* ArUcoDictionaryData.swift */,
+				A20000070000000000000001 /* CaptureReplayHarness.swift */,
+				A20000090000000000000001 /* CapturePipelinePrimitives.swift */,
+				A20000110000000000000001 /* GuidedCaptureEngine.swift */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		A40000040000000000000001 /* Tests */ = {
+			isa = PBXGroup;
+			children = (
+				A20000080000000000000001 /* CaptureReplayTests.swift */,
+				A20000100000000000000001 /* CapturePipelineStep3Tests.swift */,
+			);
+			path = Tests;
+			sourceTree = "<group>";
+		};
+		A40000030000000000000001 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A00000010000000000000001 /* Yardstick.app */,
+				B00000010000000000000001 /* YardstickTests.xctest */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A50000010000000000000001 /* Yardstick */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A60000020000000000000001 /* Build configuration list for PBXNativeTarget "Yardstick" */;
+			buildPhases = (
+				A70000010000000000000001 /* Sources */,
+				A30000010000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Yardstick;
+			productName = Yardstick;
+			productReference = A00000010000000000000001 /* Yardstick.app */;
+			productType = "com.apple.product-type.application";
+		};
+		B50000010000000000000001 /* YardstickTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B60000010000000000000001 /* Build configuration list for PBXNativeTarget "YardstickTests" */;
+			buildPhases = (
+				B70000010000000000000001 /* Sources */,
+				B30000010000000000000001 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = YardstickTests;
+			productName = YardstickTests;
+			productReference = B00000010000000000000001 /* YardstickTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A80000010000000000000001 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1600;
+				LastUpgradeCheck = 1600;
+				TargetAttributes = {
+					A50000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+					B50000010000000000000001 = {
+						CreatedOnToolsVersion = 16.0;
+					};
+				};
+			};
+			buildConfigurationList = A60000010000000000000001 /* Build configuration list for PBXProject "Yardstick" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A40000010000000000000001;
+			productRefGroup = A40000030000000000000001 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A50000010000000000000001 /* Yardstick */,
+				B50000010000000000000001 /* YardstickTests */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A70000010000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A10000010000000000000001 /* YardstickApp.swift in Sources */,
+				A10000020000000000000001 /* ContentView.swift in Sources */,
+				A10000030000000000000001 /* CaptureSessionRecorder.swift in Sources */,
+				A10000040000000000000001 /* ArUcoDetector.swift in Sources */,
+				A10000050000000000000001 /* ArUcoDictionaryData.swift in Sources */,
+				A10000060000000000000001 /* CaptureReplayHarness.swift in Sources */,
+				A10000070000000000000001 /* CapturePipelinePrimitives.swift in Sources */,
+				A10000080000000000000001 /* GuidedCaptureEngine.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B70000010000000000000001 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B10000010000000000000001 /* ArUcoDetector.swift in Sources */,
+				B10000020000000000000001 /* ArUcoDictionaryData.swift in Sources */,
+				B10000030000000000000001 /* CaptureReplayHarness.swift in Sources */,
+				B10000040000000000000001 /* CaptureReplayTests.swift in Sources */,
+				B10000050000000000000001 /* CapturePipelinePrimitives.swift in Sources */,
+				B10000060000000000000001 /* CapturePipelineStep3Tests.swift in Sources */,
+				B10000070000000000000001 /* GuidedCaptureEngine.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A90000010000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+			};
+			name = Debug;
+		};
+		A90000020000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
+		A90000030000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.yardstick.capture;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A90000040000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.yardstick.capture;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
+				SUPPORTS_MACCATALYST = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		B90000010000000000000001 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.yardstick.capture.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		B90000020000000000000001 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 26.0;
+				MACOSX_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@loader_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = io.yardstick.capture.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator macosx";
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A60000010000000000000001 /* Build configuration list for PBXProject "Yardstick" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000010000000000000001 /* Debug */,
+				A90000020000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A60000020000000000000001 /* Build configuration list for PBXNativeTarget "Yardstick" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000030000000000000001 /* Debug */,
+				A90000040000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		B60000010000000000000001 /* Build configuration list for PBXNativeTarget "YardstickTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B90000010000000000000001 /* Debug */,
+				B90000020000000000000001 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A80000010000000000000001 /* Project object */;
+}
