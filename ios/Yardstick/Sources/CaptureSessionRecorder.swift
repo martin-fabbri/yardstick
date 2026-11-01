@@ -442,6 +442,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
 
     public override init() {
         super.init()
+        if UserDefaults.standard.dictionary(forKey: Self.markerSizesDefaultsKey) == nil {
+            persistMarkerSizes()
+        }
         locationManager.delegate = self
         locationManager.headingFilter = kCLHeadingFilterNone
         #if canImport(ARKit)
@@ -529,7 +532,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         captureID = "\(compactTS)_yardstick"
 
         let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
-        let dir = docs.appendingPathComponent(captureID, isDirectory: true)
+        let dir = docs.appendingPathComponent(captureID, isDirectory: true).resolvingSymlinksInPath().standardizedFileURL
         captureDirURL = dir
         savedFrameCount = 0
         droppedFrameCount = 0
@@ -992,14 +995,26 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return (hex, ~crc, totalSize)
     }
 
-    nonisolated private static func sealManifestAndPackZip(in dir: URL) throws -> URL {
+    /// Compute the relative path of `fileURL` inside `baseDir`, resolving symlinks (`/private/var` vs `/var` on iOS)
+    /// on both URLs so prefix stripping never produces a mangled path (`YS-65`).
+    nonisolated public static func relativePath(of fileURL: URL, inside baseDir: URL) -> String? {
+        let baseResolved = baseDir.resolvingSymlinksInPath().standardizedFileURL.path
+        let fileResolved = fileURL.resolvingSymlinksInPath().standardizedFileURL.path
+        let prefix = baseResolved.hasSuffix("/") ? baseResolved : (baseResolved + "/")
+        guard fileResolved.hasPrefix(prefix) else { return nil }
+        let rel = String(fileResolved.dropFirst(prefix.count))
+        return rel.isEmpty ? nil : rel
+    }
+
+    nonisolated public static func sealManifestAndPackZip(in dir: URL) throws -> URL {
+        let resolvedDir = dir.resolvingSymlinksInPath().standardizedFileURL
         let fm = FileManager.default
-        let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey])
+        let enumerator = fm.enumerator(at: resolvedDir, includingPropertiesForKeys: [.isRegularFileKey])
         var filesArray: [[String: Any]] = []
         var precomputedCRCByRelPath: [String: (crc32: UInt32, sizeBytes: UInt64)] = [:]
 
         while let fileURL = enumerator?.nextObject() as? URL {
-            let rel = fileURL.path.replacingOccurrences(of: dir.path + "/", with: "")
+            guard let rel = Self.relativePath(of: fileURL, inside: resolvedDir) else { continue }
             if rel == "manifest.json" || rel.hasPrefix("standard/") || rel.hasPrefix(".") {
                 continue
             }
@@ -1019,7 +1034,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         formatter.formatOptions = [.withInternetDateTime]
         let manifestObj: [String: Any] = [
             "contract": "yardstick-capture/1",
-            "capture_id": dir.lastPathComponent,
+            "capture_id": resolvedDir.lastPathComponent,
             "sealed_at_utc": formatter.string(from: Date()),
             "streams_declared": [
                 "session", "frames", "rgb_video", "depth", "confidence",
@@ -1027,15 +1042,15 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             ],
             "files": filesArray,
         ]
-        let manifestURL = dir.appendingPathComponent("manifest.json")
+        let manifestURL = resolvedDir.appendingPathComponent("manifest.json")
         let manifestData = try JSONSerialization.data(withJSONObject: manifestObj, options: [.prettyPrinted, .sortedKeys])
         try manifestData.write(to: manifestURL, options: .atomic)
         let (_, manifestCRC, manifestSize) = try Self.streamHashAndCRC32(of: manifestURL)
         precomputedCRCByRelPath["manifest.json"] = (manifestCRC, manifestSize)
 
-        let zipURL = dir.deletingLastPathComponent().appendingPathComponent("\(dir.lastPathComponent).zip")
+        let zipURL = resolvedDir.deletingLastPathComponent().appendingPathComponent("\(resolvedDir.lastPathComponent).zip")
         try Self.writeStoreModeZipArchive(
-            sourceDir: dir,
+            sourceDir: resolvedDir,
             destinationZipURL: zipURL,
             precomputedMeta: precomputedCRCByRelPath
         )
@@ -1185,16 +1200,16 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let dstFH = try FileHandle(forWritingTo: destinationZipURL)
         defer { try? dstFH.close() }
 
-        let baseFolderName = sourceDir.lastPathComponent
-        let enumerator = fm.enumerator(at: sourceDir, includingPropertiesForKeys: [.isRegularFileKey])
+        let resolvedSourceDir = sourceDir.resolvingSymlinksInPath().standardizedFileURL
+        let baseFolderName = resolvedSourceDir.lastPathComponent
+        let enumerator = fm.enumerator(at: resolvedSourceDir, includingPropertiesForKeys: [.isRegularFileKey])
         var relPaths: [String] = []
         while let fileURL = enumerator?.nextObject() as? URL {
             let vals = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
-            if vals.isRegularFile == true {
-                let rel = fileURL.path.replacingOccurrences(of: sourceDir.path + "/", with: "")
-                if !rel.hasPrefix(".") {
-                    relPaths.append(rel)
-                }
+            if vals.isRegularFile == true,
+               let rel = Self.relativePath(of: fileURL, inside: resolvedSourceDir),
+               !rel.hasPrefix(".") {
+                relPaths.append(rel)
             }
         }
         relPaths.sort()
@@ -1210,7 +1225,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         var offset: UInt64 = 0
 
         for rel in relPaths {
-            let fileURL = sourceDir.appendingPathComponent(rel)
+            let fileURL = resolvedSourceDir.appendingPathComponent(rel)
             let meta: (crc32: UInt32, sizeBytes: UInt64)
             if let cached = precomputedMeta[rel] {
                 meta = cached

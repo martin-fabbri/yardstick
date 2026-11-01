@@ -822,3 +822,48 @@ def test_round4_converter_handles_truncated_png_with_fail_grade(
     assert (cap / "standard" / "grade.json").exists()
 
 
+def test_ys65_symlinked_var_path_manifest_seal_and_180mm_persistence(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-65: Sealing a capture via a symlinked parent (`/var` -> `/private/var`) never prefixes paths with `private`,
+    and iOS CaptureSessionRecorder defaults/persists 180 mm marker sizes for IDs 0-3.
+    """
+    real_root = tmp_path / "private" / "var" / "mobile" / "Documents"
+    real_root.mkdir(parents=True)
+    symlink_var = tmp_path / "var"
+    symlink_var.symlink_to(tmp_path / "private" / "var")
+
+    real_cap = _clone_capture(base_synth_dir, real_root / "20261101T003322Z_yardstick")
+    symlink_cap = symlink_var / "mobile" / "Documents" / "20261101T003322Z_yardstick"
+    (symlink_cap / "manifest.json").unlink()
+
+    seal_manifest(symlink_cap)
+    manifest = json.loads((real_cap / "manifest.json").read_text())
+    paths = [entry["path"] for entry in manifest["files"]]
+    assert "audio.wav" in paths
+    assert not any(p.startswith("private") for p in paths)
+
+    zip_path = symlink_var / "mobile" / "Documents" / "20261101T003322Z_yardstick.zip"
+    pack_capture_zip(symlink_cap, zip_path)
+    assert zip_path.stat().st_size > 10_000
+    rep_dir = validate_recording(symlink_cap)
+    assert rep_dir["status"] == "clean"
+    extracted_dir = unpack_capture_zip(zip_path, tmp_path / "unpacked")
+    rep_zip = validate_recording(extracted_dir)
+    assert rep_zip["status"] == "clean"
+
+    swift_src = (
+        Path(__file__).resolve().parents[2]
+        / "ios"
+        / "Yardstick"
+        / "Sources"
+        / "CaptureSessionRecorder.swift"
+    ).read_text()
+    assert "resolvingSymlinksInPath().standardizedFileURL" in swift_src
+    assert 'replacingOccurrences(of: dir.path + "/"' not in swift_src
+    assert 'replacingOccurrences(of: sourceDir.path + "/"' not in swift_src
+    assert "0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 250.0, 5: 250.0" in swift_src
+    assert "io.buildnexus.yardstick.markerSizesMM" in swift_src
+
+
+

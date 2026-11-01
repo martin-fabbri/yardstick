@@ -54,6 +54,7 @@ public struct ContentView: View {
     @State private var showNoteDialog = false
     @State private var noteTextInput = ""
     @State private var showShareSheet = false
+    @State private var didTriggerAutoBench = false
 
     public init() {}
 
@@ -71,6 +72,29 @@ public struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .onAppear {
+            guard !didTriggerAutoBench else { return }
+            let args = ProcessInfo.processInfo.arguments
+            if let idx = args.firstIndex(of: "--bench-seal-dir"),
+               idx + 1 < args.count {
+                didTriggerAutoBench = true
+                let dirPath = args[idx + 1]
+                let dirURL = URL(fileURLWithPath: dirPath, isDirectory: true)
+                _ = try? CaptureSessionRecorder.sealManifestAndPackZip(in: dirURL)
+            } else if let idx = args.firstIndex(of: "--auto-bench-capture"),
+               idx + 1 < args.count,
+               let seconds = Double(args[idx + 1]),
+               seconds > 0,
+               recorder.phase == .setup {
+                didTriggerAutoBench = true
+                recorder.requestPermissionsAndStart()
+                DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+                    if recorder.phase == .recording {
+                        recorder.stopAndSealCapture()
+                    }
+                }
+            }
+        }
     }
 
     private var setupView: some View {
