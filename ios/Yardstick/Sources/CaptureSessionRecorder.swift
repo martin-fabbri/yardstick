@@ -457,6 +457,17 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         }
     }
 
+    /// Append zero-PCM silence padding to `audio.wav` during an experimental pause-and-resume (`YS-82` Experiment 5).
+    func appendAudioPaddingBytes(_ paddingData: Data) throws {
+        guard !paddingData.isEmpty else { return }
+        guard let aFH = audioFH else {
+            throw NSError(domain: "Yardstick", code: -18, userInfo: [NSLocalizedDescriptionKey: "audio.wav FileHandle is closed"])
+        }
+        try aFH.write(contentsOf: paddingData)
+        audioPCMByteCount &+= UInt32(paddingData.count)
+        digestRegistry.addRecordedBytes(UInt64(paddingData.count))
+    }
+
     /// Finalize `audio.wav` RIFF/data chunk sizes, finish `rgb.mp4`, record incremental CSV digests (`YS-84`),
     /// and close all open file handles.
     /// Does NOT call `handleStreamFailure` so it can never cause recursive failure loops (Blocker 6).
@@ -628,6 +639,10 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public var isHapticsEnabled: Bool = true
     /// Developer live diagnostics overlay toggle (`YS-80`, `DESIGN-SPEC-NATIVE.md` §3c, §3g: off by default, never on the regular capture screen).
     @Published public var showDeveloperDiagnosticsOverlay: Bool = false
+    /// `YS-82` experiment flags (all default off, logged in `guidance.csv`, off unless proven).
+    @Published public var experimentFlags: CaptureExperimentFlags = .default
+    public private(set) var exposureCapController = ExposureCapExperimentController()
+    private var lastPauseStartedTimestampS: Double? = nil
     /// Completed capture records shown in the root `Captures` list (`YS-80`, `DESIGN-SPEC-NATIVE.md` §2a, §2c).
     @Published public var savedCaptureRecords: [SavedCaptureRecord] = []
     /// Live Walk Review report (`YS-72`, `DESIGN-SPEC-NATIVE.md` §3e, §4e).
@@ -1134,6 +1149,8 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         liveMarkerSizeWarning = nil
         lastSizeMismatchMarkerID = nil
         beaconProjections = []
+        exposureCapController = ExposureCapExperimentController()
+        lastPauseStartedTimestampS = nil
         isLoopClosed = false
         guidedEngine = GuidedCaptureEngine(preWalkTapeMeters0To1: preWalkTapeMeters0To1)
         guidedEngine.isVoiceCoachEnabled = isVoiceCoachEnabled
@@ -1202,8 +1219,26 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             #endif
 
             let snapData = makeSessionJSONData(status: "recording", stopReason: nil, failedStream: nil)
+            let expSummary = experimentFlags.guidanceLogSummary
             writerQueue.async {
                 Self.writeSessionJSONDataOnQueue(snapData, in: dir, registry: engine.digestRegistry)
+                try? engine.appendMonotonicGuidanceRow(
+                    timestampS: 0.0,
+                    savedIndex: 0,
+                    event: "experiments",
+                    phase: "opening_marker_0",
+                    instruction: expSummary,
+                    spoken: false,
+                    pitchDeg: -30.0,
+                    rollDeg: 0.0,
+                    trackingState: "normal",
+                    exposureDurationS: 0.0,
+                    iso: 100.0,
+                    turnRateRadS: 0.0,
+                    predictedBlurPx: 0.0,
+                    thermalState: "nominal",
+                    coverageCells: 0
+                )
             }
             phase = .recording
             statusBanner = guidedEngine.activeInstruction
@@ -1614,6 +1649,125 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         case .checkMarkerPrintSize:
             beginFixNow(targetMarkerID: lastSizeMismatchMarkerID ?? 0, reopenLookUp: false)
         }
+    }
+
+    /// Handle a hardware Camera Control / volume button press (`YS-82` Experiment 3).
+    /// Returns `.openReviewWalkFinish` when the caller should present the Review Walk sheet.
+    @discardableResult
+    public func handleHardwareCaptureButtonPress() -> HardwareButtonExperimentAction {
+        let action = HardwareButtonExperimentRouter.resolvePress(
+            isFlagEnabled: experimentFlags.hardwareButtonControl,
+            isRecordingVoiceNote: isRecordingVoiceNote,
+            isFinishAvailable: isFinishAvailable
+        )
+        switch action {
+        case .startVoiceNote:
+            setRecordingVoiceNote(true)
+        case .stopVoiceNote:
+            setRecordingVoiceNote(false)
+        case .openReviewWalkFinish:
+            _ = evaluateWalkReview()
+        case .ignoredFlagOff:
+            return action
+        }
+        if phase == .recording, let engine = writerEngine {
+            let t = latestTimestampS
+            let sIdx = savedFrameCount
+            let phaseStr = guidedEngine.phase.rawValue
+            let actStr = action.rawValue
+            let p = pitchDeg
+            let r = rollDeg
+            let tr = trackingStateText
+            let expS = latestExposureDurationS
+            let iso = latestISO
+            let trn = latestTurnRateRadS
+            let blr = latestPredictedBlurPx
+            let thm = thermalSchedule.thermalLevel.rawValue
+            let cov = coveredGroundCellCount
+            writerQueue.async {
+                guard !engine.isClosed else { return }
+                try? engine.appendMonotonicGuidanceRow(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    event: "exp_hardware_button",
+                    phase: phaseStr,
+                    instruction: actStr,
+                    spoken: false,
+                    pitchDeg: p,
+                    rollDeg: r,
+                    trackingState: tr,
+                    exposureDurationS: expS,
+                    iso: iso,
+                    turnRateRadS: trn,
+                    predictedBlurPx: blr,
+                    thermalState: thm,
+                    coverageCells: cov
+                )
+            }
+        }
+        return action
+    }
+
+    /// Record the start of a short interruption when `YS-82` `pauseAndResumeWithPaddedAudio` is enabled (`off` by default).
+    @discardableResult
+    public func beginExperimentalPauseIfEnabled(at timestampS: Double) -> Bool {
+        guard experimentFlags.pauseAndResumeWithPaddedAudio, phase == .recording else {
+            return false
+        }
+        lastPauseStartedTimestampS = timestampS
+        return true
+    }
+
+    /// Resume from a short interruption (`≤ 15.0 s`) by padding `audio.wav` with zero-PCM silence and declaring the gap in `guidance.csv` (`YS-82`).
+    /// If the flag is off or the interruption exceeded `15.0 s`, seals and saves the walk via `handleInterruption`.
+    @discardableResult
+    public func resumeFromExperimentalPauseIfPossible(at resumeTimestampS: Double) -> PauseResumeAudioPadder.PauseResumeDecision {
+        let pauseT = lastPauseStartedTimestampS ?? resumeTimestampS
+        lastPauseStartedTimestampS = nil
+        let decision = PauseResumeAudioPadder.evaluateResume(
+            isFlagEnabled: experimentFlags.pauseAndResumeWithPaddedAudio,
+            pauseTimestampS: pauseT,
+            resumeTimestampS: resumeTimestampS
+        )
+        guard decision.canResume, phase == .recording, let engine = writerEngine else {
+            handleInterruption(stopReason: "pause_exceeded_or_disabled")
+            return decision
+        }
+        let padData = PauseResumeAudioPadder.makeZeroPCMPaddingData(sampleCount: decision.zeroPCMSampleCount)
+        let sIdx = savedFrameCount
+        let phaseStr = guidedEngine.phase.rawValue
+        let detail = decision.guidanceEventDetail
+        let p = pitchDeg
+        let r = rollDeg
+        let tr = trackingStateText
+        let expS = latestExposureDurationS
+        let iso = latestISO
+        let trn = latestTurnRateRadS
+        let blr = latestPredictedBlurPx
+        let thm = thermalSchedule.thermalLevel.rawValue
+        let cov = coveredGroundCellCount
+        writerQueue.async {
+            guard !engine.isClosed else { return }
+            try? engine.appendAudioPaddingBytes(padData)
+            try? engine.appendMonotonicGuidanceRow(
+                timestampS: resumeTimestampS,
+                savedIndex: sIdx,
+                event: "exp_pause_resume",
+                phase: phaseStr,
+                instruction: detail,
+                spoken: false,
+                pitchDeg: p,
+                rollDeg: r,
+                trackingState: tr,
+                exposureDurationS: expS,
+                iso: iso,
+                turnRateRadS: trn,
+                predictedBlurPx: blr,
+                thermalState: thm,
+                coverageCells: cov
+            )
+        }
+        return decision
     }
 
     /// Plain-language Capture Detail summary for the current session (`YS-80`, `DESIGN-SPEC-NATIVE.md` §3f).
@@ -2796,6 +2950,39 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
             self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
             self.thermalSchedule = stepOut.thermalSchedule
+            let isHoldCountingNow = (self.activeRingState != nil && !(self.activeRingState?.isLocked ?? true))
+            let expCapStep = self.exposureCapController.step(
+                timestampS: timestampS,
+                isFlagEnabled: self.experimentFlags.exposureCapDuringHolds,
+                isMarkerHoldActive: isHoldCountingNow,
+                trackingState: trackingStr
+            )
+            if expCapStep.didViolateSafetyWindow {
+                self.experimentFlags.exposureCapDuringHolds = false
+                if let engine = self.writerEngine {
+                    let violSIdx = self.savedFrameCount
+                    let violPhase = self.guidedEngine.phase.rawValue
+                    self.writerQueue.async {
+                        guard !engine.isClosed else { return }
+                        try? engine.appendMonotonicGuidanceRow(
+                            timestampS: timestampS,
+                            savedIndex: violSIdx,
+                            event: "exp_exposure_cap_violated",
+                            phase: violPhase,
+                            instruction: "auto_disabled_limited_tracking",
+                            spoken: false,
+                            pitchDeg: pitchDegrees,
+                            rollDeg: rollDegrees,
+                            trackingState: trackingStr,
+                            exposureDurationS: exposureDurationS,
+                            iso: isoVal,
+                            turnRateRadS: turnRateRadS,
+                            predictedBlurPx: predictedBlurPx,
+                            thermalState: effectiveThermalStr
+                        )
+                    }
+                }
+            }
             var newBeacons: [MarkerBeaconProjection] = []
             for mid in self.guidedEngine.knownMarkerPositionsWorld.keys.sorted() {
                 guard self.activeRingState?.markerID != mid,
@@ -2876,6 +3063,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             let forceArUco = self.pendingForceMarkerDetect
             self.pendingForceMarkerDetect = false
             let sizesSnapshot = self.markerSizesMM
+            let hiResLockExperimentEnabled = self.experimentFlags.hiResStillAtLock
 
             let rawQuat = simd_quatd(cMat)
             let normQuat = simd_normalize(rawQuat)
@@ -3174,10 +3362,14 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                 let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
                                 let ciImg = CIImage(cvPixelBuffer: sendableRGB.buffer)
                                 let cs = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+                                let jpegQual = HiResLockStillExperiment.jpegQuality(
+                                    isFlagEnabled: hiResLockExperimentEnabled,
+                                    didLockMarkerOnThisStill: gateDecision.reason == "marker_hold"
+                                )
                                 if let jpegData = engine.detectionCIContext.jpegRepresentation(
                                     of: ciImg,
                                     colorSpace: cs,
-                                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]
+                                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: jpegQual]
                                 ) {
                                     let isMarkerTriggered = (gateDecision.reason == "marker_hold") || !eligibleSightings.isEmpty
                                     if isMarkerTriggered {
@@ -3353,6 +3545,40 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
                                     self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
                                     self.thermalSchedule = detStep.thermalSchedule
+                                    if self.experimentFlags.arAnchorOnLocks {
+                                        switch detStep.haptic {
+                                        case .markerLocked(let mid):
+                                            if let s = finalDetected.first(where: { $0.markerID == mid }) {
+                                                let anchorMat = ARAnchorLockExperiment.makeAnchorTransform(
+                                                    positionWorld: s.positionWorld,
+                                                    quaternionXYZW: s.quaternionXYZW
+                                                )
+                                                #if canImport(ARKit)
+                                                let anchor = ARAnchor(
+                                                    name: ARAnchorLockExperiment.anchorName(forMarkerID: mid, isClosingHold: false),
+                                                    transform: anchorMat
+                                                )
+                                                self.arSession.add(anchor: anchor)
+                                                #endif
+                                            }
+                                        case .loopClosedPathComplete:
+                                            if let s = finalDetected.first(where: { $0.markerID == 0 }) {
+                                                let anchorMat = ARAnchorLockExperiment.makeAnchorTransform(
+                                                    positionWorld: s.positionWorld,
+                                                    quaternionXYZW: s.quaternionXYZW
+                                                )
+                                                #if canImport(ARKit)
+                                                let anchor = ARAnchor(
+                                                    name: ARAnchorLockExperiment.anchorName(forMarkerID: 0, isClosingHold: true),
+                                                    transform: anchorMat
+                                                )
+                                                self.arSession.add(anchor: anchor)
+                                                #endif
+                                            }
+                                        default:
+                                            break
+                                        }
+                                    }
                                     self.dispatchHapticIfNeeded(detStep.haptic)
                                     let didSpeakDet = self.dispatchVoiceCoachIfNeeded(self.guidedEngine.lastSpokenPhraseThisStep)
                                     self.syncMarker0To1PreWalkTapeCheckIfNeeded()

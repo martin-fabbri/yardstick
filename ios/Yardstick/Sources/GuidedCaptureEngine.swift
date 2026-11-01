@@ -2576,3 +2576,375 @@ public enum MarkerScreenProjector {
         )
     }
 }
+
+// MARK: - YS-82: Experiments Behind Feature Flags (Default Off, Logged, Off Unless Proven)
+
+/// Identifier for each of the 5 `YS-82` experiments (`REQUIREMENTS-FINAL.md` §E).
+public enum CaptureExperimentID: String, Sendable, Equatable, CaseIterable, Codable {
+    case exposureCapDuringHolds = "exposure_cap_during_holds"
+    case hiResStillAtLock = "hires_still_at_lock"
+    case hardwareButtonControl = "hardware_button_control"
+    case arAnchorOnLocks = "ar_anchor_on_locks"
+    case pauseAndResumeWithPaddedAudio = "pause_and_resume_padded_audio"
+}
+
+/// Feature flags for the 5 `YS-82` experiments.
+///
+/// Every flag defaults to **`false`** (`REQUIREMENTS-FINAL.md` §E: *"each behind a flag, logged, off unless proven"*).
+public struct CaptureExperimentFlags: Sendable, Equatable, Codable {
+    /// 1. Exposure cap during marker holds (`≤ 1/250 s` = `0.004 s`).
+    public var exposureCapDuringHolds: Bool
+    /// 2. High-resolution / quality-1.0 still captured at marker lock.
+    public var hiResStillAtLock: Bool
+    /// 3. Camera Control or volume button acts as `Note` (or `Finish` when loop is closed).
+    public var hardwareButtonControl: Bool
+    /// 4. Attach an `ARAnchor` at the 3D world pose of each locked marker.
+    public var arAnchorOnLocks: Bool
+    /// 5. Pause and resume after a short interruption (`≤ 15 s`) with zero-PCM padded audio and a declared gap in `guidance.csv`.
+    public var pauseAndResumeWithPaddedAudio: Bool
+
+    public static let `default` = CaptureExperimentFlags()
+
+    public init(
+        exposureCapDuringHolds: Bool = false,
+        hiResStillAtLock: Bool = false,
+        hardwareButtonControl: Bool = false,
+        arAnchorOnLocks: Bool = false,
+        pauseAndResumeWithPaddedAudio: Bool = false
+    ) {
+        self.exposureCapDuringHolds = exposureCapDuringHolds
+        self.hiResStillAtLock = hiResStillAtLock
+        self.hardwareButtonControl = hardwareButtonControl
+        self.arAnchorOnLocks = arAnchorOnLocks
+        self.pauseAndResumeWithPaddedAudio = pauseAndResumeWithPaddedAudio
+    }
+
+    public var isAllDefaultOff: Bool {
+        !exposureCapDuringHolds
+            && !hiResStillAtLock
+            && !hardwareButtonControl
+            && !arAnchorOnLocks
+            && !pauseAndResumeWithPaddedAudio
+    }
+
+    public func isEnabled(_ id: CaptureExperimentID) -> Bool {
+        switch id {
+        case .exposureCapDuringHolds: return exposureCapDuringHolds
+        case .hiResStillAtLock: return hiResStillAtLock
+        case .hardwareButtonControl: return hardwareButtonControl
+        case .arAnchorOnLocks: return arAnchorOnLocks
+        case .pauseAndResumeWithPaddedAudio: return pauseAndResumeWithPaddedAudio
+        }
+    }
+
+    public mutating func setEnabled(_ enabled: Bool, for id: CaptureExperimentID) {
+        switch id {
+        case .exposureCapDuringHolds: exposureCapDuringHolds = enabled
+        case .hiResStillAtLock: hiResStillAtLock = enabled
+        case .hardwareButtonControl: hardwareButtonControl = enabled
+        case .arAnchorOnLocks: arAnchorOnLocks = enabled
+        case .pauseAndResumeWithPaddedAudio: pauseAndResumeWithPaddedAudio = enabled
+        }
+    }
+
+    /// Compact, CSV-safe log string written to `guidance.csv` at session start (`YS-82`).
+    public var guidanceLogSummary: String {
+        let enabledList = CaptureExperimentID.allCases
+            .filter { isEnabled($0) }
+            .map(\.rawValue)
+        if enabledList.isEmpty {
+            return "experiments:none"
+        }
+        return "experiments:" + enabledList.joined(separator: "+")
+    }
+}
+
+/// Experiment 1 (`YS-82`): Exposure cap (`≤ 1/250 s` = `0.004 s`) during marker holds, with a 2-second post-hold
+/// tracking-stability safety monitor.
+///
+/// Acceptance rule (`REQUIREMENTS-FINAL.md` §E):
+/// - Capped exposure duration during an active marker hold is `≤ 1/250 s` (`0.004 s`), with proportional ISO boost
+///   clamped to `[minISO, maxISO]`.
+/// - `0` limited-tracking transitions are permitted during the hold and for `2.0 s` after it. Any limited-tracking
+///   transition in `[holdStart, holdEnd + 2.0]` marks the experiment failed and automatically disables the cap.
+public struct ExposureCapExperimentController: Sendable, Equatable {
+    /// `1 / 250 s = 0.004 s`
+    public static let maxHoldExposureDurationS: Double = 1.0 / 250.0
+    public static let postHoldSafetyWindowS: Double = 2.0
+
+    public private(set) var isCapCurrentlyApplied: Bool = false
+    public private(set) var lastHoldActiveTimestampS: Double? = nil
+    public private(set) var limitedTrackingTransitionCountInWindow: Int = 0
+    public private(set) var autoDisabledDueToLimitedTracking: Bool = false
+
+    public init() {}
+
+    /// Compute the capped exposure duration (`≤ 0.004 s`) and compensated ISO when `exposureCapDuringHolds` is active.
+    public static func computeCappedExposureAndISO(
+        currentExposureDurationS: Double,
+        currentISO: Double,
+        minISO: Double = 32.0,
+        maxISO: Double = 1600.0
+    ) -> (cappedExposureS: Double, compensatedISO: Double, didCap: Bool) {
+        guard currentExposureDurationS > maxHoldExposureDurationS, currentExposureDurationS > 0 else {
+            let clampedISO = min(maxISO, max(minISO, currentISO))
+            return (max(1e-5, currentExposureDurationS), clampedISO, false)
+        }
+        let ratio = currentExposureDurationS / maxHoldExposureDurationS
+        let targetISO = min(maxISO, max(minISO, currentISO * ratio))
+        return (maxHoldExposureDurationS, targetISO, true)
+    }
+
+    /// Step the exposure-cap controller on each frame (`YS-82`).
+    public mutating func step(
+        timestampS: Double,
+        isFlagEnabled: Bool,
+        isMarkerHoldActive: Bool,
+        trackingState: String
+    ) -> (shouldApplyCap: Bool, didViolateSafetyWindow: Bool) {
+        guard isFlagEnabled && !autoDisabledDueToLimitedTracking else {
+            isCapCurrentlyApplied = false
+            return (false, false)
+        }
+
+        if isMarkerHoldActive {
+            lastHoldActiveTimestampS = timestampS
+            isCapCurrentlyApplied = true
+        } else {
+            isCapCurrentlyApplied = false
+        }
+
+        let inHoldOrPostHoldWindow: Bool = {
+            if isMarkerHoldActive { return true }
+            guard let lastT = lastHoldActiveTimestampS else { return false }
+            return (timestampS - lastT) >= 0.0 && (timestampS - lastT) <= Self.postHoldSafetyWindowS
+        }()
+
+        if inHoldOrPostHoldWindow && trackingState != "normal" {
+            limitedTrackingTransitionCountInWindow += 1
+            autoDisabledDueToLimitedTracking = true
+            isCapCurrentlyApplied = false
+            return (false, true)
+        }
+
+        return (isCapCurrentlyApplied, false)
+    }
+}
+
+/// Experiment 2 (`YS-82`): High-resolution / maximum-quality still at marker lock.
+public enum HiResLockStillExperiment: Sendable {
+    public static let standardJPEGQuality: Double = 0.92
+    public static let lockStillJPEGQuality: Double = 1.00
+
+    public static func jpegQuality(
+        isFlagEnabled: Bool,
+        didLockMarkerOnThisStill: Bool
+    ) -> Double {
+        (isFlagEnabled && didLockMarkerOnThisStill) ? lockStillJPEGQuality : standardJPEGQuality
+    }
+}
+
+/// Experiment 3 (`YS-82`): Hardware button (`Camera Control` or volume button) routed as `Note` and `Finish`.
+public enum HardwareButtonExperimentAction: String, Sendable, Equatable {
+    case startVoiceNote = "start_voice_note"
+    case stopVoiceNote = "stop_voice_note"
+    case openReviewWalkFinish = "open_review_walk_finish"
+    case ignoredFlagOff = "ignored_flag_off"
+}
+
+public enum HardwareButtonExperimentRouter: Sendable {
+    public static func resolvePress(
+        isFlagEnabled: Bool,
+        isRecordingVoiceNote: Bool,
+        isFinishAvailable: Bool
+    ) -> HardwareButtonExperimentAction {
+        guard isFlagEnabled else {
+            return .ignoredFlagOff
+        }
+        if isRecordingVoiceNote {
+            return .stopVoiceNote
+        }
+        if isFinishAvailable {
+            return .openReviewWalkFinish
+        }
+        return .startVoiceNote
+    }
+}
+
+/// Experiment 4 (`YS-82`): `ARAnchor` placement on marker locks.
+public enum ARAnchorLockExperiment: Sendable {
+    public static func anchorName(forMarkerID markerID: Int, isClosingHold: Bool) -> String {
+        isClosingHold ? "yardstick_marker_\(markerID)_close" : "yardstick_marker_\(markerID)"
+    }
+
+    public static func makeAnchorTransform(
+        positionWorld: SIMD3<Double>,
+        quaternionXYZW: SIMD4<Double>
+    ) -> simd_float4x4 {
+        let q = simd_normalize(simd_quatf(
+            ix: Float(quaternionXYZW.x),
+            iy: Float(quaternionXYZW.y),
+            iz: Float(quaternionXYZW.z),
+            r: Float(quaternionXYZW.w)
+        ))
+        var mat = simd_matrix4x4(q)
+        mat.columns.3 = SIMD4<Float>(
+            Float(positionWorld.x),
+            Float(positionWorld.y),
+            Float(positionWorld.z),
+            1.0
+        )
+        return mat
+    }
+}
+
+/// Experiment 5 (`YS-82`): Pause and resume after a short interruption (`≤ 15 s`) with zero-PCM padded audio
+/// and a declared gap in `guidance.csv`.
+public enum PauseResumeAudioPadder: Sendable {
+    public static let maxPauseDurationS: Double = 15.0
+    public static let sampleRateHz: Int = 16_000
+
+    public struct PauseResumeDecision: Sendable, Equatable {
+        public let canResume: Bool
+        public let gapDurationS: Double
+        public let zeroPCMSampleCount: Int
+        public let zeroPCMByteCount: Int
+        public let guidanceEventDetail: String
+    }
+
+    public static func evaluateResume(
+        isFlagEnabled: Bool,
+        pauseTimestampS: Double,
+        resumeTimestampS: Double
+    ) -> PauseResumeDecision {
+        let gapS = max(0.0, resumeTimestampS - pauseTimestampS)
+        guard isFlagEnabled, gapS > 0.0, gapS <= maxPauseDurationS else {
+            return PauseResumeDecision(
+                canResume: false,
+                gapDurationS: gapS,
+                zeroPCMSampleCount: 0,
+                zeroPCMByteCount: 0,
+                guidanceEventDetail: "seal_interrupted"
+            )
+        }
+        let samples = Int((gapS * Double(sampleRateHz)).rounded())
+        let bytes = samples * MemoryLayout<Int16>.size
+        let detail = String(format: "exp_pause_resume_gap_s=%.3f,padded_samples=%d", gapS, samples)
+        return PauseResumeDecision(
+            canResume: true,
+            gapDurationS: gapS,
+            zeroPCMSampleCount: samples,
+            zeroPCMByteCount: bytes,
+            guidanceEventDetail: detail
+        )
+    }
+
+    public static func makeZeroPCMPaddingData(sampleCount: Int) -> Data {
+        guard sampleCount > 0 else { return Data() }
+        return Data(count: sampleCount * MemoryLayout<Int16>.size)
+    }
+}
+
+/// Summary metrics for one walk in an A/B experiment comparison (`YS-82`).
+public struct ExperimentWalkMetrics: Sendable, Equatable {
+    public let totalFrames: Int
+    public let normalTrackingFrames: Int
+    public let poseJumpCount: Int
+    public let loopClosureGapM: Double
+    public let validates: Bool
+    public let limitedTrackingTransitionsDuringOrWithin2sAfterHold: Int
+
+    public init(
+        totalFrames: Int,
+        normalTrackingFrames: Int,
+        poseJumpCount: Int,
+        loopClosureGapM: Double,
+        validates: Bool,
+        limitedTrackingTransitionsDuringOrWithin2sAfterHold: Int = 0
+    ) {
+        self.totalFrames = totalFrames
+        self.normalTrackingFrames = normalTrackingFrames
+        self.poseJumpCount = poseJumpCount
+        self.loopClosureGapM = loopClosureGapM
+        self.validates = validates
+        self.limitedTrackingTransitionsDuringOrWithin2sAfterHold = limitedTrackingTransitionsDuringOrWithin2sAfterHold
+    }
+
+    public var trackingNormalFraction: Double {
+        guard totalFrames > 0 else { return 0.0 }
+        return Double(normalTrackingFrames) / Double(totalFrames)
+    }
+}
+
+/// Verdict for a `YS-82` A/B walk pair comparison (`REQUIREMENTS-FINAL.md` §E).
+public struct ExperimentABVerdict: Sendable, Equatable {
+    public let experimentID: CaptureExperimentID
+    public let keepEnabled: Bool
+    public let trackingNormalPassed: Bool
+    public let noPoseJumpRisePassed: Bool
+    public let noLoopGapRisePassed: Bool
+    public let validationPassed: Bool
+    public let exposureHoldStabilityPassed: Bool
+    public let failureReasons: [String]
+}
+
+/// Evaluates an A/B pair of walks for a `YS-82` experiment (`REQUIREMENTS-FINAL.md` §E):
+/// - `tracking normal >= 99%` (`0.99`),
+/// - no rise in pose jumps (`candidate.poseJumpCount <= baseline.poseJumpCount`),
+/// - no rise in loop gap (`candidate.loopClosureGapM <= baseline.loopClosureGapM + 1e-6`),
+/// - walk validates (`candidate.validates == true`),
+/// - for `.exposureCapDuringHolds`: `0` limited-tracking transitions during the hold and for `2 s` after it.
+/// - Any failure keeps the experiment off (`keepEnabled == false`).
+public enum ExperimentABValidator: Sendable {
+    public static let minTrackingNormalFraction: Double = 0.99
+
+    public static func evaluate(
+        experimentID: CaptureExperimentID,
+        baselineWalkA: ExperimentWalkMetrics,
+        candidateWalkB: ExperimentWalkMetrics
+    ) -> ExperimentABVerdict {
+        var reasons: [String] = []
+
+        let trackingOK = candidateWalkB.trackingNormalFraction >= minTrackingNormalFraction
+        if !trackingOK {
+            reasons.append(String(format: "tracking_normal_below_99pct (%.2f%%)", candidateWalkB.trackingNormalFraction * 100.0))
+        }
+
+        let poseJumpsOK = candidateWalkB.poseJumpCount <= baselineWalkA.poseJumpCount
+        if !poseJumpsOK {
+            reasons.append("pose_jumps_increased (\(baselineWalkA.poseJumpCount) -> \(candidateWalkB.poseJumpCount))")
+        }
+
+        let loopGapOK = candidateWalkB.loopClosureGapM <= (baselineWalkA.loopClosureGapM + 1e-6)
+        if !loopGapOK {
+            reasons.append(String(format: "loop_gap_increased (%.4f m -> %.4f m)", baselineWalkA.loopClosureGapM, candidateWalkB.loopClosureGapM))
+        }
+
+        let validOK = candidateWalkB.validates
+        if !validOK {
+            reasons.append("candidate_walk_failed_validation")
+        }
+
+        let exposureHoldOK: Bool = {
+            if experimentID == .exposureCapDuringHolds {
+                return candidateWalkB.limitedTrackingTransitionsDuringOrWithin2sAfterHold == 0
+            }
+            return true
+        }()
+        if !exposureHoldOK {
+            reasons.append("exposure_cap_limited_tracking_during_or_2s_after_hold (\(candidateWalkB.limitedTrackingTransitionsDuringOrWithin2sAfterHold))")
+        }
+
+        let allPassed = trackingOK && poseJumpsOK && loopGapOK && validOK && exposureHoldOK
+        return ExperimentABVerdict(
+            experimentID: experimentID,
+            keepEnabled: allPassed,
+            trackingNormalPassed: trackingOK,
+            noPoseJumpRisePassed: poseJumpsOK,
+            noLoopGapRisePassed: loopGapOK,
+            validationPassed: validOK,
+            exposureHoldStabilityPassed: exposureHoldOK,
+            failureReasons: reasons
+        )
+    }
+}

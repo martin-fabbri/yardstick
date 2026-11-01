@@ -1493,6 +1493,35 @@ private struct SettingsSheetView: View {
 
                 Section("Developer") {
                     Toggle("Live Diagnostics", isOn: $recorder.showDeveloperDiagnosticsOverlay)
+                    NavigationLink("Experiments") {
+                        Form {
+                            Section {
+                                Toggle(
+                                    "Exposure Cap During Holds (≤ 1/250 s)",
+                                    isOn: $recorder.experimentFlags.exposureCapDuringHolds
+                                )
+                                Toggle(
+                                    "Hi-Res Still at Lock",
+                                    isOn: $recorder.experimentFlags.hiResStillAtLock
+                                )
+                                Toggle(
+                                    "Hardware Button as Note / Finish",
+                                    isOn: $recorder.experimentFlags.hardwareButtonControl
+                                )
+                                Toggle(
+                                    "ARAnchor on Locks",
+                                    isOn: $recorder.experimentFlags.arAnchorOnLocks
+                                )
+                                Toggle(
+                                    "Pause & Resume (Padded Audio)",
+                                    isOn: $recorder.experimentFlags.pauseAndResumeWithPaddedAudio
+                                )
+                            } footer: {
+                                Text("Each experiment is off by default and logged in guidance.csv.")
+                            }
+                        }
+                        .navigationTitle("Experiments")
+                    }
                 }
             }
             .navigationTitle("Settings")

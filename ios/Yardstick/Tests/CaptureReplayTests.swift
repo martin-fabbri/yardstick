@@ -1528,6 +1528,146 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertGreaterThan(highContrastAudit.brightSkyTextRatio, standardAudit.brightSkyTextRatio)
     }
 
+    /// `YS-82`: Always-on unit test verifying all 5 experiments (`exposureCapDuringHolds`, `hiResStillAtLock`,
+    /// `hardwareButtonControl`, `arAnchorOnLocks`, `pauseAndResumeWithPaddedAudio`) default to `false`, log their
+    /// state for `guidance.csv`, enforce the 2-second post-hold exposure-cap safety window, and require passing
+    /// the `ExperimentABValidator` gates (`tracking normal >= 99%`, no rise in pose jumps or loop gap, walk validates).
+    func testYS82_ExperimentsBehindFlags_DefaultOffLoggedAndABAcceptanceGatesEnforced() {
+        // 1. All 5 experiments default to OFF and log "experiments:none"
+        var flags = CaptureExperimentFlags.default
+        XCTAssertTrue(flags.isAllDefaultOff, "YS-82: Every experiment must default to false")
+        XCTAssertEqual(flags.guidanceLogSummary, "experiments:none")
+        for id in CaptureExperimentID.allCases {
+            XCTAssertFalse(flags.isEnabled(id))
+        }
+
+        flags.setEnabled(true, for: .exposureCapDuringHolds)
+        flags.setEnabled(true, for: .arAnchorOnLocks)
+        XCTAssertEqual(
+            flags.guidanceLogSummary,
+            "experiments:exposure_cap_during_holds+ar_anchor_on_locks"
+        )
+
+        // 2. Experiment 1: Exposure cap (<= 1/250 s = 0.004 s) + 2 s post-hold limited-tracking safety monitor
+        let capped = ExposureCapExperimentController.computeCappedExposureAndISO(
+            currentExposureDurationS: 0.016,
+            currentISO: 200.0
+        )
+        XCTAssertTrue(capped.didCap)
+        XCTAssertEqual(capped.cappedExposureS, 1.0 / 250.0, accuracy: 1e-6)
+        XCTAssertEqual(capped.compensatedISO, 800.0, accuracy: 1e-3)
+
+        var expCap = ExposureCapExperimentController()
+        let holdFrame = expCap.step(
+            timestampS: 10.0,
+            isFlagEnabled: true,
+            isMarkerHoldActive: true,
+            trackingState: "normal"
+        )
+        XCTAssertTrue(holdFrame.shouldApplyCap)
+        XCTAssertFalse(holdFrame.didViolateSafetyWindow)
+
+        // 1.2 s after hold ends (< 2.0 s safety window): a limited-tracking transition must fail & auto-disable the experiment
+        let postHoldLimited = expCap.step(
+            timestampS: 11.2,
+            isFlagEnabled: true,
+            isMarkerHoldActive: false,
+            trackingState: "limited"
+        )
+        XCTAssertFalse(postHoldLimited.shouldApplyCap)
+        XCTAssertTrue(postHoldLimited.didViolateSafetyWindow, "YS-82: Limited tracking within 2 s after a hold must trigger safety violation")
+        XCTAssertTrue(expCap.autoDisabledDueToLimitedTracking, "YS-82: Any failure keeps the experiment off")
+
+        // 3. Experiment 2: Hi-res / maximum-quality still at marker lock
+        XCTAssertEqual(HiResLockStillExperiment.jpegQuality(isFlagEnabled: false, didLockMarkerOnThisStill: true), 0.92, accuracy: 1e-6)
+        XCTAssertEqual(HiResLockStillExperiment.jpegQuality(isFlagEnabled: true, didLockMarkerOnThisStill: true), 1.00, accuracy: 1e-6)
+
+        // 4. Experiment 3: Hardware button (Camera Control / volume button) as Note and Finish
+        XCTAssertEqual(
+            HardwareButtonExperimentRouter.resolvePress(isFlagEnabled: false, isRecordingVoiceNote: false, isFinishAvailable: true),
+            .ignoredFlagOff
+        )
+        XCTAssertEqual(
+            HardwareButtonExperimentRouter.resolvePress(isFlagEnabled: true, isRecordingVoiceNote: false, isFinishAvailable: false),
+            .startVoiceNote
+        )
+        XCTAssertEqual(
+            HardwareButtonExperimentRouter.resolvePress(isFlagEnabled: true, isRecordingVoiceNote: true, isFinishAvailable: true),
+            .stopVoiceNote
+        )
+        XCTAssertEqual(
+            HardwareButtonExperimentRouter.resolvePress(isFlagEnabled: true, isRecordingVoiceNote: false, isFinishAvailable: true),
+            .openReviewWalkFinish
+        )
+
+        // 5. Experiment 4: ARAnchor on locks
+        let anchorMat = ARAnchorLockExperiment.makeAnchorTransform(
+            positionWorld: SIMD3<Double>(1.25, -0.80, -3.50),
+            quaternionXYZW: SIMD4<Double>(0.0, 0.0, 0.0, 1.0)
+        )
+        XCTAssertEqual(ARAnchorLockExperiment.anchorName(forMarkerID: 2, isClosingHold: false), "yardstick_marker_2")
+        XCTAssertEqual(ARAnchorLockExperiment.anchorName(forMarkerID: 0, isClosingHold: true), "yardstick_marker_0_close")
+        XCTAssertEqual(Double(anchorMat.columns.3.x), 1.25, accuracy: 1e-5)
+        XCTAssertEqual(Double(anchorMat.columns.3.y), -0.80, accuracy: 1e-5)
+        XCTAssertEqual(Double(anchorMat.columns.3.z), -3.50, accuracy: 1e-5)
+
+        // 6. Experiment 5: Pause and resume with zero-PCM padded audio (16 kHz mono Int16) and declared gap
+        let offPause = PauseResumeAudioPadder.evaluateResume(isFlagEnabled: false, pauseTimestampS: 20.0, resumeTimestampS: 24.5)
+        XCTAssertFalse(offPause.canResume, "YS-82: When flag is off, interruption seals immediately and never pauses")
+
+        let shortPause = PauseResumeAudioPadder.evaluateResume(isFlagEnabled: true, pauseTimestampS: 20.0, resumeTimestampS: 24.5)
+        XCTAssertTrue(shortPause.canResume)
+        XCTAssertEqual(shortPause.gapDurationS, 4.5, accuracy: 1e-6)
+        XCTAssertEqual(shortPause.zeroPCMSampleCount, 72_000)
+        XCTAssertEqual(shortPause.zeroPCMByteCount, 144_000)
+        let padBytes = PauseResumeAudioPadder.makeZeroPCMPaddingData(sampleCount: shortPause.zeroPCMSampleCount)
+        XCTAssertEqual(padBytes.count, 144_000)
+
+        // 7. A/B Acceptance Gate (`ExperimentABValidator`)
+        let walkA = ExperimentWalkMetrics(
+            totalFrames: 1800,
+            normalTrackingFrames: 1795,
+            poseJumpCount: 0,
+            loopClosureGapM: 0.032,
+            validates: true,
+            limitedTrackingTransitionsDuringOrWithin2sAfterHold: 0
+        )
+        let passingWalkB = ExperimentWalkMetrics(
+            totalFrames: 1800,
+            normalTrackingFrames: 1796,
+            poseJumpCount: 0,
+            loopClosureGapM: 0.029,
+            validates: true,
+            limitedTrackingTransitionsDuringOrWithin2sAfterHold: 0
+        )
+        let passVerdict = ExperimentABValidator.evaluate(
+            experimentID: .exposureCapDuringHolds,
+            baselineWalkA: walkA,
+            candidateWalkB: passingWalkB
+        )
+        XCTAssertTrue(passVerdict.keepEnabled)
+        XCTAssertTrue(passVerdict.failureReasons.isEmpty)
+
+        let failingWalkB = ExperimentWalkMetrics(
+            totalFrames: 1800,
+            normalTrackingFrames: 1760, // 97.78% < 99%
+            poseJumpCount: 1, // rose from 0 -> 1
+            loopClosureGapM: 0.045, // rose from 0.032 -> 0.045
+            validates: true,
+            limitedTrackingTransitionsDuringOrWithin2sAfterHold: 1
+        )
+        let failVerdict = ExperimentABValidator.evaluate(
+            experimentID: .exposureCapDuringHolds,
+            baselineWalkA: walkA,
+            candidateWalkB: failingWalkB
+        )
+        XCTAssertFalse(failVerdict.keepEnabled, "YS-82: Any A/B regression keeps the experiment off")
+        XCTAssertFalse(failVerdict.trackingNormalPassed)
+        XCTAssertFalse(failVerdict.noPoseJumpRisePassed)
+        XCTAssertFalse(failVerdict.noLoopGapRisePassed)
+        XCTAssertFalse(failVerdict.exposureHoldStabilityPassed)
+    }
+
     // MARK: - Full Walk 1–5 Local Suite (`YARDSTICK_REPLAY_ROOT`)
 
     /// `YS-66` / `YS-69` / `YS-70` / `YS-73`: Full Walk 5 (`2,865` frames, `455` stills) replay in `.liveDetectorOnStills` mode under `< 15 s`.
