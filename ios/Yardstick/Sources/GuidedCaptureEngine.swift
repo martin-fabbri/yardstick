@@ -591,6 +591,8 @@ public struct GuidedCaptureEngine: Sendable {
     private var justLockedBannerUntilS: Double = -100.0
     private var justLockedKey: String = ""
     private var justLockedText: String = ""
+    private var lastActiveHoldMarkerID: Int? = nil
+    private var lastRingSightingTimestampS: Double = -100.0
 
     public init(requireLookUpStep: Bool = true) {
         self.requireLookUpStep = requireLookUpStep
@@ -633,17 +635,30 @@ public struct GuidedCaptureEngine: Sendable {
     }
 
     /// Require a fresh closing hold at Marker 0 after any `"Fix now"` action from Walk Review (`YS-72`, `YS-74`).
-    public mutating func beginFixNowRequiringReturnToMarker0(at timestampS: Double) {
+    /// If `targetMarkerID` is in `1...3`, also unlocks that marker first so the operator re-locks it before returning to Marker 0.
+    public mutating func beginFixNowRequiringReturnToMarker0(targetMarkerID: Int? = nil, at timestampS: Double) {
         fixNowRequiresReturnToMarker0 = true
         isClosingMarker0Locked = false
         closingMarker0Hold = MarkerHoldProgress(markerID: 0, isClosingHold: true)
-        phase = .closingMarker0
-        commitInstruction(
-            key: "return_marker_0",
-            text: "Head back to marker 0",
-            at: timestampS,
-            forceImmediate: true
-        )
+        if let mid = targetMarkerID, (1...3).contains(mid) {
+            lockedMarkerIDs.remove(mid)
+            marker1To3Holds[mid] = MarkerHoldProgress(markerID: mid)
+            phase = .markers1To3
+            commitInstruction(
+                key: "walk_to_marker_\(mid)",
+                text: "Walk to marker \(mid)",
+                at: timestampS,
+                forceImmediate: true
+            )
+        } else {
+            phase = .closingMarker0
+            commitInstruction(
+                key: "return_marker_0",
+                text: "Head back to marker 0",
+                at: timestampS,
+                forceImmediate: true
+            )
+        }
     }
 
     public mutating func skipLookUpStep(at timestampS: Double) {
@@ -679,7 +694,8 @@ public struct GuidedCaptureEngine: Sendable {
         lowDiskSpaceWarning: Bool = false,
         hasValidDepthForLookUp: Bool = true,
         elevatedPointsAbove2m: Int = 0,
-        relaxViewingAngleAndSizeForLegacyReplay: Bool = false
+        relaxViewingAngleAndSizeForLegacyReplay: Bool = false,
+        didRunMarkerDetection: Bool = true
     ) -> (
         instruction: String,
         instructionKey: String,
@@ -694,7 +710,13 @@ public struct GuidedCaptureEngine: Sendable {
 
         var emittedHaptic: GuidedHapticEvent? = nil
         var activeHoldMarkerID: Int? = nil
-        activeRingState = nil
+        let holdGraceActive = !didRunMarkerDetection && ((timestampS - lastRingSightingTimestampS) <= 0.45)
+        if !holdGraceActive {
+            activeRingState = nil
+            lastActiveHoldMarkerID = nil
+        } else {
+            activeHoldMarkerID = lastActiveHoldMarkerID
+        }
 
         // 1. Determine which marker hold (if any) is relevant in the current phase
         let allVisible = !confirmedSightings.isEmpty ? confirmedSightings : rawSightings
@@ -881,6 +903,9 @@ public struct GuidedCaptureEngine: Sendable {
                 cornersUV: hold.latestCornersUV,
                 rangeMeters: hold.latestRangeMeters
             )
+            lastRingSightingTimestampS = timestampS
+            lastActiveHoldMarkerID = hold.isLocked ? nil : mid
+            activeHoldMarkerID = lastActiveHoldMarkerID
 
             if target.isClosing {
                 closingMarker0Hold = hold

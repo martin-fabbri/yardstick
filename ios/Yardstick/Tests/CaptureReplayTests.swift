@@ -428,6 +428,27 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertEqual(engine.activeRingState?.isPaused, false)
         XCTAssertEqual(s1.haptic, .holdSegmentConfirmed(markerID: 0, segment: 1, intensity: 0.5))
 
+        // 1b. Non-detection 30 Hz frame (`didRunMarkerDetection: false`) 33 ms later preserves `activeRingState`
+        // and keeps `thermalSchedule.detectionHz == 10.0` even under `.serious` thermal state (`YS-74`, `YS-85`)
+        let sNonDet = engine.step(
+            timestampS: 1.033,
+            savedIndex: 11,
+            dt: 0.033,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.04,
+            predictedBlurPx: 0.5,
+            cameraPositionWorld: camAtM0,
+            confirmedSightings: [],
+            rawSightings: [],
+            unifiedLoopClosed: false,
+            thermalLevel: .serious,
+            didRunMarkerDetection: false
+        )
+        XCTAssertEqual(engine.activeRingState?.confirmedSegments, 1, "YS-74: 30 Hz non-detection frame must not clear activeRingState")
+        XCTAssertEqual(sNonDet.thermalSchedule.detectionHz, 10.0, "YS-85: Serious thermal detection stays at 10 Hz during an active hold across 30 Hz frames")
+        XCTAssertEqual(sNonDet.thermalSchedule.detectionFrameStrideAt30FPS, 3)
+
         // 2. Condition breaks at t = 1.2 s (fast turn / blur) -> ring PAUSES at 1 segment (does NOT reset to 0!)
         // and correction does NOT emit a haptic
         let sPause = engine.step(
@@ -578,10 +599,12 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertEqual(engine.activeInstruction, "All done. Tap Finish.")
         XCTAssertEqual(lastHaptic, .loopClosedPathComplete)
 
-        // 9. Trigger "Fix now" -> requires closing Marker 0 to be locked again!
-        engine.beginFixNowRequiringReturnToMarker0(at: t + 1.0)
-        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-74: Fix now must require re-locking Marker 0 at the end")
-        XCTAssertEqual(engine.phase, .closingMarker0)
+        // 9. Trigger "Fix now" on Marker 2 -> unlocks Marker 2 AND requires closing Marker 0 to be locked again!
+        engine.beginFixNowRequiringReturnToMarker0(targetMarkerID: 2, at: t + 1.0)
+        XCTAssertFalse(engine.lockedMarkerIDs.contains(2))
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-74: Fix now must require re-locking Marker 2 and Marker 0 at the end")
+        XCTAssertEqual(engine.phase, .markers1To3)
+        XCTAssertEqual(engine.activeInstruction, "Walk to marker 2")
     }
 
     /// `YS-78`: Always-on unit test verifying the `0.25 m` `GroundCoverageGrid` filters depth to

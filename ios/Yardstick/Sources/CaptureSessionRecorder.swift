@@ -115,6 +115,10 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         coverageGridLock.withLock { $0.coveredCellCount }
     }
 
+    func isCoverageUpdateDue(at timestampS: Double, minIntervalS: Double) -> Bool {
+        coverageGridLock.withLock { $0.shouldUpdate(at: timestampS, minIntervalS: minIntervalS) }
+    }
+
     func anchorGroundPlaneY(_ yWorld: Double) {
         coverageGridLock.withLock { grid in
             grid.anchorGroundPlaneY(yWorld)
@@ -2058,7 +2062,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                 thermalLevel: activeThermalLevel,
                 lowDiskSpaceWarning: self.lowDiskSpaceWarning != nil,
                 hasValidDepthForLookUp: self.latestValidDepthSamplesCount >= 8 || finalCenterDepthM != nil,
-                elevatedPointsAbove2m: self.latestElevatedPointsAbove2m
+                elevatedPointsAbove2m: self.latestElevatedPointsAbove2m,
+                didRunMarkerDetection: false
             )
             self.latestElevatedPointsAbove2m = 0
             self.guidedWalkPhase = self.guidedEngine.phase
@@ -2287,7 +2292,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     let isSteadyEnoughForStill = (predictedBlurPx <= ExposureAndStillnessGate.maxPredictedBlurPx)
                         && (turnRateRadS <= ExposureAndStillnessGate.maxTurnRateRadS)
                     let shouldConsiderPeriodicStill = isSteadyEnoughForStill && ((timestampS - engine.lastAnyStillTimeS) >= 2.0)
-                    let shouldConsiderCoverage = (sIdx % 6 == 0)
+                    let shouldConsiderCoverage = engine.isCoverageUpdateDue(at: timestampS, minIntervalS: coverageMinIntervalS)
                     if shouldRunArUco || shouldConsiderPeriodicStill || shouldConsiderCoverage {
                         self.detectionScheduler.submitIfIdle { [weak self] in
                             guard let self, !engine.isClosed else { return }
@@ -2312,7 +2317,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             var rejectedCoachingCue: String? = nil
                             var sharpnessVal: Double? = nil
 
-                            if let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
+                            if (shouldRunArUco || shouldConsiderPeriodicStill),
+                               let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
                                 if shouldRunArUco {
                                     let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
                                     for d2 in dets2D {
@@ -2487,7 +2493,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         self.latestElevatedPointsAbove2m += cov.elevatedPointsAbove2m
                                     }
                                     if !finalDetected.isEmpty {
-                                        let updatedLoop = self.phoneLoopState.ingestSightings(
+                                        _ = self.phoneLoopState.ingestSightings(
                                             finalDetected,
                                             timestampS: timestampS,
                                             savedIndex: sIdx,
@@ -2496,6 +2502,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
                                         self.isLoopClosed = self.phoneLoopState.unifiedLoopClosed
                                         self.loopClosureGapMeters = self.phoneLoopState.unifiedLoopClosureGapMeters
+                                        self.updateProvisionalGrade()
 
                                         // YS-73: After 3 sightings of a marker, check if median measured size is > 3% off
                                         for m in finalDetected {
@@ -2513,14 +2520,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                                 )
                                             }
                                         }
-
-                                        if updatedLoop, let gap = self.phoneLoopState.unifiedLoopClosureGapMeters {
-                                            self.loopClosureGapMeters = gap
-                                            self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
-                                            self.updateProvisionalGrade()
-                                        }
                                     }
 
+                                    let wasClosingLocked = self.guidedEngine.isClosingMarker0Locked
                                     let detStep = self.guidedEngine.step(
                                         timestampS: timestampS,
                                         savedIndex: sIdx,
@@ -2537,7 +2539,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         thermalLevel: activeThermalLevel,
                                         lowDiskSpaceWarning: self.lowDiskSpaceWarning != nil,
                                         hasValidDepthForLookUp: self.latestValidDepthSamplesCount >= 8,
-                                        elevatedPointsAbove2m: 0
+                                        elevatedPointsAbove2m: 0,
+                                        didRunMarkerDetection: shouldRunArUco
                                     )
                                     self.guidedWalkPhase = self.guidedEngine.phase
                                     self.activeRingState = self.guidedEngine.activeRingState
@@ -2551,6 +2554,53 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     }
                                     if self.lowDiskSpaceWarning == nil {
                                         self.statusBanner = detStep.instruction
+                                    }
+
+                                    // YS-67 / YS-71 / YS-74: Only a completed 3-still closing hold on Marker 0 writes `loop_closed`
+                                    // so all 3 confirmed stills of the closing hold precede `loop_closed_t_s`!
+                                    if !wasClosingLocked && self.guidedEngine.isClosingMarker0Locked {
+                                        let gap = self.phoneLoopState.unifiedLoopClosureGapMeters ?? 0.0
+                                        self.loopClosureGapMeters = self.phoneLoopState.unifiedLoopClosureGapMeters
+                                        self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
+                                        self.updateProvisionalGrade()
+                                    }
+
+                                    // Log explicit `marker_locked` / `loop_closed` guidance event rows to `guidance.csv` (`YS-67`, `YS-74`)
+                                    let guidanceEventName: String? = {
+                                        switch detStep.haptic {
+                                        case .markerLocked: return "marker_locked"
+                                        case .loopClosedPathComplete: return "loop_closed"
+                                        default: return nil
+                                        }
+                                    }()
+                                    if let evName = guidanceEventName {
+                                        let lockLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
+                                            timestampS: timestampS,
+                                            savedIndex: sIdx,
+                                            event: evName,
+                                            phase: self.guidedEngine.phase.rawValue,
+                                            instruction: detStep.instruction,
+                                            spoken: false,
+                                            pitchDeg: pitchDegrees,
+                                            rollDeg: rollDegrees,
+                                            trackingState: trackingStr,
+                                            exposureDurationS: exposureDurationS,
+                                            iso: isoVal,
+                                            turnRateRadS: turnRateRadS,
+                                            predictedBlurPx: predictedBlurPx,
+                                            thermalState: effectiveThermalStr,
+                                            coverageCells: self.coveredGroundCellCount
+                                        )
+                                        self.writerQueue.async { [weak self] in
+                                            guard let self, !engine.isClosed else { return }
+                                            do {
+                                                try engine.appendLine(lockLine, to: engine.guidanceFH)
+                                            } catch {
+                                                Task { @MainActor in
+                                                    self.handleStreamFailure(stream: "guidance", message: error.localizedDescription)
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
