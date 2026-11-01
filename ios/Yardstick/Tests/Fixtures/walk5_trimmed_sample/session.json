@@ -1,0 +1,181 @@
+{
+  "app_version" : "0.1.0",
+  "camera_format" : {
+    "actual" : {
+      "fps" : 30,
+      "height" : 1440,
+      "width" : 1920
+    },
+    "requested" : {
+      "fps" : 30,
+      "height" : 1440,
+      "width" : 1920
+    }
+  },
+  "capture_id" : "20261101T012134Z_yardstick",
+  "clock" : {
+    "audio_first_sample_t_s" : 711.71012499999995,
+    "audio_sample_rate_hz" : 16000,
+    "start_clock_pair" : {
+      "t_s" : 711.774081583,
+      "utc" : "2026-11-01T01:21:34Z"
+    },
+    "started_at_utc" : "2026-11-01T01:21:34Z",
+    "stop_clock_pair" : {
+      "t_s" : 807.24237511700005,
+      "utc" : "2026-11-01T01:23:10Z"
+    },
+    "t0_monotonic_s" : 711.774081583
+  },
+  "contract" : "yardstick-capture\/1",
+  "device" : {
+    "ios_version" : "27.0",
+    "lidar_supported" : true,
+    "model" : "iPhone18,2",
+    "name" : "iPhone"
+  },
+  "guide_thresholds" : {
+    "pitch_max_deg" : -15,
+    "pitch_min_deg" : -45,
+    "roll_max_abs_deg" : 15
+  },
+  "location" : {
+    "heading_accuracy_deg" : 10,
+    "horizontal_accuracy_m" : 2.1381498384342996,
+    "latitude_deg" : 44.044641543474533,
+    "longitude_deg" : -123.09170498015244,
+    "magnetic_heading_deg" : 343.39437866210938,
+    "north_samples" : [
+      {
+        "camera_yaw_world_deg" : 91.146179341417636,
+        "heading_accuracy_deg" : 12.976922988891602,
+        "t_s" : 712.17321449799999,
+        "true_heading_deg" : 189.31607055664062
+      },
+      {
+        "camera_yaw_world_deg" : 91.179695753953652,
+        "heading_accuracy_deg" : 12.976922988891602,
+        "t_s" : 712.33986374899996,
+        "true_heading_deg" : 189.3760986328125
+      },
+      {
+        "camera_yaw_world_deg" : 90.980233426767839,
+        "heading_accuracy_deg" : 12.960842132568359,
+        "t_s" : 712.50656005099995,
+        "true_heading_deg" : 189.73403930664062
+      },
+      {
+        "camera_yaw_world_deg" : 95.861080494509167,
+        "heading_accuracy_deg" : 12.921342849731445,
+        "t_s" : 712.67323145900002,
+        "true_heading_deg" : 190.92988586425781
+      },
+      {
+        "camera_yaw_world_deg" : 94.21702762287255,
+        "heading_accuracy_deg" : 12.905547142028809,
+        "t_s" : 712.83990285899995,
+        "true_heading_deg" : 192.06350708007812
+      },
+      {
+        "camera_yaw_world_deg" : 86.033244500686919,
+        "heading_accuracy_deg" : 12.882506370544434,
+        "t_s" : 713.00657361900005,
+        "true_heading_deg" : 194.47711181640625
+      },
+      {
+        "camera_yaw_world_deg" : 85.928629503460328,
+        "heading_accuracy_deg" : 12.882506370544434,
+        "t_s" : 713.17324704600003,
+        "true_heading_deg" : 194.31097412109375
+      },
+      {
+        "camera_yaw_world_deg" : 89.782726744403917,
+        "heading_accuracy_deg" : 12.854009628295898,
+        "t_s" : 713.33990622199997,
+        "true_heading_deg" : 189.769287109375
+      },
+      {
+        "camera_yaw_world_deg" : 92.783712098471241,
+        "heading_accuracy_deg" : 12.822943687438965,
+        "t_s" : 713.50658219800005,
+        "true_heading_deg" : 187.29130554199219
+      },
+      {
+        "camera_yaw_world_deg" : 96.099404305871445,
+        "heading_accuracy_deg" : 12.811861038208008,
+        "t_s" : 713.67324420600005,
+        "true_heading_deg" : 186.50471496582031
+      },
+      {
+        "camera_yaw_world_deg" : 94.279263801420356,
+        "heading_accuracy_deg" : 12.79761791229248,
+        "t_s" : 713.83992942500004,
+        "true_heading_deg" : 186.97308349609375
+      },
+      {
+        "camera_yaw_world_deg" : 95.112255309500384,
+        "heading_accuracy_deg" : 12.778555870056152,
+        "t_s" : 714.00658714300005,
+        "true_heading_deg" : 187.84864807128906
+      },
+      {
+        "camera_yaw_world_deg" : 94.170039137162348,
+        "heading_accuracy_deg" : 12.766131401062012,
+        "t_s" : 714.17326182399995,
+        "true_heading_deg" : 188.29205322265625
+      },
+      {
+        "camera_yaw_world_deg" : 92.927461729948675,
+        "heading_accuracy_deg" : 12.766131401062012,
+        "t_s" : 714.33992716900002,
+        "true_heading_deg" : 189.10491943359375
+      },
+      {
+        "camera_yaw_world_deg" : 91.997367310872264,
+        "heading_accuracy_deg" : 12.759202003479004,
+        "t_s" : 714.50660851500004,
+        "true_heading_deg" : 189.79721069335938
+      }
+    ],
+    "status" : "ok",
+    "true_heading_deg" : 357.59439086914062
+  },
+  "loop_closure_gaps" : [
+    {
+      "first_t_s" : 712.07320837300006,
+      "gap_m" : 0.075325553934287443,
+      "last_t_s" : 726.67359594699997,
+      "marker_id" : 0
+    }
+  ],
+  "marker_config" : {
+    "dictionary" : "DICT_5X5_250",
+    "printed_sizes_mm" : {
+      "0" : 180,
+      "1" : 180,
+      "2" : 180,
+      "3" : 180,
+      "4" : 250,
+      "5" : 250
+    }
+  },
+  "pose_convention" : "arkit_right_handed_y_up",
+  "provisional_grade" : {
+    "distance_tolerance_10m_m" : 0.066692733460212761,
+    "grade" : "C",
+    "loop_closure_gap_m" : 0.075325553934287443,
+    "reasons" : [
+      "distance_tolerance_10m_m=0.067m",
+      "cap: no_tape_check -> C"
+    ]
+  },
+  "state" : {
+    "failed_stream" : null,
+    "last_heartbeat_t_s" : 807.24237511700005,
+    "status" : "stopped",
+    "stop_reason" : "user_done"
+  },
+  "tape_checks" : [
+
+  ]
+}
