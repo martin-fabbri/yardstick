@@ -38,10 +38,13 @@ private struct SendableAudioSampleBuffer: @unchecked Sendable {
 }
 
 /// Serial-queue disk writer engine confined strictly to `writerQueue` so no file I/O ever runs on `@MainActor`
-/// and non-Sendable AVFoundation/FileHandle objects never cross concurrency domains (Blockers 3, 4, 5, 6).
+/// and non-Sendable AVFoundation/FileHandle objects never cross concurrency domains (Blockers 3, 4, 5, 6, `YS-68`, `YS-84`).
 private final class CaptureWriterEngine: @unchecked Sendable {
     let captureDirURL: URL
     let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    let detectionCIContext = CIContext(options: [.useSoftwareRenderer: false])
+    let digestRegistry = PrecomputedDigestRegistry()
+    private let stillGateLock = OSAllocatedUnfairLock(initialState: StillCaptureGate())
 
     var assetWriter: AVAssetWriter?
     var videoWriterInput: AVAssetWriterInput?
@@ -54,6 +57,12 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var markersFH: FileHandle?
     var eventsFH: FileHandle?
     var audioFH: FileHandle?
+
+    var framesDigest = IncrementalByteDigest()
+    var posesDigest = IncrementalByteDigest()
+    var stillsDigest = IncrementalByteDigest()
+    var markersDigest = IncrementalByteDigest()
+    var eventsDigest = IncrementalByteDigest()
 
     var audioConverter: AVAudioConverter?
     var audioInputFormat: AVAudioFormat?
@@ -68,9 +77,28 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var droppedFrameCount: Int = 0
     var audioPCMByteCount: UInt32 = 0
     var audioFirstSampleTS: Double? = nil
-    var lastStillSavedTimeS: Double = -10.0
     var savedStillsIndices: Set<Int> = []
     var isClosed: Bool = false
+
+    var lastAnyStillTimeS: Double {
+        stillGateLock.withLock { $0.lastAnyStillTimeS }
+    }
+
+    func evaluateStillGate(
+        timestampS: Double,
+        detectedMarkerIDs: [Int],
+        forceOperatorMarkerTap: Bool,
+        sharpness: Double?
+    ) -> (shouldSave: Bool, reason: String?) {
+        stillGateLock.withLock { gate in
+            gate.evaluateFrame(
+                timestampS: timestampS,
+                detectedMarkerIDs: detectedMarkerIDs,
+                forceOperatorMarkerTap: forceOperatorMarkerTap,
+                sharpness: sharpness
+            )
+        }
+    }
 
     init(captureDirURL: URL, width: Int, height: Int) throws {
         self.captureDirURL = captureDirURL
@@ -81,25 +109,36 @@ private final class CaptureWriterEngine: @unchecked Sendable {
 
         try Self.createFileWithHeader(
             "t,saved_index,dropped,drop_reason,tracking_state,tracking_reason\n",
-            at: captureDirURL.appendingPathComponent("frames.csv")
+            at: captureDirURL.appendingPathComponent("frames.csv"),
+            digest: &framesDigest,
+            registry: digestRegistry
         )
         try Self.createFileWithHeader(
             "t,saved_index,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n",
-            at: captureDirURL.appendingPathComponent("poses.csv")
+            at: captureDirURL.appendingPathComponent("poses.csv"),
+            digest: &posesDigest,
+            registry: digestRegistry
         )
         try Self.createFileWithHeader(
             "t,saved_index,file,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n",
-            at: captureDirURL.appendingPathComponent("stills.csv")
+            at: captureDirURL.appendingPathComponent("stills.csv"),
+            digest: &stillsDigest,
+            registry: digestRegistry
         )
         try Self.createFileWithHeader(
             "t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v\n",
-            at: captureDirURL.appendingPathComponent("markers.csv")
+            at: captureDirURL.appendingPathComponent("markers.csv"),
+            digest: &markersDigest,
+            registry: digestRegistry
         )
         try Self.createFileWithHeader(
             "t,saved_index,kind,detail\n",
-            at: captureDirURL.appendingPathComponent("events.csv")
+            at: captureDirURL.appendingPathComponent("events.csv"),
+            digest: &eventsDigest,
+            registry: digestRegistry
         )
         try Self.initializeAudioWavHeader(at: captureDirURL.appendingPathComponent("audio.wav"))
+        digestRegistry.addRecordedBytes(44)
 
         self.framesFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("frames.csv"))
         try self.framesFH?.seekToEnd()
@@ -144,11 +183,18 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         self.pixelBufferAdaptor = adaptor
     }
 
-    private static func createFileWithHeader(_ header: String, at url: URL) throws {
+    private static func createFileWithHeader(
+        _ header: String,
+        at url: URL,
+        digest: inout IncrementalByteDigest,
+        registry: PrecomputedDigestRegistry
+    ) throws {
         guard let data = header.data(using: .utf8) else {
             throw NSError(domain: "Yardstick", code: -3, userInfo: [NSLocalizedDescriptionKey: "Failed to encode CSV header as UTF-8"])
         }
         try data.write(to: url, options: .atomic)
+        digest.update(with: data)
+        registry.addRecordedBytes(UInt64(data.count))
     }
 
     private static func initializeAudioWavHeader(at url: URL) throws {
@@ -182,6 +228,18 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             throw NSError(domain: "Yardstick", code: -5, userInfo: [NSLocalizedDescriptionKey: "Stream FileHandle is nil"])
         }
         try fh.write(contentsOf: data)
+        if fh === framesFH {
+            framesDigest.update(with: data)
+        } else if fh === posesFH {
+            posesDigest.update(with: data)
+        } else if fh === stillsFH {
+            stillsDigest.update(with: data)
+        } else if fh === markersFH {
+            markersDigest.update(with: data)
+        } else if fh === eventsFH {
+            eventsDigest.update(with: data)
+        }
+        digestRegistry.addRecordedBytes(UInt64(data.count))
     }
 
     /// Convert `CMSampleBuffer` audio to 16,000 Hz mono Int16 PCM using stateful `AVAudioConverter` (`YS-06`).
@@ -253,10 +311,12 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             }
             try aFH.write(contentsOf: pcmData)
             audioPCMByteCount &+= UInt32(byteCount)
+            digestRegistry.addRecordedBytes(UInt64(byteCount))
         }
     }
 
-    /// Finalize `audio.wav` RIFF/data chunk sizes, finish `rgb.mp4`, and close all open file handles.
+    /// Finalize `audio.wav` RIFF/data chunk sizes, finish `rgb.mp4`, record incremental CSV digests (`YS-84`),
+    /// and close all open file handles.
     /// Does NOT call `handleStreamFailure` so it can never cause recursive failure loops (Blocker 6).
     func finishStreamsAndCloseFiles() throws {
         guard !isClosed else { return }
@@ -267,6 +327,12 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         try? stillsFH?.close()
         try? markersFH?.close()
         try? eventsFH?.close()
+
+        digestRegistry.record(framesDigest.finalize(), forRelativePath: "frames.csv")
+        digestRegistry.record(posesDigest.finalize(), forRelativePath: "poses.csv")
+        digestRegistry.record(stillsDigest.finalize(), forRelativePath: "stills.csv")
+        digestRegistry.record(markersDigest.finalize(), forRelativePath: "markers.csv")
+        digestRegistry.record(eventsDigest.finalize(), forRelativePath: "events.csv")
 
         var audioFinalizeErr: Error?
         if let aFH = audioFH {
@@ -306,7 +372,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     }
 }
 
-/// Crash-safe, zero-`ARFrame`-retention LiDAR capture session recorder (`YS-00`–`YS-14`, `YS-21`, `YS-22`, `YS-30`–`YS-33`, `YS-40`–`YS-44`).
+/// Crash-safe, zero-`ARFrame`-retention LiDAR capture session recorder (`YS-00`–`YS-14`, `YS-21`, `YS-22`, `YS-30`–`YS-33`, `YS-40`–`YS-44`, `YS-68`, `YS-84`).
 @MainActor
 public final class CaptureSessionRecorder: NSObject, ObservableObject {
     public enum SessionPhase: String, Sendable {
@@ -336,6 +402,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var provisionalGrade: String = "—"
     @Published public private(set) var provisionalReasons: [String] = []
     @Published public private(set) var archiveZipURL: URL? = nil
+    @Published public private(set) var sealingProgress: Double = 0.0
+    @Published public private(set) var sealingStatusText: String = "Saving your walk"
+    @Published public private(set) var lowDiskSpaceWarning: String? = nil
 
     private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM"
 
@@ -371,6 +440,13 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     public let arSession = ARSession()
     #endif
 
+    /// Atomic writer backlog counter updated strictly on `writerQueue` (`YS-68`).
+    nonisolated public let writerBacklog = WriterBacklogCounter(maxBacklog: 8)
+    /// Single-slot background detection scheduler that drops incoming work immediately when busy (`YS-68`).
+    nonisolated public let detectionScheduler = SingleSlotDetectionScheduler()
+    /// Injectable free-disk-bytes provider for mid-walk `ENOSPC` prevention and unit testing (`YS-84`).
+    public var availableDiskBytesProvider: (@Sendable (URL) -> Int64?) = { DiskSpaceMonitor.querySystemAvailableBytes(at: $0) }
+
     private let writerQueue = DispatchQueue(label: "io.yardstick.capture.writer", qos: .userInitiated)
     private let locationManager = CLLocationManager()
     private var notificationObservers: [NSObjectProtocol] = []
@@ -384,7 +460,6 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var lastNorthSampleTimeS: Double = -10.0
     private var lastDeliveredFrameTimestampS: Double?
     private var pendingForceMarkerDetect: Bool = false
-    private var pendingWriterJobs: Int = 0
 
     private var requestedWidth: Int = 1920
     private var requestedHeight: Int = 1440
@@ -564,7 +639,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         tapeChecks.removeAll()
         tapeCheckCount = 0
         tapeCheckSummaries.removeAll()
-         pendingTapeEndpointAWorld = nil
+        pendingTapeEndpointAWorld = nil
         pendingTapeEndpointBWorld = nil
         phoneLoopState = PhoneLoopRuleState()
         loopClosureGapMeters = nil
@@ -572,11 +647,15 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         audioFirstSampleTS = nil
         lastNorthSampleTimeS = -10.0
         lastDeliveredFrameTimestampS = nil
-        pendingWriterJobs = 0
+        writerBacklog.reset()
+        detectionScheduler.resetStats()
         provisionalGrade = "—"
         provisionalReasons = []
         provisionalDistanceTolerance10m = 0.05
         archiveZipURL = nil
+        sealingProgress = 0.0
+        sealingStatusText = "Saving your walk"
+        lowDiskSpaceWarning = nil
 
         #if canImport(ARKit) && !targetEnvironment(simulator)
         let config = ARWorldTrackingConfiguration()
@@ -626,14 +705,35 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
 
             let snapData = makeSessionJSONData(status: "recording", stopReason: nil, failedStream: nil)
             writerQueue.async {
-                Self.writeSessionJSONDataOnQueue(snapData, in: dir)
+                Self.writeSessionJSONDataOnQueue(snapData, in: dir, registry: engine.digestRegistry)
             }
             phase = .recording
             statusBanner = "Recording (\(actualWidth)×\(actualHeight)@\(actualFPS)fps) — hold on Marker 0"
+            _ = checkMidWalkDiskSpace(recordedBytes: 0)
         } catch {
             UIApplication.shared.isIdleTimerDisabled = false
             phase = .failed
             statusBanner = "Failed to initialize capture: \(error.localizedDescription)"
+        }
+    }
+
+    /// Evaluate free disk space during a walk and warn `"Almost out of space. Finish soon."` before sealing can fail with `ENOSPC` (`YS-84`).
+    @discardableResult
+    public func checkMidWalkDiskSpace(recordedBytes: Int64) -> Bool {
+        let queryURL = captureDirURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        guard let avail = availableDiskBytesProvider(queryURL) else { return false }
+        let eval = DiskSpaceMonitor.evaluateMidWalkStorage(
+            availableBytes: avail,
+            recordedCaptureBytes: recordedBytes
+        )
+        if eval.isLowSpace {
+            let msg = eval.warningMessage ?? "Almost out of space. Finish soon."
+            lowDiskSpaceWarning = msg
+            statusBanner = msg
+            return true
+        } else {
+            lowDiskSpaceWarning = nil
+            return false
         }
     }
 
@@ -747,18 +847,23 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
 
         let engine = writerEngine
         let snapData = makeSessionJSONData(status: "failed", stopReason: "write_error", failedStream: stream)
-        writerQueue.async {
-            try? engine?.finishStreamsAndCloseFiles()
-            Self.writeSessionJSONDataOnQueue(snapData, in: dir)
+        detectionScheduler.scheduleAfterPendingWork { [writerQueue] in
+            writerQueue.async {
+                try? engine?.finishStreamsAndCloseFiles()
+                Self.writeSessionJSONDataOnQueue(snapData, in: dir, registry: engine?.digestRegistry)
+            }
         }
     }
 
     /// Handle backgrounding or session interruption by finishing streams, writing `status: "interrupted"`,
-    /// and sealing `manifest.json` + `.zip` inside a UIKit background task (`YS-08`, Blocker 1).
+    /// and sealing `manifest.json` + `.zip` inside a UIKit background task (`YS-08`, `YS-84`, Blocker 1).
     public func handleInterruption(stopReason: String) {
         guard phase == .recording, let dir = captureDirURL, let engine = writerEngine else { return }
         phase = .sealing
-        UIApplication.shared.isIdleTimerDisabled = false
+        sealingProgress = 0.0
+        sealingStatusText = "Saving your walk"
+        // Keep idle timer disabled until `.zip` finishes (`YS-84`)
+        UIApplication.shared.isIdleTimerDisabled = true
         #if canImport(ARKit)
         arSession.pause()
         #endif
@@ -770,28 +875,44 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
 
         beginSealingBackgroundTask(name: "YardstickSealInterrupted")
         let snapData = makeSessionJSONData(status: "interrupted", stopReason: stopReason, failedStream: nil)
-        writerQueue.async { [weak self] in
-            try? engine.finishStreamsAndCloseFiles()
-            Self.writeSessionJSONDataOnQueue(snapData, in: dir)
-            let zipURL = try? Self.sealManifestAndPackZip(in: dir)
-            Task { @MainActor in
-                if let self {
+        detectionScheduler.scheduleAfterPendingWork { [weak self] in
+            guard let self else { return }
+            self.writerQueue.async { [weak self] in
+                guard let self else { return }
+                try? engine.finishStreamsAndCloseFiles()
+                Self.writeSessionJSONDataOnQueue(snapData, in: dir, registry: engine.digestRegistry)
+                let precomputed = engine.digestRegistry.snapshot()
+                let zipURL = try? Self.sealManifestAndPackZip(
+                    in: dir,
+                    precomputedDigests: precomputed
+                ) { [self] frac, label in
+                    Task { @MainActor [self] in
+                        self.sealingProgress = frac
+                        self.sealingStatusText = label
+                    }
+                }
+                Task { @MainActor [self] in
+                    self.sealingProgress = 1.0
                     self.archiveZipURL = zipURL
                     self.phase = .completed
                     self.statusBanner = "Capture interrupted (\(stopReason)) — partial archive sealed"
+                    UIApplication.shared.isIdleTimerDisabled = false
                     self.endSealingBackgroundTask()
                 }
             }
         }
     }
 
-    /// Cleanly stop the recording, finish `rgb.mp4`, hash all streams (`Q022`), write `manifest.json`, and build the store-mode `.zip` (`YS-21`, `YS-22`).
+    /// Cleanly stop the recording, finish `rgb.mp4`, seal `manifest.json` using incremental digests (`YS-84`), and build the store-mode `.zip` (`YS-21`, `YS-22`, `YS-84`).
     public func stopAndSealCapture() {
         guard let dir = captureDirURL, phase == .recording, let engine = writerEngine else { return }
-        UIApplication.shared.isIdleTimerDisabled = false
+        // Keep the screen awake with a determinate "Saving your walk" progress bar until `.zip` finishes (`YS-84`)
+        UIApplication.shared.isIdleTimerDisabled = true
         logEvent(kind: "done", detail: "User tapped Done")
         phase = .sealing
-        statusBanner = "Sealing manifest.json and building capture archive…"
+        sealingProgress = 0.0
+        sealingStatusText = "Saving your walk"
+        statusBanner = "Saving your walk — sealing manifest.json and building capture archive…"
 
         #if canImport(ARKit)
         arSession.pause()
@@ -803,23 +924,37 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         updateProvisionalGrade()
         let snapData = makeSessionJSONData(status: "stopped", stopReason: "user_done", failedStream: nil)
 
-        writerQueue.async { [weak self] in
+        detectionScheduler.scheduleAfterPendingWork { [weak self] in
             guard let self else { return }
-            do {
-                try engine.finishStreamsAndCloseFiles()
-                Self.writeSessionJSONDataOnQueue(snapData, in: dir)
-                let zipURL = try Self.sealManifestAndPackZip(in: dir)
-                Task { @MainActor in
-                    self.archiveZipURL = zipURL
-                    self.phase = .completed
-                    self.statusBanner = "Capture sealed — Grade \(self.provisionalGrade)"
-                    self.endSealingBackgroundTask()
-                }
-            } catch {
-                let errMsg = error.localizedDescription
-                Task { @MainActor in
-                    self.handleStreamFailure(stream: "manifest", message: errMsg)
-                    self.endSealingBackgroundTask()
+            self.writerQueue.async { [weak self] in
+                guard let self else { return }
+                do {
+                    try engine.finishStreamsAndCloseFiles()
+                    Self.writeSessionJSONDataOnQueue(snapData, in: dir, registry: engine.digestRegistry)
+                    let precomputed = engine.digestRegistry.snapshot()
+                    let zipURL = try Self.sealManifestAndPackZip(
+                        in: dir,
+                        precomputedDigests: precomputed
+                    ) { [self] frac, label in
+                        Task { @MainActor [self] in
+                            self.sealingProgress = frac
+                            self.sealingStatusText = label
+                        }
+                    }
+                    Task { @MainActor [self] in
+                        self.sealingProgress = 1.0
+                        self.archiveZipURL = zipURL
+                        self.phase = .completed
+                        self.statusBanner = "Capture sealed — Grade \(self.provisionalGrade)"
+                        UIApplication.shared.isIdleTimerDisabled = false
+                        self.endSealingBackgroundTask()
+                    }
+                } catch {
+                    let errMsg = error.localizedDescription
+                    Task { @MainActor [self] in
+                        self.handleStreamFailure(stream: "manifest", message: errMsg)
+                        self.endSealingBackgroundTask()
+                    }
                 }
             }
         }
@@ -967,9 +1102,21 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return try? JSONSerialization.data(withJSONObject: dict, options: [.prettyPrinted, .sortedKeys])
     }
 
-    nonisolated private static func writeSessionJSONDataOnQueue(_ data: Data?, in dir: URL) {
+    nonisolated private static func writeSessionJSONDataOnQueue(
+        _ data: Data?,
+        in dir: URL,
+        registry: PrecomputedDigestRegistry? = nil
+    ) {
         guard let data else { return }
-        try? data.write(to: dir.appendingPathComponent("session.json"), options: .atomic)
+        do {
+            try data.write(to: dir.appendingPathComponent("session.json"), options: .atomic)
+            if let registry {
+                let meta = IncrementalByteDigest.compute(for: data)
+                registry.record(meta, forRelativePath: "session.json")
+            }
+        } catch {
+            // Ignored on heartbeat; final seal checks files directly
+        }
     }
 
     /// Stream-compute SHA-256, table-driven CRC-32, and exact byte size in 64 KB chunks so large videos
@@ -1024,7 +1171,16 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return rel.isEmpty ? nil : rel
     }
 
-    nonisolated public static func sealManifestAndPackZip(in dir: URL) throws -> URL {
+    /// Seal `manifest.json` and build the store-mode `.zip` archive (`YS-21`, `YS-22`, `YS-84`).
+    ///
+    /// When `precomputedDigests` is provided (`YS-84`), files whose incremental SHA-256, CRC-32, and
+    /// byte size were computed as they were written are never re-opened or re-read during the manifest pass.
+    nonisolated public static func sealManifestAndPackZip(
+        in dir: URL,
+        precomputedDigests: [String: FileDigestMeta] = [:],
+        progressHandler: (@Sendable (Double, String) -> Void)? = nil
+    ) throws -> URL {
+        progressHandler?(0.02, "Saving your walk")
         let resolvedDir = dir.resolvingSymlinksInPath().standardizedFileURL
         let fm = FileManager.default
         let enumerator = fm.enumerator(at: resolvedDir, includingPropertiesForKeys: [.isRegularFileKey])
@@ -1038,7 +1194,20 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             }
             let vals = try fileURL.resourceValues(forKeys: [.isRegularFileKey])
             guard vals.isRegularFile == true else { continue }
-            let (hex, crc, sizeBytes) = try Self.streamHashAndCRC32(of: fileURL)
+
+            let hex: String
+            let crc: UInt32
+            let sizeBytes: UInt64
+            if let pre = precomputedDigests[rel] {
+                hex = pre.sha256
+                crc = pre.crc32
+                sizeBytes = pre.sizeBytes
+            } else {
+                let computed = try Self.streamHashAndCRC32(of: fileURL)
+                hex = computed.sha256
+                crc = computed.crc32
+                sizeBytes = computed.sizeBytes
+            }
             filesArray.append([
                 "path": rel,
                 "size_bytes": sizeBytes,
@@ -1047,6 +1216,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             precomputedCRCByRelPath[rel] = (crc, sizeBytes)
         }
         filesArray.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
+        progressHandler?(0.15, "Saving your walk")
 
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
@@ -1063,21 +1233,25 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let manifestURL = resolvedDir.appendingPathComponent("manifest.json")
         let manifestData = try JSONSerialization.data(withJSONObject: manifestObj, options: [.prettyPrinted, .sortedKeys])
         try manifestData.write(to: manifestURL, options: .atomic)
-        let (_, manifestCRC, manifestSize) = try Self.streamHashAndCRC32(of: manifestURL)
-        precomputedCRCByRelPath["manifest.json"] = (manifestCRC, manifestSize)
+        let manifestMeta = IncrementalByteDigest.compute(for: manifestData)
+        precomputedCRCByRelPath["manifest.json"] = (manifestMeta.crc32, manifestMeta.sizeBytes)
 
         let zipURL = resolvedDir.deletingLastPathComponent().appendingPathComponent("\(resolvedDir.lastPathComponent).zip")
         try Self.writeStoreModeZipArchive(
             sourceDir: resolvedDir,
             destinationZipURL: zipURL,
-            precomputedMeta: precomputedCRCByRelPath
+            precomputedMeta: precomputedCRCByRelPath,
+            progressHandler: { zipFrac, label in
+                let combined = 0.15 + 0.85 * min(1.0, max(0.0, zipFrac))
+                progressHandler?(combined, label)
+            }
         )
+        progressHandler?(1.0, "Saving your walk")
         return zipURL
     }
 
-    /// Encode 16-bit depth millimetres (`[UInt16]`) into a 16-bit linear grayscale PNG (`YS-04`).
-    @discardableResult
-    nonisolated public static func writeDepth16BitPNG(_ pixels: [UInt16], width: Int, height: Int, to url: URL) -> Bool {
+    /// Encode 16-bit depth millimetres (`[UInt16]`) into in-memory PNG `Data` (`YS-04`, `YS-84`).
+    nonisolated public static func encodeDepth16BitPNGData(_ pixels: [UInt16], width: Int, height: Int) -> Data? {
         let bigEndian = pixels.map { $0.bigEndian }
         let data = bigEndian.withUnsafeBytes { Data($0) } as CFData
         guard let provider = CGDataProvider(data: data),
@@ -1095,17 +1269,44 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                   shouldInterpolate: false,
                   intent: .defaultIntent
               ),
-              let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+              let outData = CFDataCreateMutable(kCFAllocatorDefault, 0),
+              let dest = CGImageDestinationCreateWithData(outData, UTType.png.identifier as CFString, 1, nil)
         else {
-            return false
+            return nil
         }
         CGImageDestinationAddImage(dest, cgImg, nil)
-        return CGImageDestinationFinalize(dest)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return outData as Data
     }
 
-    /// Encode 8-bit LiDAR confidence levels (`0, 1, 2`) into an 8-bit linear grayscale PNG (`YS-04`).
+    /// Encode 16-bit depth millimetres (`[UInt16]`) into a 16-bit linear grayscale PNG and optionally
+    /// record its incremental SHA-256 + CRC-32 digest in memory (`YS-04`, `YS-84`).
     @discardableResult
-    nonisolated public static func writeConfidence8BitPNG(_ pixels: [UInt8], width: Int, height: Int, to url: URL) -> Bool {
+    nonisolated public static func writeDepth16BitPNG(
+        _ pixels: [UInt16],
+        width: Int,
+        height: Int,
+        to url: URL,
+        registry: PrecomputedDigestRegistry? = nil,
+        relativePath: String? = nil
+    ) -> Bool {
+        guard let pngData = encodeDepth16BitPNGData(pixels, width: width, height: height) else {
+            return false
+        }
+        do {
+            try pngData.write(to: url)
+            if let registry, let relativePath {
+                let meta = IncrementalByteDigest.compute(for: pngData)
+                registry.record(meta, forRelativePath: relativePath)
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Encode 8-bit LiDAR confidence levels (`0, 1, 2`) into in-memory PNG `Data` (`YS-04`, `YS-84`).
+    nonisolated public static func encodeConfidence8BitPNGData(_ pixels: [UInt8], width: Int, height: Int) -> Data? {
         let data = Data(pixels) as CFData
         guard let provider = CGDataProvider(data: data),
               let cs = CGColorSpace(name: CGColorSpace.linearGray),
@@ -1122,12 +1323,40 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                   shouldInterpolate: false,
                   intent: .defaultIntent
               ),
-              let dest = CGImageDestinationCreateWithURL(url as CFURL, UTType.png.identifier as CFString, 1, nil)
+              let outData = CFDataCreateMutable(kCFAllocatorDefault, 0),
+              let dest = CGImageDestinationCreateWithData(outData, UTType.png.identifier as CFString, 1, nil)
         else {
-            return false
+            return nil
         }
         CGImageDestinationAddImage(dest, cgImg, nil)
-        return CGImageDestinationFinalize(dest)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return outData as Data
+    }
+
+    /// Encode 8-bit LiDAR confidence levels (`0, 1, 2`) into an 8-bit linear grayscale PNG and optionally
+    /// record its incremental SHA-256 + CRC-32 digest in memory (`YS-04`, `YS-84`).
+    @discardableResult
+    nonisolated public static func writeConfidence8BitPNG(
+        _ pixels: [UInt8],
+        width: Int,
+        height: Int,
+        to url: URL,
+        registry: PrecomputedDigestRegistry? = nil,
+        relativePath: String? = nil
+    ) -> Bool {
+        guard let pngData = encodeConfidence8BitPNGData(pixels, width: width, height: height) else {
+            return false
+        }
+        do {
+            try pngData.write(to: url)
+            if let registry, let relativePath {
+                let meta = IncrementalByteDigest.compute(for: pngData)
+                registry.record(meta, forRelativePath: relativePath)
+            }
+            return true
+        } catch {
+            return false
+        }
     }
 
     /// Copy an NV12 `CVPixelBuffer` synchronously into a newly allocated buffer so `ARFrame` is never retained (`YS-02`).
@@ -1204,11 +1433,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return out
     }
 
-    /// Streaming, table-CRC, ZIP64-capable `ZIP_STORED` (`compressionMethod = 0`) archiver (`YS-22`, Blocker 4).
+    /// Streaming, table-CRC, ZIP64-capable `ZIP_STORED` (`compressionMethod = 0`) archiver (`YS-22`, `YS-84`, Blocker 4).
     nonisolated public static func writeStoreModeZipArchive(
         sourceDir: URL,
         destinationZipURL: URL,
-        precomputedMeta: [String: (crc32: UInt32, sizeBytes: UInt64)] = [:]
+        precomputedMeta: [String: (crc32: UInt32, sizeBytes: UInt64)] = [:],
+        progressHandler: (@Sendable (Double, String) -> Void)? = nil
     ) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: destinationZipURL.path) {
@@ -1231,6 +1461,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             }
         }
         relPaths.sort()
+        let totalFiles = max(1, relPaths.count)
 
         struct CentralRecord {
             let nameData: Data
@@ -1242,7 +1473,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         var centralRecords: [CentralRecord] = []
         var offset: UInt64 = 0
 
-        for rel in relPaths {
+        for (fileIdx, rel) in relPaths.enumerated() {
             let fileURL = resolvedSourceDir.appendingPathComponent(rel)
             let meta: (crc32: UInt32, sizeBytes: UInt64)
             if let cached = precomputedMeta[rel] {
@@ -1312,6 +1543,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                 )
             )
             offset += UInt64(localHeader.count) + meta.sizeBytes
+            if fileIdx % 32 == 0 || fileIdx + 1 == totalFiles {
+                progressHandler?(Double(fileIdx + 1) / Double(totalFiles), "Saving your walk")
+            }
         }
 
         let centralStartOffset = offset
@@ -1629,8 +1863,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                 self.northSampleCount = self.northSamples.count
             }
 
-            // Backpressure guard before dispatching heavy frame buffers
-            let queueOverloaded = self.pendingWriterJobs > 8
+            // Atomic writer-side backpressure guard (`YS-68`) — never decremented through `@MainActor`
+            let (queueOverloaded, _) = self.writerBacklog.acquireSlot()
             let forceArUco = self.pendingForceMarkerDetect
             self.pendingForceMarkerDetect = false
             let sizesSnapshot = self.markerSizesMM
@@ -1650,13 +1884,15 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             if timestampS - self.lastHeartbeatS >= 5.0 {
                 self.lastHeartbeatS = timestampS
                 sessionHeartbeatData = self.makeSessionJSONData(status: "recording", stopReason: nil, failedStream: nil)
+                _ = self.checkMidWalkDiskSpace(recordedBytes: Int64(engine.digestRegistry.totalRecordedBytes))
             } else {
                 sessionHeartbeatData = nil
             }
 
-            self.pendingWriterJobs += 1
             self.writerQueue.async { [weak self] in
-                guard let self, !engine.isClosed else { return }
+                guard let self else { return }
+                defer { self.writerBacklog.releaseSlot() }
+                guard !engine.isClosed else { return }
                 let sp = Self.writerSignposter
                 let jobState = sp.beginInterval("WriterJob")
                 defer { sp.endInterval("WriterJob", jobState) }
@@ -1676,7 +1912,6 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         engine.droppedFrameCount += 1
                         let totalDropped = engine.droppedFrameCount + finalGapLines.count
                         Task { @MainActor in
-                            self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
                             self.droppedFrameCount = max(self.droppedFrameCount, totalDropped)
                         }
                         return
@@ -1687,7 +1922,6 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         try engine.appendLine(dropLine, to: engine.framesFH)
                         engine.droppedFrameCount += 1
                         Task { @MainActor in
-                            self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
                             self.droppedFrameCount += 1
                         }
                         return
@@ -1711,7 +1945,6 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         try engine.appendLine(dropLine, to: engine.framesFH)
                         engine.droppedFrameCount += 1
                         Task { @MainActor in
-                            self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
                             self.droppedFrameCount += 1
                         }
                         return
@@ -1749,10 +1982,26 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     sp.endInterval("CSVAppend", csvState)
 
                     let pngState = sp.beginInterval("DepthConfidencePNG")
-                    let depthURL = dir.appendingPathComponent(String(format: "depth/%06d.png", sIdx))
-                    let confURL = dir.appendingPathComponent(String(format: "confidence/%06d.png", sIdx))
-                    let depthOK = Self.writeDepth16BitPNG(dPixels, width: wD, height: hD, to: depthURL)
-                    let confOK = depthOK ? Self.writeConfidence8BitPNG(cPixels, width: wD, height: hD, to: confURL) : false
+                    let depthRelPath = String(format: "depth/%06d.png", sIdx)
+                    let confRelPath = String(format: "confidence/%06d.png", sIdx)
+                    let depthURL = dir.appendingPathComponent(depthRelPath)
+                    let confURL = dir.appendingPathComponent(confRelPath)
+                    let depthOK = Self.writeDepth16BitPNG(
+                        dPixels,
+                        width: wD,
+                        height: hD,
+                        to: depthURL,
+                        registry: engine.digestRegistry,
+                        relativePath: depthRelPath
+                    )
+                    let confOK = depthOK ? Self.writeConfidence8BitPNG(
+                        cPixels,
+                        width: wD,
+                        height: hD,
+                        to: confURL,
+                        registry: engine.digestRegistry,
+                        relativePath: confRelPath
+                    ) : false
                     sp.endInterval("DepthConfidencePNG", pngState)
                     guard depthOK else {
                         throw NSError(domain: "Yardstick", code: -33, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(depthURL.lastPathComponent)"])
@@ -1761,122 +2010,161 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         throw NSError(domain: "Yardstick", code: -34, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(confURL.lastPathComponent)"])
                     }
 
-                    // Run ArUco detector & periodic sharp still selector on `writerQueue`
-                    let shouldRunArUco = (sIdx % 3 == 0) || forceArUco
-                    let shouldConsiderPeriodicStill = (timestampS - engine.lastStillSavedTimeS) >= 2.0
-                    var detected3D: [DetectedMarkerSighting] = []
-                    var saveStillNow = false
+                    if let sessionHeartbeatData {
+                        Self.writeSessionJSONDataOnQueue(sessionHeartbeatData, in: dir, registry: engine.digestRegistry)
+                    }
 
+                    let newSavedCount = engine.savedFrameCount
+                    Task { @MainActor in
+                        self.latestSavedIndex = sIdx
+                        self.savedFrameCount = newSavedCount
+                    }
+
+                    // Offload ArUco detection, 3D plane measurement, rate-limited still gate (`YS-68`), and
+                    // JPEG encoding onto the single-slot `detectionScheduler` so `writerQueue` is never blocked!
+                    let shouldRunArUco = (sIdx % 3 == 0) || forceArUco
+                    let shouldConsiderPeriodicStill = (timestampS - engine.lastAnyStillTimeS) >= 2.0
                     if shouldRunArUco || shouldConsiderPeriodicStill {
-                        let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
-                        if let luma = Self.extractLumaBytes(from: rgbPB) {
-                            if shouldRunArUco {
-                                let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
-                                for d2 in dets2D {
-                                    let pSize = sizesSnapshot[d2.markerID] ?? 250.0
-                                    if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
-                                        markerID: d2.markerID,
-                                        cornersUV: d2.cornersUV,
-                                        printedSizeMM: pSize,
-                                        depthMapMM: dPixels,
-                                        confidenceMap: cPixels,
-                                        depthWidth: wD,
-                                        depthHeight: hD,
-                                        rgbWidth: rgbW,
-                                        rgbHeight: rgbH,
-                                        fx: fx,
-                                        fy: fy,
-                                        cx: cx,
-                                        cy: cy,
-                                        cameraToWorld: cMat
-                                    ) {
-                                        detected3D.append(s3D)
+                        self.detectionScheduler.submitIfIdle { [weak self] in
+                            guard let self, !engine.isClosed else { return }
+                            let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
+                            var detected3D: [DetectedMarkerSighting] = []
+                            var sharpnessVal: Double? = nil
+
+                            if let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
+                                if shouldRunArUco {
+                                    let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
+                                    for d2 in dets2D {
+                                        let pSize = sizesSnapshot[d2.markerID] ?? 250.0
+                                        if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
+                                            markerID: d2.markerID,
+                                            cornersUV: d2.cornersUV,
+                                            printedSizeMM: pSize,
+                                            depthMapMM: dPixels,
+                                            confidenceMap: cPixels,
+                                            depthWidth: wD,
+                                            depthHeight: hD,
+                                            rgbWidth: rgbW,
+                                            rgbHeight: rgbH,
+                                            fx: fx,
+                                            fy: fy,
+                                            cx: cx,
+                                            cy: cy,
+                                            cameraToWorld: cMat
+                                        ) {
+                                            detected3D.append(s3D)
+                                        }
+                                    }
+                                }
+                                if detected3D.isEmpty && shouldConsiderPeriodicStill {
+                                    sharpnessVal = ArUcoDetector.computeLaplacianSharpness(lumaBytes: luma, width: rgbW, height: rgbH)
+                                }
+                            }
+                            sp.endInterval("ArUcoDetectAndMeasure", detectState)
+
+                            let gateDecision = engine.evaluateStillGate(
+                                timestampS: timestampS,
+                                detectedMarkerIDs: detected3D.map(\.markerID),
+                                forceOperatorMarkerTap: forceArUco,
+                                sharpness: sharpnessVal
+                            )
+
+                            // Encode JPEG and compute SHA-256 + CRC-32 in memory on `detectionQueue` (`YS-68`, `YS-84`)
+                            var encodedStill: (relPath: String, data: Data, meta: FileDigestMeta, csvLine: String)? = nil
+                            if gateDecision.shouldSave {
+                                let stillState = sp.beginInterval("StillJPEGEncode")
+                                let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
+                                let ciImg = CIImage(cvPixelBuffer: sendableRGB.buffer)
+                                let cs = CGColorSpaceCreateDeviceRGB()
+                                if let jpegData = engine.detectionCIContext.jpegRepresentation(
+                                    of: ciImg,
+                                    colorSpace: cs,
+                                    options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]
+                                ) {
+                                    let meta = IncrementalByteDigest.compute(for: jpegData)
+                                    let sLine = String(
+                                        format: "%.6f,%d,%@,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
+                                        timestampS, sIdx, stillRelPath,
+                                        camPosW.x, camPosW.y, camPosW.z,
+                                        normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
+                                        fx, fy, cx, cy, rgbW, rgbH
+                                    )
+                                    encodedStill = (stillRelPath, jpegData, meta, sLine)
+                                }
+                                sp.endInterval("StillJPEGEncode", stillState)
+                            }
+
+                            var markerLines: [String] = []
+                            for m in detected3D {
+                                let mq = m.quaternionXYZW
+                                let c = m.cornersUV
+                                let mLine = String(
+                                    format: "%.6f,%d,%d,%.2f,%.3f,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                                    timestampS, sIdx, m.markerID,
+                                    m.sizeMMPrinted, m.sizeMMMeasured,
+                                    m.positionWorld.x, m.positionWorld.y, m.positionWorld.z,
+                                    mq.x, mq.y, mq.z, mq.w,
+                                    c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y
+                                )
+                                markerLines.append(mLine)
+                            }
+
+                            let finalDetected = detected3D
+                            let finalEncodedStill = encodedStill
+                            let finalMarkerLines = markerLines
+
+                            if finalEncodedStill != nil || !finalMarkerLines.isEmpty {
+                                self.writerQueue.async { [weak self] in
+                                    guard let self, !engine.isClosed else { return }
+                                    do {
+                                        if let still = finalEncodedStill, !engine.savedStillsIndices.contains(sIdx) {
+                                            let stillURL = dir.appendingPathComponent(still.relPath)
+                                            try still.data.write(to: stillURL)
+                                            engine.digestRegistry.record(still.meta, forRelativePath: still.relPath)
+                                            engine.savedStillsIndices.insert(sIdx)
+                                            try engine.appendLine(still.csvLine, to: engine.stillsFH)
+                                        }
+                                        for mLine in finalMarkerLines {
+                                            try engine.appendLine(mLine, to: engine.markersFH)
+                                        }
+                                    } catch {
+                                        let errMsg = error.localizedDescription
+                                        Task { @MainActor in
+                                            self.handleStreamFailure(stream: "stills", message: errMsg)
+                                        }
                                     }
                                 }
                             }
-                            if !detected3D.isEmpty {
-                                saveStillNow = true
-                            } else if shouldConsiderPeriodicStill {
-                                let sharpness = ArUcoDetector.computeLaplacianSharpness(lumaBytes: luma, width: rgbW, height: rgbH)
-                                if sharpness >= 12.0 || (timestampS - engine.lastStillSavedTimeS) >= 3.0 {
-                                    saveStillNow = true
+
+                            if !finalDetected.isEmpty {
+                                Task { @MainActor [weak self] in
+                                    guard let self, self.phase == .recording else { return }
+                                    let hadM0First = (self.phoneLoopState.marker0FirstPassPos != nil)
+                                    let updatedLoop = self.phoneLoopState.ingestSightings(
+                                        finalDetected,
+                                        timestampS: timestampS,
+                                        cameraPositionWorld: camPosW
+                                    )
+                                    self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
+                                    if !hadM0First && self.phoneLoopState.marker0FirstPassPos != nil {
+                                        if self.lowDiskSpaceWarning == nil {
+                                            self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
+                                        }
+                                    }
+                                    if updatedLoop, let gap = self.phoneLoopState.loopClosureGapMeters {
+                                        self.loopClosureGapMeters = gap
+                                        self.updateProvisionalGrade()
+                                        if self.lowDiskSpaceWarning == nil {
+                                            self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
+                                        }
+                                    }
                                 }
                             }
-                        }
-                        sp.endInterval("ArUcoDetectAndMeasure", detectState)
-                    }
-
-                    // Write still JPEG AND its `stills.csv` row atomically on `writerQueue` so no still is ever orphaned when sealing starts!
-                    if saveStillNow && !engine.savedStillsIndices.contains(sIdx) {
-                        let stillState = sp.beginInterval("StillJPEGWrite")
-                        defer { sp.endInterval("StillJPEGWrite", stillState) }
-                        let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
-                        let stillURL = dir.appendingPathComponent(stillRelPath)
-                        let ciImg = CIImage(cvPixelBuffer: rgbPB)
-                        let cs = CGColorSpaceCreateDeviceRGB()
-                        try engine.ciContext.writeJPEGRepresentation(
-                            of: ciImg,
-                            to: stillURL,
-                            colorSpace: cs,
-                            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]
-                        )
-                        engine.savedStillsIndices.insert(sIdx)
-                        engine.lastStillSavedTimeS = timestampS
-                        let sLine = String(
-                            format: "%.6f,%d,%@,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
-                            timestampS, sIdx, stillRelPath,
-                            camPosW.x, camPosW.y, camPosW.z,
-                            normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
-                            fx, fy, cx, cy, rgbW, rgbH
-                        )
-                        try engine.appendLine(sLine, to: engine.stillsFH)
-                    }
-
-                    for m in detected3D {
-                        let mq = m.quaternionXYZW
-                        let c = m.cornersUV
-                        let mLine = String(
-                            format: "%.6f,%d,%d,%.2f,%.3f,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
-                            timestampS, sIdx, m.markerID,
-                            m.sizeMMPrinted, m.sizeMMMeasured,
-                            m.positionWorld.x, m.positionWorld.y, m.positionWorld.z,
-                            mq.x, mq.y, mq.z, mq.w,
-                            c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y
-                        )
-                        try engine.appendLine(mLine, to: engine.markersFH)
-                    }
-
-                    if let sessionHeartbeatData {
-                        Self.writeSessionJSONDataOnQueue(sessionHeartbeatData, in: dir)
-                    }
-
-                    let finalDetected = detected3D
-                    let newSavedCount = engine.savedFrameCount
-                    Task { @MainActor in
-                        self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
-                        self.latestSavedIndex = sIdx
-                        self.savedFrameCount = newSavedCount
-
-                        let hadM0First = (self.phoneLoopState.marker0FirstPassPos != nil)
-                        let updatedLoop = self.phoneLoopState.ingestSightings(
-                            finalDetected,
-                            timestampS: timestampS,
-                            cameraPositionWorld: camPosW
-                        )
-                        self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
-                        if !hadM0First && self.phoneLoopState.marker0FirstPassPos != nil {
-                            self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
-                        }
-                        if updatedLoop, let gap = self.phoneLoopState.loopClosureGapMeters {
-                            self.loopClosureGapMeters = gap
-                            self.updateProvisionalGrade()
-                            self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
                         }
                     }
                 } catch {
                     let errMsg = error.localizedDescription
                     Task { @MainActor in
-                        self.pendingWriterJobs = max(0, self.pendingWriterJobs - 1)
                         self.handleStreamFailure(stream: "rgb_video", message: errMsg)
                     }
                 }
