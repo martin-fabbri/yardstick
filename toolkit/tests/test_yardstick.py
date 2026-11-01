@@ -862,7 +862,7 @@ def test_ys65_symlinked_var_path_manifest_seal_and_180mm_persistence(
     assert "resolvingSymlinksInPath().standardizedFileURL" in swift_src
     assert 'replacingOccurrences(of: dir.path + "/"' not in swift_src
     assert 'replacingOccurrences(of: sourceDir.path + "/"' not in swift_src
-    assert "0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 250.0, 5: 250.0" in swift_src
+    assert "0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 180.0" in swift_src
     assert "io.buildnexus.yardstick.markerSizesMM" in swift_src
 
 
