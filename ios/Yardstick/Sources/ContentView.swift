@@ -61,6 +61,9 @@ public struct ContentView: View {
     @StateObject private var recorder = CaptureSessionRecorder()
     @State private var showTapeBKeypad = false
     @State private var tapeMetersInput = "5.00"
+    @State private var preWalkTapeInput = ""
+    @State private var customPrintSizeCMInput = "18.0"
+    @State private var showPrintCustomSizeField = false
     @State private var tapeRoleInput = "primary"
     @State private var showNoteDialog = false
     @State private var noteTextInput = ""
@@ -110,81 +113,181 @@ public struct ContentView: View {
     }
 
     private var setupView: some View {
-        VStack(spacing: 20) {
-            Text("Yardstick")
-                .font(.largeTitle.bold())
-                .foregroundStyle(.white)
-
-            Text("Calibrated iPhone LiDAR Yard Capture (yardstick-capture/1)")
-                .font(.subheadline)
-                .foregroundStyle(.gray)
-                .multilineTextAlignment(.center)
-
-            if !CaptureSessionRecorder.isLiDARSupported {
-                HStack {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.yellow)
-                    Text("LiDAR sensor required on physical iPhone Pro / Pro Max (YS-00)")
-                        .font(.footnote)
-                        .foregroundStyle(.yellow)
-                }
-                .padding(10)
-                .background(Color.white.opacity(0.08))
-                .clipShape(.rect(cornerRadius: 8))
-            }
-
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Printed Marker Edge Size (tap to toggle 250 mm / 180 mm)")
-                    .font(.headline)
+        ScrollView {
+            VStack(spacing: 18) {
+                Text("Before You Start")
+                    .font(.largeTitle.bold())
                     .foregroundStyle(.white)
 
-                ForEach(0..<6, id: \.self) { mid in
-                    let sizeMM = Int(recorder.markerSizesMM[mid] ?? 250.0)
-                    Button {
-                        recorder.toggleMarkerSize(for: mid)
-                    } label: {
-                        HStack {
-                            Text(mid == 0 ? "Marker 0 (Origin & Loop Closure)" : "Marker \(mid)")
-                                .font(.body.weight(.medium))
+                if !CaptureSessionRecorder.isLiDARSupported {
+                    HStack {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.yellow)
+                        Text("This iPhone Can't Measure Yards — LiDAR sensor required on iPhone Pro / Pro Max")
+                            .font(.footnote)
+                            .foregroundStyle(.yellow)
+                    }
+                    .padding(10)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(.rect(cornerRadius: 8))
+                }
+
+                // YS-76: Pre-flight readiness rows (Daylight, Storage >= 10 GB, Battery, Heat, Lens Smudge, Print Card, Tape)
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(recorder.preFlightReport.visibleRows, id: \.id) { row in
+                        HStack(alignment: .top, spacing: 10) {
+                            Image(systemName: preFlightSymbol(for: row.state))
+                                .foregroundStyle(preFlightColor(for: row.state))
+                                .font(.body.bold())
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(row.title)
+                                    .font(.subheadline.bold())
+                                    .foregroundStyle(.white)
+                                Text(row.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.gray)
+                            }
                             Spacer()
-                            Text("\(sizeMM) mm")
-                                .font(.body.monospacedDigit().bold())
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(sizeMM == 250 ? Color.blue.opacity(0.35) : Color.orange.opacity(0.35))
-                                .clipShape(.rect(cornerRadius: 6))
+                            if row.id == "lens", row.actionTitle != nil {
+                                Button("Check Again") {
+                                    _ = recorder.evaluatePreFlightChecklist(overrideLensProbe: nil)
+                                }
+                                .font(.caption.bold())
+                                .buttonStyle(.borderedProminent)
+                            } else if row.id == "print_check" && !recorder.isPrintSizeConfirmed {
+                                HStack(spacing: 6) {
+                                    Button("Yes") {
+                                        recorder.isPrintSizeConfirmed = true
+                                    }
+                                    .font(.caption.bold())
+                                    .buttonStyle(.borderedProminent)
+                                    Button("No, It Measures…") {
+                                        showPrintCustomSizeField.toggle()
+                                    }
+                                    .font(.caption)
+                                    .buttonStyle(.bordered)
+                                }
+                            } else if row.id == "storage" && row.state == .block {
+                                if let settingsURL = URL(string: UIApplication.openSettingsURLString) {
+                                    Link("Open Settings", destination: settingsURL)
+                                        .font(.caption.bold())
+                                }
+                            }
                         }
-                        .foregroundStyle(.white)
                         .padding(.vertical, 4)
                     }
+
+                    if showPrintCustomSizeField {
+                        HStack(spacing: 8) {
+                            TextField("18.0", text: $customPrintSizeCMInput)
+                                .keyboardType(.decimalPad)
+                                .textFieldStyle(.roundedBorder)
+                            Text("cm")
+                                .font(.caption)
+                                .foregroundStyle(.gray)
+                            Button("Save Size") {
+                                if let cm = Double(customPrintSizeCMInput), cm >= 8.0 && cm <= 40.0 {
+                                    recorder.setAllMarkersPrintedSizeMM(cm * 10.0)
+                                    recorder.isPrintSizeConfirmed = true
+                                    showPrintCustomSizeField = false
+                                }
+                            }
+                            .font(.caption.bold())
+                            .buttonStyle(.borderedProminent)
+                        }
+                    }
+                }
+                .padding()
+                .background(Color.white.opacity(0.06))
+                .clipShape(.rect(cornerRadius: 12))
+
+                // YS-77: Centre-to-centre Marker 0 -> Marker 1 pre-walk tape measurement (nothing typed during the walk)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Tape measurement (Marker 0 to Marker 1 centre-to-centre)")
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                    HStack(spacing: 10) {
+                        TextField("e.g. 4.21", text: $preWalkTapeInput)
+                            .keyboardType(.decimalPad)
+                            .padding(8)
+                            .background(Color.white.opacity(0.10))
+                            .clipShape(.rect(cornerRadius: 8))
+                            .onChange(of: preWalkTapeInput) { _, newValue in
+                                if let val = Double(newValue), val > 0 {
+                                    recorder.setPreWalkTapeMeters0To1(val)
+                                } else if newValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                                    recorder.setPreWalkTapeMeters0To1(nil)
+                                }
+                            }
+                        Text("m")
+                            .font(.body.bold())
+                            .foregroundStyle(.gray)
+                    }
+                }
+                .padding()
+                .background(Color.white.opacity(0.06))
+                .clipShape(.rect(cornerRadius: 12))
+
+                // YS-80 #3 & YS-75: Uniform marker size setting (sets every marker ID) and Voice Coach toggle
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("Marker Size")
+                            .font(.subheadline.bold())
+                            .foregroundStyle(.white)
+                        Spacer()
+                        let currentSizeMM = Int((recorder.markerSizesMM[0] ?? 180.0).rounded())
+                        Picker("Marker Size", selection: Binding(
+                            get: { currentSizeMM == 250 ? 250 : 180 },
+                            set: { newMM in
+                                recorder.setAllMarkersPrintedSizeMM(Double(newMM))
+                            }
+                        )) {
+                            Text("18 cm (standard)").tag(180)
+                            Text("25 cm").tag(250)
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(maxWidth: 220)
+                    }
+
+                    Toggle("Voice Coach", isOn: $recorder.isVoiceCoachEnabled)
+                        .font(.subheadline.bold())
+                        .foregroundStyle(.white)
+                }
+                .padding()
+                .background(Color.white.opacity(0.06))
+                .clipShape(.rect(cornerRadius: 12))
+
+                Text("Stops you: too dark, no space, too hot.")
+                    .font(.caption)
+                    .foregroundStyle(.gray)
+
+                let canStart = CaptureSessionRecorder.isLiDARSupported && recorder.preFlightReport.canStartWalk
+                Button {
+                    recorder.requestPermissionsAndStart()
+                } label: {
+                    Text(CaptureSessionRecorder.isLiDARSupported ? "Start Walk" : "This iPhone Can't Measure Yards")
+                        .font(.headline)
+                        .foregroundStyle(.black)
+                        .frame(maxWidth: .infinity)
+                        .padding()
+                        .background(canStart ? Color.green : Color.gray)
+                        .clipShape(.rect(cornerRadius: 12))
+                }
+                .disabled(!canStart)
+
+                Button {
+                    showAboutSheet = true
+                } label: {
+                    Label("About & Open-Source Licences", systemImage: "info.circle")
+                        .font(.footnote)
+                        .foregroundStyle(.gray)
                 }
             }
-            .padding()
-            .background(Color.white.opacity(0.06))
-            .clipShape(.rect(cornerRadius: 12))
-
-            Button {
-                recorder.requestPermissionsAndStart()
-            } label: {
-                Text(CaptureSessionRecorder.isLiDARSupported ? "Start Yard Walk" : "LiDAR Required (YS-00)")
-                    .font(.headline)
-                    .foregroundStyle(.black)
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(CaptureSessionRecorder.isLiDARSupported ? Color.green : Color.gray)
-                    .clipShape(.rect(cornerRadius: 12))
-            }
-            .disabled(!CaptureSessionRecorder.isLiDARSupported)
-
-            Button {
-                showAboutSheet = true
-            } label: {
-                Label("About & Open-Source Licences", systemImage: "info.circle")
-                    .font(.footnote)
-                    .foregroundStyle(.gray)
-            }
+            .padding(24)
         }
-        .padding(24)
+        .onAppear {
+            _ = recorder.evaluatePreFlightChecklist()
+        }
         .sheet(isPresented: $showAboutSheet) {
             NavigationStack {
                 ScrollView {
@@ -210,6 +313,24 @@ public struct ContentView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func preFlightSymbol(for state: PreFlightCheckState) -> String {
+        switch state {
+        case .pass: return "checkmark.circle.fill"
+        case .warn: return "exclamationmark.triangle.fill"
+        case .block: return "xmark.octagon.fill"
+        case .hidden: return "circle"
+        }
+    }
+
+    private func preFlightColor(for state: PreFlightCheckState) -> Color {
+        switch state {
+        case .pass: return .green
+        case .warn: return .yellow
+        case .block: return .red
+        case .hidden: return .gray
         }
     }
 

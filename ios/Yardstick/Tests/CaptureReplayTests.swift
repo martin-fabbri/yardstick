@@ -847,6 +847,302 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertEqual(seriousHolding.recordingFPS, 30)
     }
 
+    /// `YS-75`: Always-on unit test verifying Voice Coach rules:
+    /// - speaks fixed phrases only for `"Locked"`, phase changes, and non-counting corrections,
+    /// - never speaks during hold counting (`hold_steady`, segments `1 -> 2 -> 3`),
+    /// - speaks `"Hold steady."` on `hold_paused_moving` only after `>= 2.0 s` of pause,
+    /// - speaks marker digits as words (`"zero"`, `"one"`, `"two"`, `"three"`),
+    /// - suppresses all speech while a voice note is recording.
+    func testYS75_VoiceCoach_SpeaksFixedPhrasesOnlyForLocksAndPhaseChangesNeverCountsAndSuppressesDuringVoiceNotes() {
+        var engine = GuidedCaptureEngine(requireLookUpStep: true)
+
+        func makeSighting(id: Int, pos: SIMD3<Double>, range: Double = 1.0) -> DetectedMarkerSighting {
+            DetectedMarkerSighting(
+                markerID: id,
+                cornersUV: [
+                    SIMD2<Double>(400, 300),
+                    SIMD2<Double>(600, 300),
+                    SIMD2<Double>(600, 500),
+                    SIMD2<Double>(400, 500),
+                ],
+                positionWorld: pos,
+                quaternionXYZW: SIMD4<Double>(0, 0, 0, 1),
+                sizeMMPrinted: 180.0,
+                sizeMMMeasured: 180.0,
+                rangeMeters: range,
+                viewingAngleDeg: 15.0
+            )
+        }
+
+        // 1. Initial frame speaks "Stand over marker zero and point at it."
+        _ = engine.step(
+            timestampS: 0.0,
+            savedIndex: 0,
+            dt: 0.033,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2,
+            cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+            confirmedSightings: [],
+            rawSightings: [],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.lastSpokenPhraseThisStep, "Stand over marker zero and point at it.")
+
+        // 2. First confirmed still on Marker 0 -> glass shows "Hold steady", voice MUST BE SILENT (never speak counts!)
+        _ = engine.step(
+            timestampS: 1.0,
+            savedIndex: 30,
+            dt: 0.033,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2,
+            cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+            confirmedSightings: [makeSighting(id: 0, pos: .zero)],
+            rawSightings: [makeSighting(id: 0, pos: .zero)],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.activeInstruction, "Hold steady")
+        XCTAssertNil(engine.lastSpokenPhraseThisStep, "YS-75: Hold counting must never speak")
+
+        // 3. Second confirmed still -> still silent!
+        _ = engine.step(
+            timestampS: 1.5,
+            savedIndex: 45,
+            dt: 0.50,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2,
+            cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+            confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.005, 0, 0))],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.005, 0, 0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertNil(engine.lastSpokenPhraseThisStep, "YS-75: Segment 2 count must never speak")
+
+        // 4. Third confirmed still locks Marker 0 -> speaks "Got it. Every marker works like that."
+        _ = engine.step(
+            timestampS: 2.1,
+            savedIndex: 63,
+            dt: 0.60,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2,
+            cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+            confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.010, 0, 0))],
+            rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.010, 0, 0))],
+            unifiedLoopClosed: false
+        )
+        XCTAssertEqual(engine.lastSpokenPhraseThisStep, "Got it. Every marker works like that.")
+
+        // 5. While recording a voice note, NO voice coach lines may be spoken
+        engine.setRecordingVoiceNote(true, at: 3.0)
+        XCTAssertNil(engine.lastSpokenPhraseThisStep, "YS-75: Starting a voice note must be silent")
+        _ = engine.step(
+            timestampS: 4.0,
+            savedIndex: 120,
+            dt: 1.0,
+            trackingState: "normal",
+            pitchDeg: -30.0,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2,
+            cameraPositionWorld: SIMD3<Double>(2, 1.2, 0.5),
+            confirmedSightings: [],
+            rawSightings: [],
+            unifiedLoopClosed: false,
+            thermalLevel: .serious
+        )
+        XCTAssertNil(engine.lastSpokenPhraseThisStep, "YS-75: Voice coach must remain completely silent while a note records")
+        engine.setRecordingVoiceNote(false, at: 4.1)
+
+        // 6. Verify fixed phrase catalog for marker words and once-per-walk warnings
+        XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "locked_marker_2"), "Got marker two.")
+        XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "walk_to_marker_3"), "Now walk to marker three.")
+        XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "return_marker_0"), "That's all of them. Head back to marker zero.")
+        XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "all_done_finish"), "You're back at the start. All done.")
+        XCTAssertNil(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "hold_paused_moving", holdPausedDurationS: 1.2))
+        XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "hold_paused_moving", holdPausedDurationS: 2.1), "Hold steady.")
+        XCTAssertNil(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "storage_low", alreadySpokenOnceKeys: ["storage_low"]))
+    }
+
+    /// `YS-76`: Always-on unit test verifying Pre-Flight Checklist and Stable-Frame Lens Smudge Detector:
+    /// - `< 10 GB` free blocks start with `"Free up 10 GB to start."` (`YS-80` #4),
+    /// - a thumb/smudge on the lens on a stable frame triggers the smudge warning card,
+    /// - a clean lens at dusk while moving does NOT trigger the smudge warning card,
+    /// - refusing Location falls back to the exposure probe and never blocks start.
+    func testYS76_PreFlightChecklist_BlocksUnder10GBDetectsSmudgeOnStableFrameOnlyAndAllowsStartWhenLocationRefused() {
+        // 1. Storage < 10 GB blocks Start Walk ("Free up 10 GB to start.")
+        let lowSpaceReport = PreFlightChecklistEvaluator.evaluate(
+            availableDiskBytes: 8_500_000_000,
+            batteryLevelFraction: 0.85,
+            thermalLevel: .nominal,
+            exposureDurationS: 0.005,
+            iso: 100.0,
+            isLocationAuthorized: true
+        )
+        XCTAssertFalse(lowSpaceReport.canStartWalk, "YS-76: < 10 GB free must block Start Walk")
+        XCTAssertEqual(lowSpaceReport.storageRow.state, .block)
+        XCTAssertEqual(lowSpaceReport.storageRow.detail, "Free up 10 GB to start.")
+
+        // 2. Thumb / heavy smudge on lens on a STABLE frame triggers the smudge card
+        let w = 64
+        let h = 48
+        let thumbLuma = [UInt8](repeating: 42, count: w * h)
+        let thumbProbe = LensSmudgeDetector.evaluate(
+            lumaBytes: thumbLuma,
+            width: w,
+            height: h,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2,
+            cameraVelocityMps: 0.01
+        )
+        XCTAssertTrue(thumbProbe.isStableFrame)
+        XCTAssertTrue(thumbProbe.isSmudged, "YS-76: Uniform/blurred thumb frame on a stable camera must flag lens smudge")
+        let thumbReport = PreFlightChecklistEvaluator.evaluate(
+            availableDiskBytes: 20_000_000_000,
+            batteryLevelFraction: 0.85,
+            thermalLevel: .nominal,
+            exposureDurationS: 0.010,
+            iso: 200.0,
+            isLocationAuthorized: true,
+            lensProbe: thumbProbe
+        )
+        XCTAssertEqual(thumbReport.lensRow.state, .warn)
+        XCTAssertEqual(thumbReport.lensRow.title, "Lens looks smudged")
+
+        // 3. Clean lens at dusk WHILE MOVING (`turnRateRadS = 0.35`, `predictedBlurPx = 2.8`) must NOT trigger the smudge card
+        let movingDuskProbe = LensSmudgeDetector.evaluate(
+            lumaBytes: thumbLuma,
+            width: w,
+            height: h,
+            turnRateRadS: 0.35,
+            predictedBlurPx: 2.8,
+            cameraVelocityMps: 0.60
+        )
+        XCTAssertFalse(movingDuskProbe.isStableFrame, "YS-76: Moving frame must not be classified as stable")
+        XCTAssertFalse(movingDuskProbe.isSmudged, "YS-76: Clean lens at dusk while moving must never trigger the smudge card")
+
+        // 4. Clean lens with sharp detail on a stable frame passes (`isSmudged == false`)
+        var sharpLuma = [UInt8](repeating: 30, count: w * h)
+        for v in 0..<h {
+            for u in 0..<w where ((u / 2 + v / 2) % 2 == 0) {
+                sharpLuma[v * w + u] = 210
+            }
+        }
+        let sharpProbe = LensSmudgeDetector.evaluate(
+            lumaBytes: sharpLuma,
+            width: w,
+            height: h,
+            turnRateRadS: 0.02,
+            predictedBlurPx: 0.2
+        )
+        XCTAssertTrue(sharpProbe.isStableFrame)
+        XCTAssertFalse(sharpProbe.isSmudged)
+
+        // 5. Refusing Location (`isLocationAuthorized == false`) falls back to the exposure probe and NEVER blocks Start Walk
+        let refusedLocReport = PreFlightChecklistEvaluator.evaluate(
+            availableDiskBytes: 18_000_000_000,
+            batteryLevelFraction: 0.80,
+            thermalLevel: .nominal,
+            exposureDurationS: 0.055,
+            iso: 1200.0,
+            isLocationAuthorized: false
+        )
+        XCTAssertTrue(refusedLocReport.canStartWalk, "YS-76: Refusing Location must fall back to the exposure probe and never block")
+        XCTAssertNotEqual(refusedLocReport.daylightRow.state, .block)
+    }
+
+    /// `YS-77`: Always-on unit test verifying Pre-Walk Centre-to-Centre Tape Measurement (`Marker 0 -> Marker 1`):
+    /// - entered before the walk on the setup screen (`preWalkTapeMeters0To1`),
+    /// - once both Marker 0 and Marker 1 are locked, automatically writes a standard `session.json["tape_checks"]` entry
+    ///   from their locked 3D median positions with nothing typed during the walk,
+    /// - at `4–8 m` spacing (`6.00 m`), residual is `<= 3.0 cm` (`1.2 cm`).
+    func testYS77_PreWalkCentreToCentreTapeCheck_GeneratesSchemaValidEntryFromLockedMarker0And1WithResidualUnder3cm() {
+        var engine = GuidedCaptureEngine(requireLookUpStep: true, preWalkTapeMeters0To1: 6.00)
+        XCTAssertNil(engine.generatedMarker0To1TapeCheck, "YS-77: Tape check must not be generated before Markers 0 and 1 are locked")
+
+        func makeSighting(id: Int, pos: SIMD3<Double>) -> DetectedMarkerSighting {
+            DetectedMarkerSighting(
+                markerID: id,
+                cornersUV: [
+                    SIMD2<Double>(400, 300),
+                    SIMD2<Double>(600, 300),
+                    SIMD2<Double>(600, 500),
+                    SIMD2<Double>(400, 500),
+                ],
+                positionWorld: pos,
+                quaternionXYZW: SIMD4<Double>(0, 0, 0, 1),
+                sizeMMPrinted: 180.0,
+                sizeMMMeasured: 180.0,
+                rangeMeters: 1.0,
+                viewingAngleDeg: 14.0
+            )
+        }
+
+        // Lock Marker 0 at (0, 0, 0)
+        var t = 1.0
+        var sIdx = 10
+        for k in 0..<3 {
+            t += 0.55
+            sIdx += 16
+            _ = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 0.55,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.02,
+                predictedBlurPx: 0.2,
+                cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+                confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(Double(k - 1) * 0.002, 0, 0))],
+                rawSightings: [makeSighting(id: 0, pos: .zero)],
+                unifiedLoopClosed: false
+            )
+        }
+        XCTAssertTrue(engine.lockedMarkerIDs.contains(0))
+        XCTAssertNil(engine.generatedMarker0To1TapeCheck, "YS-77: Still waiting for Marker 1 to lock")
+
+        // Lock Marker 1 at (6.012, 0, 0) -> 6.012 m centre-to-centre (residual = 1.2 cm <= 3.0 cm)
+        for k in 0..<3 {
+            t += 0.55
+            sIdx += 16
+            _ = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 0.55,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.02,
+                predictedBlurPx: 0.2,
+                cameraPositionWorld: SIMD3<Double>(6.012, 1.2, 0.5),
+                confirmedSightings: [makeSighting(id: 1, pos: SIMD3<Double>(6.012 + Double(k - 1) * 0.002, 0, 0))],
+                rawSightings: [makeSighting(id: 1, pos: SIMD3<Double>(6.012, 0, 0))],
+                unifiedLoopClosed: false
+            )
+        }
+        XCTAssertTrue(engine.lockedMarkerIDs.contains(1))
+        guard let tapeEntry = engine.generatedMarker0To1TapeCheck else {
+            XCTFail("YS-77: generatedMarker0To1TapeCheck must be populated as soon as Markers 0 and 1 are both locked")
+            return
+        }
+        XCTAssertEqual(tapeEntry.id, 0)
+        XCTAssertEqual(tapeEntry.role, "primary")
+        XCTAssertEqual(tapeEntry.tapeM, 6.00, accuracy: 1e-6)
+        XCTAssertEqual(tapeEntry.measuredM, 6.012, accuracy: 1e-4)
+        XCTAssertLessThanOrEqual(tapeEntry.residualM, 0.030, "YS-77: Residual at 6 m spacing must be <= 3.0 cm")
+
+        let dict = tapeEntry.toJSONDictionary()
+        let requiredKeys: Set<String> = [
+            "id", "role", "t_a_s", "t_b_s", "saved_index_a", "saved_index_b",
+            "point_a_world_m", "point_b_world_m", "tape_m", "measured_m", "residual_m",
+        ]
+        XCTAssertEqual(Set(dict.keys), requiredKeys, "YS-77: Dictionary keys must match contract/session.schema.json:406-480")
+    }
+
     // MARK: - Full Walk 1–5 Local Suite (`YARDSTICK_REPLAY_ROOT`)
 
     /// `YS-66` / `YS-69` / `YS-70` / `YS-73`: Full Walk 5 (`2,865` frames, `455` stills) replay in `.liveDetectorOnStills` mode under `< 15 s`.

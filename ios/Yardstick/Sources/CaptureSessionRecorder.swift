@@ -516,6 +516,19 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     }
 }
 
+/// Route through which a `YS-75` voice coach line was delivered.
+public enum VoiceCoachOutputRoute: Sendable, Equatable {
+    case speechSynthesizer(String)
+    case voiceOverAnnouncement(String)
+
+    public var phrase: String {
+        switch self {
+        case .speechSynthesizer(let p), .voiceOverAnnouncement(let p):
+            return p
+        }
+    }
+}
+
 /// Crash-safe, zero-`ARFrame`-retention LiDAR capture session recorder (`YS-00`–`YS-14`, `YS-21`, `YS-22`, `YS-30`–`YS-33`, `YS-40`–`YS-44`, `YS-68`, `YS-84`).
 @MainActor
 public final class CaptureSessionRecorder: NSObject, ObservableObject {
@@ -572,29 +585,76 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var hapticDispatchCount: Int = 0
     public private(set) var dispatchedHaptics: [GuidedHapticEvent] = []
     @Published public private(set) var isRecordingVoiceNote: Bool = false
+    /// Voice coach toggle (`YS-75`, `DESIGN-SPEC-NATIVE.md` §3g).
+    @Published public var isVoiceCoachEnabled: Bool = true {
+        didSet {
+            guidedEngine.isVoiceCoachEnabled = isVoiceCoachEnabled
+            if !isVoiceCoachEnabled {
+                speechSynthesizer.stopSpeaking(at: .immediate)
+            }
+        }
+    }
+    /// Injectable VoiceOver status provider (`YS-75`: routes coach lines through VoiceOver announcements instead of a second voice).
+    public var isVoiceOverRunningProvider: () -> Bool = { UIAccessibility.isVoiceOverRunning }
+    @Published public private(set) var spokenCoachHistory: [VoiceCoachOutputRoute] = []
+    private let speechSynthesizer = AVSpeechSynthesizer()
+
+    /// Pre-walk centre-to-centre tape distance (meters) between Marker 0 and Marker 1 (`YS-77`).
+    @Published public var preWalkTapeMeters0To1: Double? = nil {
+        didSet {
+            guidedEngine.preWalkTapeMeters0To1 = preWalkTapeMeters0To1
+            syncMarker0To1PreWalkTapeCheckIfNeeded()
+            _ = evaluatePreFlightChecklist()
+        }
+    }
+    @Published public var isPrintSizeConfirmed: Bool = false {
+        didSet {
+            _ = evaluatePreFlightChecklist()
+        }
+    }
+    @Published public private(set) var latestLensSmudgeProbe: LensSmudgeProbeResult? = nil
+    @Published public private(set) var preFlightReport: PreFlightChecklistReport = PreFlightChecklistEvaluator.evaluate(
+        availableDiskBytes: 25_000_000_000,
+        batteryLevelFraction: 0.85,
+        thermalLevel: .nominal,
+        exposureDurationS: 0.004,
+        iso: 100.0,
+        isLocationAuthorized: false
+    )
     /// Injectable thermal level for deterministic testing of `YS-85` serious-thermal adaptation.
     public var injectedThermalLevelForTesting: CaptureThermalLevel? = nil
 
     private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM"
 
-    /// Per-marker printed size configuration (`180.0` mm for printed set IDs `0–3`, `250.0` mm for `4–5`), persisted in `UserDefaults`.
+    /// Per-marker printed size configuration (`180.0` mm default for all markers `0–5` per `YS-80` #3), persisted in `UserDefaults`.
     @Published public var markerSizesMM: [Int: Double] = CaptureSessionRecorder.loadPersistedMarkerSizes()
 
     public static func loadPersistedMarkerSizes(defaults: UserDefaults = .standard) -> [Int: Double] {
         var sizes: [Int: Double] = [
-            0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 250.0, 5: 250.0,
+            0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 180.0,
         ]
         if let saved = defaults.dictionary(forKey: markerSizesDefaultsKey) {
             for mid in 0..<6 {
                 if let num = saved[String(mid)] as? NSNumber {
                     let val = num.doubleValue
-                    if val == 180.0 || val == 250.0 {
+                    if val >= 80.0 && val <= 400.0 {
                         sizes[mid] = val
                     }
                 }
             }
         }
         return sizes
+    }
+
+    /// Sets every marker ID (`0...5`) to the given printed size in millimeters (`YS-80` correction #3:
+    /// "the marker-size setting sets every marker ID").
+    public func setAllMarkersPrintedSizeMM(_ sizeMM: Double, defaults: UserDefaults = .standard) {
+        guard sizeMM >= 80.0 && sizeMM <= 400.0 else { return }
+        for mid in 0..<6 {
+            markerSizesMM[mid] = sizeMM
+        }
+        persistMarkerSizes(defaults: defaults)
+        _ = evaluatePreFlightChecklist()
     }
 
     private func persistMarkerSizes(defaults: UserDefaults = .standard) {
@@ -723,10 +783,133 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
         locationManager.delegate = self
         locationManager.headingFilter = kCLHeadingFilterNone
+        UIDevice.current.isBatteryMonitoringEnabled = true
+        speechSynthesizer.usesApplicationAudioSession = true
         #if canImport(ARKit)
         arSession.delegate = self
         #endif
         registerLifecycleObservers()
+        _ = evaluatePreFlightChecklist()
+    }
+
+    /// Dispatch a `YS-75` spoken coach phrase, sharing the AR session's `AVAudioSession` without deactivating it,
+    /// routing through VoiceOver announcements when VoiceOver is running, and staying silent while a voice note records.
+    @discardableResult
+    public func dispatchVoiceCoachIfNeeded(_ spokenPhrase: String?) -> Bool {
+        guard let phrase = spokenPhrase,
+              !phrase.isEmpty,
+              isVoiceCoachEnabled,
+              !guidedEngine.isRecordingVoiceNote
+        else {
+            return false
+        }
+        if isVoiceOverRunningProvider() {
+            spokenCoachHistory.append(.voiceOverAnnouncement(phrase))
+            UIAccessibility.post(notification: .announcement, argument: phrase)
+            return true
+        }
+        spokenCoachHistory.append(.speechSynthesizer(phrase))
+        let utterance = AVSpeechUtterance(string: phrase)
+        utterance.prefersAssistiveTechnologySettings = true
+        if speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
+        speechSynthesizer.speak(utterance)
+        return true
+    }
+
+    /// Evaluate the `YS-76` pre-flight checklist and update `preFlightReport`.
+    @discardableResult
+    public func evaluatePreFlightChecklist(
+        overrideAvailableBytes: Int64? = nil,
+        overrideBatteryLevel: Double? = nil,
+        overrideThermalLevel: CaptureThermalLevel? = nil,
+        overrideExposureDurationS: Double? = nil,
+        overrideISO: Double? = nil,
+        overrideLocationAuthorized: Bool? = nil,
+        overrideLensProbe: LensSmudgeProbeResult? = nil
+    ) -> PreFlightChecklistReport {
+        let docsURL = captureDirURL ?? FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first!
+        let availBytes = overrideAvailableBytes ?? availableDiskBytesProvider(docsURL) ?? 25_000_000_000
+        let sysBatt = Double(UIDevice.current.batteryLevel)
+        let battLevel = overrideBatteryLevel ?? (sysBatt < 0 ? 0.85 : sysBatt)
+        let therm = overrideThermalLevel ?? injectedThermalLevelForTesting ?? CaptureThermalLevel.fromSystem(ProcessInfo.processInfo.thermalState)
+        let expS = overrideExposureDurationS ?? (latestExposureDurationS > 0 ? latestExposureDurationS : 0.004)
+        let isoV = overrideISO ?? (latestISO > 0 ? latestISO : 100.0)
+        let locAuth = overrideLocationAuthorized ?? (locationAuthStatus == "authorizedWhenInUse" || locationAuthStatus == "authorizedAlways")
+        let lensProbe = overrideLensProbe ?? latestLensSmudgeProbe
+        let printedMM = markerSizesMM[0] ?? 180.0
+
+        let report = PreFlightChecklistEvaluator.evaluate(
+            availableDiskBytes: availBytes,
+            batteryLevelFraction: battLevel,
+            thermalLevel: therm,
+            exposureDurationS: expS,
+            iso: isoV,
+            isLocationAuthorized: locAuth,
+            lensProbe: lensProbe,
+            printedMarkerSizeMM: printedMM,
+            isPrintSizeConfirmed: isPrintSizeConfirmed,
+            preWalkTapeMeters0To1: preWalkTapeMeters0To1
+        )
+        preFlightReport = report
+        return report
+    }
+
+    /// Update the live lens smudge probe (`YS-76`) from a camera luma frame.
+    @discardableResult
+    public func updateLensSmudgeProbe(
+        lumaBytes: [UInt8],
+        width: Int,
+        height: Int,
+        turnRateRadS: Double,
+        predictedBlurPx: Double,
+        cameraVelocityMps: Double = 0.0
+    ) -> LensSmudgeProbeResult {
+        let probe = LensSmudgeDetector.evaluate(
+            lumaBytes: lumaBytes,
+            width: width,
+            height: height,
+            turnRateRadS: turnRateRadS,
+            predictedBlurPx: predictedBlurPx,
+            cameraVelocityMps: cameraVelocityMps
+        )
+        latestLensSmudgeProbe = probe
+        _ = evaluatePreFlightChecklist()
+        return probe
+    }
+
+    /// Set the pre-walk centre-to-centre tape distance (`Marker 0 -> Marker 1`, `YS-77`) and synchronize `session.json["tape_checks"]`
+    /// once both Marker 0 and Marker 1 are locked.
+    public func setPreWalkTapeMeters0To1(_ meters: Double?) {
+        preWalkTapeMeters0To1 = (meters != nil && meters! > 0) ? meters : nil
+    }
+
+    /// Synchronize the automatic `YS-77` centre-to-centre `Marker 0 -> Marker 1` tape entry into `tapeChecks` (`session.json["tape_checks"]`)
+    /// without requiring any mid-walk typing or writing an operator tap event (`events.csv`).
+    public func syncMarker0To1PreWalkTapeCheckIfNeeded() {
+        guard let autoEntry = guidedEngine.generatedMarker0To1TapeCheck else { return }
+        let dict = autoEntry.toJSONDictionary()
+        let summaryStr = String(
+            format: "Marker 0→1 (%@): tape %.2f m · phone %.2f m (diff %.1f cm)",
+            autoEntry.role, autoEntry.tapeM, autoEntry.measuredM, autoEntry.residualM * 100.0
+        )
+        if !tapeChecks.isEmpty, (tapeChecks[0]["id"] as? Int) == 0 {
+            tapeChecks[0] = dict
+            if !tapeCheckSummaries.isEmpty {
+                tapeCheckSummaries[0] = summaryStr
+            } else {
+                tapeCheckSummaries.append(summaryStr)
+            }
+        } else {
+            tapeChecks.insert(dict, at: 0)
+            for idx in 0..<tapeChecks.count {
+                tapeChecks[idx]["id"] = idx
+            }
+            tapeCheckSummaries.insert(summaryStr, at: 0)
+        }
+        tapeCheckCount = tapeChecks.count
+        updateProvisionalGrade()
     }
 
     /// Dispatch a `GuidedHapticEvent` through native `UIKit` feedback generators while respecting
@@ -878,7 +1061,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         latestPredictedBlurPx = 0.0
         liveMarkerSizeWarning = nil
         isLoopClosed = false
-        guidedEngine = GuidedCaptureEngine()
+        guidedEngine = GuidedCaptureEngine(preWalkTapeMeters0To1: preWalkTapeMeters0To1)
+        guidedEngine.isVoiceCoachEnabled = isVoiceCoachEnabled
+        spokenCoachHistory = []
         guidedWalkPhase = .openingMarker0
         activeRingState = nil
         lockedMarkerIDs = []
@@ -1004,8 +1189,11 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Toggle or set voice-note recording state (`YS-74`, `YS-75`), suppressing haptics while active.
+    /// Toggle or set voice-note recording state (`YS-74`, `YS-75`), suppressing haptics and voice coach while active.
     public func setRecordingVoiceNote(_ active: Bool) {
+        if active && speechSynthesizer.isSpeaking {
+            speechSynthesizer.stopSpeaking(at: .immediate)
+        }
         let t = latestTimestampS
         guidedEngine.setRecordingVoiceNote(active, at: t)
         isRecordingVoiceNote = guidedEngine.isRecordingVoiceNote
@@ -1023,6 +1211,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         phoneLoopState.endEarlyChosen = true
         phoneLoopState.evaluateUnifiedLoopClosure()
         guidedEngine.markEndEarlyChosen(at: t)
+        let didSpeak = dispatchVoiceCoachIfNeeded(guidedEngine.lastSpokenPhraseThisStep)
         guidedWalkPhase = guidedEngine.phase
         isLoopClosed = phoneLoopState.unifiedLoopClosed
         isFinishAvailable = guidedEngine.isFinishAvailable(unifiedLoopClosed: phoneLoopState.unifiedLoopClosed)
@@ -1048,7 +1237,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                     event: "end_early",
                     phase: phaseStr,
                     instruction: instr,
-                    spoken: false,
+                    spoken: didSpeak,
                     pitchDeg: pDeg,
                     rollDeg: rDeg,
                     trackingState: trk,
@@ -1074,6 +1263,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let sIdx = max(0, latestSavedIndex)
         phoneLoopState.clearLoopClosedForFixNow()
         guidedEngine.beginFixNowRequiringReturnToMarker0(targetMarkerID: targetMarkerID, at: t)
+        let didSpeak = dispatchVoiceCoachIfNeeded(guidedEngine.lastSpokenPhraseThisStep)
         guidedWalkPhase = guidedEngine.phase
         lockedMarkerIDs = guidedEngine.lockedMarkerIDs
         isLoopClosed = phoneLoopState.unifiedLoopClosed
@@ -1100,7 +1290,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                     event: "fix_now",
                     phase: phaseStr,
                     instruction: instr,
-                    spoken: false,
+                    spoken: didSpeak,
                     pitchDeg: pDeg,
                     rollDeg: rDeg,
                     trackingState: trk,
@@ -1124,6 +1314,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let t = latestTimestampS
         let sIdx = max(0, latestSavedIndex)
         guidedEngine.skipLookUpStep(at: t)
+        let didSpeak = dispatchVoiceCoachIfNeeded(guidedEngine.lastSpokenPhraseThisStep)
         guidedWalkPhase = guidedEngine.phase
         isLookUpDone = guidedEngine.lookUpTracker.isDone
         lookUpProgressFraction = guidedEngine.lookUpTracker.progressFraction
@@ -1149,7 +1340,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                     event: "lookup_skipped",
                     phase: phaseStr,
                     instruction: instr,
-                    spoken: false,
+                    spoken: didSpeak,
                     pitchDeg: pDeg,
                     rollDeg: rDeg,
                     trackingState: trk,
@@ -2333,6 +2524,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
             self.thermalSchedule = stepOut.thermalSchedule
             self.dispatchHapticIfNeeded(stepOut.haptic)
+            let didSpeakFrame = self.dispatchVoiceCoachIfNeeded(self.guidedEngine.lastSpokenPhraseThisStep)
             self.statusBanner = stepOut.instruction
             let currentInstruction = self.statusBanner
             let currentGuidedPhaseStr = self.guidedEngine.phase.rawValue
@@ -2496,7 +2688,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         event: "frame",
                         phase: currentGuidedPhaseStr,
                         instruction: currentInstruction,
-                        spoken: false,
+                        spoken: didSpeakFrame && (emittedSafetyEvent == nil),
                         pitchDeg: pitchDegrees,
                         rollDeg: rollDegrees,
                         trackingState: trackingStr,
@@ -2513,7 +2705,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             event: safetyEv,
                             phase: currentGuidedPhaseStr,
                             instruction: currentInstruction,
-                            spoken: false,
+                            spoken: didSpeakFrame,
                             pitchDeg: pitchDegrees,
                             rollDeg: rollDegrees,
                             trackingState: trackingStr,
@@ -2859,6 +3051,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
                                     self.thermalSchedule = detStep.thermalSchedule
                                     self.dispatchHapticIfNeeded(detStep.haptic)
+                                    let didSpeakDet = self.dispatchVoiceCoachIfNeeded(self.guidedEngine.lastSpokenPhraseThisStep)
+                                    self.syncMarker0To1PreWalkTapeCheckIfNeeded()
                                     self.statusBanner = detStep.instruction
 
                                     // YS-67 / YS-71 / YS-74: Only a completed 3-still closing hold on Marker 0 writes `loop_closed`
@@ -2874,12 +3068,12 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     }
                                     self.isFinishAvailable = self.guidedEngine.isFinishAvailable(unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed)
 
-                                    // Log explicit `marker_locked` / `loop_closed` guidance event rows to `guidance.csv` (`YS-67`, `YS-74`)
+                                    // Log explicit `marker_locked` / `loop_closed` / spoken guidance event rows to `guidance.csv` (`YS-67`, `YS-74`, `YS-75`)
                                     let guidanceEventName: String? = {
                                         switch detStep.haptic {
                                         case .markerLocked: return "marker_locked"
                                         case .loopClosedPathComplete: return "loop_closed"
-                                        default: return nil
+                                        default: return didSpeakDet ? "voice_coach" : nil
                                         }
                                     }()
                                     if let evName = guidanceEventName {
@@ -2895,7 +3089,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                                     event: evName,
                                                     phase: phaseNow,
                                                     instruction: instrNow,
-                                                    spoken: false,
+                                                    spoken: didSpeakDet,
                                                     pitchDeg: pitchDegrees,
                                                     rollDeg: rollDegrees,
                                                     trackingState: trackingStr,

@@ -628,11 +628,20 @@ public struct GuidedCaptureEngine: Sendable {
     public static let pitchOutOfBandTriggerS: Double = 3.00
 
     public var requireLookUpStep: Bool
+    public var isVoiceCoachEnabled: Bool = true
+    public var preWalkTapeMeters0To1: Double? = nil {
+        didSet {
+            recomputeMarker0To1TapeCheckIfPossible()
+        }
+    }
+    public private(set) var generatedMarker0To1TapeCheck: PreWalkTapeCheckEntry? = nil
     public private(set) var phase: GuidedWalkPhase = .openingMarker0
     public private(set) var activeInstruction: String = "Stand over marker 0 and point at it"
     public private(set) var activeInstructionKey: String = "origin_find_marker_0"
     public private(set) var activeInstructionSinceS: Double = -100.0
     public private(set) var instructionHistory: [(timestampS: Double, key: String, text: String)] = []
+    public private(set) var spokenHistory: [(timestampS: Double, key: String, glassText: String, spokenPhrase: String)] = []
+    public private(set) var lastSpokenPhraseThisStep: String? = nil
 
     public private(set) var openingMarker0Hold = MarkerHoldProgress(markerID: 0, isClosingHold: false)
     public private(set) var marker1To3Holds: [Int: MarkerHoldProgress] = [
@@ -656,7 +665,7 @@ public struct GuidedCaptureEngine: Sendable {
         isMarkerHoldActive: false
     )
 
-    // Debounce & dwell state
+    // Debounce, dwell & voice coach state
     private var activeInstructionIsCorrection: Bool = false
     private var pendingCandidateKey: String? = nil
     private var pendingCandidateText: String? = nil
@@ -670,9 +679,44 @@ public struct GuidedCaptureEngine: Sendable {
     private var justLockedText: String = ""
     private var lastActiveHoldMarkerID: Int? = nil
     private var lastRingSightingTimestampS: Double = -100.0
+    private var holdPausedAccumulatedS: Double = 0.0
+    private var didSpeakHoldPausedMovingThisPause: Bool = false
+    private var spokenOnceKeys: Set<String> = []
 
-    public init(requireLookUpStep: Bool = true) {
+    public init(requireLookUpStep: Bool = true, preWalkTapeMeters0To1: Double? = nil) {
         self.requireLookUpStep = requireLookUpStep
+        self.preWalkTapeMeters0To1 = preWalkTapeMeters0To1
+    }
+
+    /// Recompute the automatic centre-to-centre `tape_checks` entry between Marker 0 and Marker 1 (`YS-77`)
+    /// once both Marker 0 and Marker 1 are locked and a pre-walk tape distance `> 0` was entered.
+    public mutating func recomputeMarker0To1TapeCheckIfPossible() {
+        guard let tapeM = preWalkTapeMeters0To1, tapeM > 0,
+              openingMarker0Hold.isLocked,
+              !openingMarker0Hold.confirmedSamples.isEmpty,
+              let hold1 = marker1To3Holds[1],
+              hold1.isLocked,
+              !hold1.confirmedSamples.isEmpty
+        else {
+            return
+        }
+        let samples0 = openingMarker0Hold.confirmedSamples
+        let samples1 = hold1.confirmedSamples
+        let ptA = PhoneLoopRuleState.medianPosition3D(samples0.map(\.positionWorld))
+        let ptB = PhoneLoopRuleState.medianPosition3D(samples1.map(\.positionWorld))
+        let last0 = samples0[samples0.count - 1]
+        let last1 = samples1[samples1.count - 1]
+        generatedMarker0To1TapeCheck = PreWalkTapeCheckEntry(
+            id: 0,
+            role: "primary",
+            tAS: last0.timestampS,
+            tBS: last1.timestampS,
+            savedIndexA: last0.savedIndex,
+            savedIndexB: last1.savedIndex,
+            pointAWorldM: ptA,
+            pointBWorldM: ptB,
+            tapeM: tapeM
+        )
     }
 
     /// True only when `YS-71` confirms the loop is closed AND Marker 0's closing hold is locked
@@ -784,12 +828,15 @@ public struct GuidedCaptureEngine: Sendable {
         haptic: GuidedHapticEvent?,
         thermalSchedule: ThermalAdaptationSchedule
     ) {
-        if instructionHistory.isEmpty {
+        let wasInstructionHistoryEmpty = instructionHistory.isEmpty
+        if wasInstructionHistoryEmpty {
             activeInstructionSinceS = timestampS
             instructionHistory.append((timestampS, activeInstructionKey, activeInstruction))
         }
+        lastSpokenPhraseThisStep = nil
 
         let phaseBeforeStep = phase
+        let keyBeforeStep = activeInstructionKey
         var didLockMarkerThisStep = false
         var didStartHoldThisStep = false
         var emittedHaptic: GuidedHapticEvent? = nil
@@ -1019,6 +1066,9 @@ public struct GuidedCaptureEngine: Sendable {
             } else {
                 marker1To3Holds[mid] = hold
             }
+            if didLockMarkerThisStep && (mid == 0 || mid == 1) {
+                recomputeMarker0To1TapeCheckIfPossible()
+            }
         }
 
         // 3. Advance phase state machine
@@ -1212,6 +1262,27 @@ public struct GuidedCaptureEngine: Sendable {
             emittedHaptic = nil
         }
 
+        // Voice coach rules (`YS-75`, `DESIGN-SPEC-NATIVE.md` §4c):
+        // - Spoken only for "Locked", phase changes, and non-counting corrections; never for counts (`hold_steady`).
+        // - Silent while a voice note is recording or when `isVoiceCoachEnabled == false`.
+        // - Hold paused due to motion (`hold_paused_moving`) speaks `"Hold steady."` after 2.0 s of pause.
+        if activeInstructionKey == "hold_paused_moving" {
+            holdPausedAccumulatedS += max(0.0, dt)
+        } else {
+            holdPausedAccumulatedS = 0.0
+            didSpeakHoldPausedMovingThisPause = false
+        }
+
+        if isVoiceCoachEnabled && !isRecordingVoiceNote {
+            if wasInstructionHistoryEmpty && activeInstructionKey == keyBeforeStep {
+                recordSpokenPhraseForActiveInstructionIfNeeded(at: timestampS)
+            } else if activeInstructionKey == "hold_paused_moving" && !didSpeakHoldPausedMovingThisPause && holdPausedAccumulatedS >= 2.0 {
+                recordSpokenPhraseForActiveInstructionIfNeeded(at: timestampS)
+            }
+        } else {
+            lastSpokenPhraseThisStep = nil
+        }
+
         latestThermalSchedule = ThermalAdaptationSchedule.evaluate(
             thermalLevel: thermalLevel,
             isMarkerHoldActive: activeHoldMarkerID != nil
@@ -1241,5 +1312,630 @@ public struct GuidedCaptureEngine: Sendable {
         pendingCandidateKey = nil
         pendingCandidateText = nil
         instructionHistory.append((timestampS, key, text))
+        if isVoiceCoachEnabled && !isRecordingVoiceNote {
+            recordSpokenPhraseForActiveInstructionIfNeeded(at: timestampS)
+        } else {
+            lastSpokenPhraseThisStep = nil
+        }
+    }
+
+    private mutating func recordSpokenPhraseForActiveInstructionIfNeeded(at timestampS: Double) {
+        guard isVoiceCoachEnabled && !isRecordingVoiceNote else {
+            lastSpokenPhraseThisStep = nil
+            return
+        }
+        guard let phrase = GuidedVoiceCatalog.spokenPhrase(
+            forInstructionKey: activeInstructionKey,
+            holdPausedDurationS: holdPausedAccumulatedS,
+            alreadySpokenOnceKeys: spokenOnceKeys
+        ) else {
+            return
+        }
+        if GuidedVoiceCatalog.isSpokenAtMostOncePerWalk(key: activeInstructionKey) {
+            spokenOnceKeys.insert(activeInstructionKey)
+        }
+        if activeInstructionKey == "hold_paused_moving" {
+            didSpeakHoldPausedMovingThisPause = true
+        }
+        lastSpokenPhraseThisStep = phrase
+        spokenHistory.append((timestampS, activeInstructionKey, activeInstruction, phrase))
+    }
+}
+
+// MARK: - YS-75: Fixed Voice Coach Phrase Catalog
+
+/// Maps deterministic `GuidedCaptureEngine` instruction keys to the exact fixed spoken phrases
+/// from `DESIGN-SPEC-NATIVE.md` §4c (`YS-75`).
+///
+/// Rules (`YS-75`, `DESIGN-SPEC-NATIVE.md` §4a, §4c):
+/// - Fixed phrases, spoken only for `"Locked"`, phase changes, and non-counting corrections; **never** for counts (`1, 2, 3` or `"Hold steady"` while counting).
+/// - The voice says `"marker zero"`, `"marker one"`, `"marker two"`, `"marker three"`, while the glass shows `"marker 0"`.
+/// - Silent while a voice note is recording (`note_recording`, `note_added`).
+public enum GuidedVoiceCatalog: Sendable {
+    public static func markerNumberWord(_ id: Int) -> String {
+        switch id {
+        case 0: return "zero"
+        case 1: return "one"
+        case 2: return "two"
+        case 3: return "three"
+        case 4: return "four"
+        case 5: return "five"
+        default: return "\(id)"
+        }
+    }
+
+    public static func isSpokenAtMostOncePerWalk(key: String) -> Bool {
+        switch key {
+        case "storage_low", "thermal_serious", "battery_low", "dark_exposure":
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// Return the spoken phrase for `key`, or `nil` if the instruction should be silent on the voice channel.
+    public static func spokenPhrase(
+        forInstructionKey key: String,
+        holdPausedDurationS: Double = 0.0,
+        alreadySpokenOnceKeys: Set<String> = []
+    ) -> String? {
+        if isSpokenAtMostOncePerWalk(key: key) && alreadySpokenOnceKeys.contains(key) {
+            return nil
+        }
+        switch key {
+        case "origin_find_marker_0":
+            return "Stand over marker zero and point at it."
+        case "hold_steady":
+            // YS-75: Never speak during hold counting!
+            return nil
+        case "hold_paused_moving":
+            // DESIGN-SPEC-NATIVE.md §4c: (after 2 s) "Hold steady."
+            return holdPausedDurationS >= 2.0 ? "Hold steady." : nil
+        case "locked_marker_0_opening":
+            return "Got it. Every marker works like that."
+        case "look_for_markers":
+            return "Turn slowly and look for your markers."
+        case "pace_turn_slower":
+            return "Turn a little slower."
+        case "pace_walk_slower":
+            return "Slow down a little."
+        case "pace_hold_steady":
+            return "Hold steady."
+        case "tilt_point_ground":
+            return "Point at the ground ahead."
+        case "tilt_lift_phone":
+            return "Lift the phone a little."
+        case "tracking_insufficient_features":
+            return "Point at something with more detail, like the fence."
+        case "tracking_excessive_motion":
+            return "Move the phone more slowly."
+        case "dark_exposure":
+            return "It's getting dark. Hold each marker longer."
+        case "lookup_step":
+            return "Now look up at the roof edge, then the trees."
+        case "lookup_sky_warning":
+            return "Point at the roof edge, not the sky."
+        case "return_marker_0":
+            return "That's all of them. Head back to marker zero."
+        case "all_done_finish":
+            return "You're back at the start. All done."
+        case "storage_low":
+            return "Almost out of space. Finish soon."
+        case "thermal_serious":
+            return "iPhone is getting warm. Finish soon."
+        case "thermal_critical":
+            return "Your walk was saved. iPhone needs to cool down."
+        case "battery_low":
+            return "Battery low. Finish soon."
+        case "note_recording", "note_added", "walk_interrupted":
+            return nil
+        default:
+            if key.hasPrefix("locked_marker_"),
+               let mid = Int(key.replacingOccurrences(of: "locked_marker_", with: "")) {
+                return "Got marker \(markerNumberWord(mid))."
+            }
+            if key.hasPrefix("walk_to_marker_"),
+               let mid = Int(key.replacingOccurrences(of: "walk_to_marker_", with: "")) {
+                return "Now walk to marker \(markerNumberWord(mid))."
+            }
+            if key.hasPrefix("hold_too_far_") {
+                return "Step closer."
+            }
+            if key.hasPrefix("hold_too_close_") {
+                return "Step back."
+            }
+            return nil
+        }
+    }
+}
+
+// MARK: - YS-76: Pre-Flight Checklist & Stable-Frame Lens Smudge Detector
+
+/// Result of evaluating a camera luma frame for a smudged or obstructed lens (`YS-76`).
+///
+/// Only runs on a **stable frame** (`turnRateRadS <= 0.12`, `predictedBlurPx <= 1.5`, `cameraVelocityMps <= 0.25`)
+/// so a clean lens at dusk while moving never false-triggers the smudge card.
+public struct LensSmudgeProbeResult: Sendable, Equatable {
+    public let isStableFrame: Bool
+    public let isSmudged: Bool
+    public let maxTileLaplacianVariance: Double
+    public let medianTileLaplacianVariance: Double
+    public let maxTileContrast: Double
+
+    public init(
+        isStableFrame: Bool,
+        isSmudged: Bool,
+        maxTileLaplacianVariance: Double,
+        medianTileLaplacianVariance: Double,
+        maxTileContrast: Double
+    ) {
+        self.isStableFrame = isStableFrame
+        self.isSmudged = isSmudged
+        self.maxTileLaplacianVariance = maxTileLaplacianVariance
+        self.medianTileLaplacianVariance = medianTileLaplacianVariance
+        self.maxTileContrast = maxTileContrast
+    }
+}
+
+/// Evaluates whether a camera frame shows a smudged/covered lens (`YS-76`).
+public enum LensSmudgeDetector: Sendable {
+    public static let maxStableTurnRateRadS: Double = 0.12
+    public static let maxStablePredictedBlurPx: Double = 1.50
+    public static let maxStableCameraVelocityMps: Double = 0.25
+    public static let minCleanMaxTileLaplacianVariance: Double = 18.0
+
+    public static func evaluate(
+        lumaBytes: [UInt8],
+        width: Int,
+        height: Int,
+        turnRateRadS: Double,
+        predictedBlurPx: Double,
+        cameraVelocityMps: Double = 0.0
+    ) -> LensSmudgeProbeResult {
+        let isStable = turnRateRadS <= maxStableTurnRateRadS
+            && predictedBlurPx <= maxStablePredictedBlurPx
+            && cameraVelocityMps <= maxStableCameraVelocityMps
+        guard isStable, width >= 32, height >= 32, lumaBytes.count >= width * height else {
+            return LensSmudgeProbeResult(
+                isStableFrame: false,
+                isSmudged: false,
+                maxTileLaplacianVariance: 0.0,
+                medianTileLaplacianVariance: 0.0,
+                maxTileContrast: 0.0
+            )
+        }
+
+        // Evaluate a 4x4 grid over the central 80% of the image
+        let xStart = width / 10
+        let yStart = height / 10
+        let regionW = (width * 8) / 10
+        let regionH = (height * 8) / 10
+        let tileW = max(8, regionW / 4)
+        let tileH = max(8, regionH / 4)
+
+        var tileVariances: [Double] = []
+        tileVariances.reserveCapacity(16)
+        var maxContrast = 0.0
+
+        for ty in 0..<4 {
+            for tx in 0..<4 {
+                let u0 = xStart + tx * tileW
+                let v0 = yStart + ty * tileH
+                let u1 = min(width - 2, u0 + tileW)
+                let v1 = min(height - 2, v0 + tileH)
+                guard u1 > u0 + 2, v1 > v0 + 2 else { continue }
+
+                var sumLap = 0.0
+                var sumLapSq = 0.0
+                var count = 0
+                var minLuma: UInt8 = 255
+                var maxLuma: UInt8 = 0
+
+                for v in stride(from: v0 + 1, to: v1, by: 2) {
+                    let row = v * width
+                    let rowUp = (v - 1) * width
+                    let rowDn = (v + 1) * width
+                    for u in stride(from: u0 + 1, to: u1, by: 2) {
+                        let c = lumaBytes[row + u]
+                        if c < minLuma { minLuma = c }
+                        if c > maxLuma { maxLuma = c }
+                        let lap = Double(lumaBytes[rowUp + u])
+                            + Double(lumaBytes[rowDn + u])
+                            + Double(lumaBytes[row + u - 1])
+                            + Double(lumaBytes[row + u + 1])
+                            - 4.0 * Double(c)
+                        sumLap += lap
+                        sumLapSq += lap * lap
+                        count += 1
+                    }
+                }
+
+                if count > 0 {
+                    let mean = sumLap / Double(count)
+                    let variance = max(0.0, (sumLapSq / Double(count)) - (mean * mean))
+                    tileVariances.append(variance)
+                    let contrast = Double(maxLuma) - Double(minLuma)
+                    if contrast > maxContrast {
+                        maxContrast = contrast
+                    }
+                }
+            }
+        }
+
+        guard !tileVariances.isEmpty else {
+            return LensSmudgeProbeResult(
+                isStableFrame: true,
+                isSmudged: false,
+                maxTileLaplacianVariance: 0.0,
+                medianTileLaplacianVariance: 0.0,
+                maxTileContrast: 0.0
+            )
+        }
+
+        let sorted = tileVariances.sorted()
+        let maxVar = sorted.last ?? 0.0
+        let medVar = sorted[sorted.count / 2]
+        // A thumb or heavy smudge across the lens blurs high-frequency detail in every tile (`maxVar < 18.0`),
+        // whereas a clean lens on a stable frame (even at dusk) preserves sharp edges in at least one tile (`maxVar >= 18.0`).
+        let smudged = maxVar < minCleanMaxTileLaplacianVariance
+        return LensSmudgeProbeResult(
+            isStableFrame: true,
+            isSmudged: smudged,
+            maxTileLaplacianVariance: maxVar,
+            medianTileLaplacianVariance: medVar,
+            maxTileContrast: maxContrast
+        )
+    }
+}
+
+public enum PreFlightCheckState: String, Sendable, Equatable {
+    case pass
+    case warn
+    case block
+    case hidden
+}
+
+public struct PreFlightCheckRow: Sendable, Equatable {
+    public let id: String
+    public let state: PreFlightCheckState
+    public let title: String
+    public let detail: String
+    public let actionTitle: String?
+
+    public init(
+        id: String,
+        state: PreFlightCheckState,
+        title: String,
+        detail: String,
+        actionTitle: String? = nil
+    ) {
+        self.id = id
+        self.state = state
+        self.title = title
+        self.detail = detail
+        self.actionTitle = actionTitle
+    }
+}
+
+public struct PreFlightChecklistReport: Sendable, Equatable {
+    public let daylightRow: PreFlightCheckRow
+    public let storageRow: PreFlightCheckRow
+    public let batteryRow: PreFlightCheckRow
+    public let thermalRow: PreFlightCheckRow
+    public let lensRow: PreFlightCheckRow
+    public let printCheckRow: PreFlightCheckRow
+    public let tapeMeasurementRow: PreFlightCheckRow
+    public let canStartWalk: Bool
+    public let blockingReasons: [String]
+
+    public var visibleRows: [PreFlightCheckRow] {
+        [
+            daylightRow,
+            storageRow,
+            batteryRow,
+            thermalRow,
+            lensRow,
+            printCheckRow,
+            tapeMeasurementRow,
+        ].filter { $0.state != .hidden }
+    }
+}
+
+/// Evaluates all pre-flight readiness checks (`YS-76`, `YS-77`, `YS-80` corrections #3 & #4).
+public enum PreFlightChecklistEvaluator: Sendable {
+    /// Minimum free disk space to start a walk: `10 GB` (`10_000_000_000` bytes, `YS-76`, `YS-80` #4).
+    public static let minRequiredStorageBytes: Int64 = 10_000_000_000
+    /// Warning band for free disk space: `10–12 GB` (`12_000_000_000` bytes, `YS-76`).
+    public static let warnStorageBytes: Int64 = 12_000_000_000
+    /// Battery block threshold: `<= 10%` (`0.10`, `YS-76`).
+    public static let blockBatteryFraction: Double = 0.10
+    /// Battery warn threshold: `<= 20%` (`0.20`, `YS-76`).
+    public static let warnBatteryFraction: Double = 0.20
+
+    public static func evaluate(
+        availableDiskBytes: Int64,
+        batteryLevelFraction: Double,
+        thermalLevel: CaptureThermalLevel,
+        exposureDurationS: Double,
+        iso: Double,
+        isLocationAuthorized: Bool,
+        minutesUntilSunset: Double? = nil,
+        sunsetTimeText: String? = nil,
+        lensProbe: LensSmudgeProbeResult? = nil,
+        printedMarkerSizeMM: Double = 180.0,
+        isPrintSizeConfirmed: Bool = false,
+        preWalkTapeMeters0To1: Double? = nil
+    ) -> PreFlightChecklistReport {
+        // 1. Storage check (`>= 10 GB` required, warns at `10–12 GB`, `YS-76`, `YS-80` #4)
+        let gbFree = Double(max(0, availableDiskBytes)) / 1_000_000_000.0
+        let storageRow: PreFlightCheckRow = {
+            if availableDiskBytes < minRequiredStorageBytes {
+                return PreFlightCheckRow(
+                    id: "storage",
+                    state: .block,
+                    title: "Space on iPhone",
+                    detail: "Free up 10 GB to start.",
+                    actionTitle: "Open Settings"
+                )
+            } else if availableDiskBytes < warnStorageBytes {
+                return PreFlightCheckRow(
+                    id: "storage",
+                    state: .warn,
+                    title: "Space on iPhone",
+                    detail: String(format: "%.1f GB free", gbFree)
+                )
+            } else {
+                return PreFlightCheckRow(
+                    id: "storage",
+                    state: .pass,
+                    title: "Space on iPhone",
+                    detail: String(format: "%.0f GB free", gbFree)
+                )
+            }
+        }()
+
+        // 2. Battery check (warns <= 20%, blocks <= 10%, `YS-76`)
+        let clampedBatt = batteryLevelFraction < 0 ? 1.0 : min(1.0, max(0.0, batteryLevelFraction))
+        let battPct = Int((clampedBatt * 100.0).rounded())
+        let batteryRow: PreFlightCheckRow = {
+            if clampedBatt <= blockBatteryFraction + 1e-6 {
+                return PreFlightCheckRow(
+                    id: "battery",
+                    state: .block,
+                    title: "Battery",
+                    detail: "\(battPct)%. Charge above 10% to start."
+                )
+            } else if clampedBatt <= warnBatteryFraction + 1e-6 {
+                return PreFlightCheckRow(
+                    id: "battery",
+                    state: .warn,
+                    title: "Battery",
+                    detail: "\(battPct)%. Plug in if you can."
+                )
+            } else {
+                return PreFlightCheckRow(
+                    id: "battery",
+                    state: .pass,
+                    title: "Battery",
+                    detail: "\(battPct)%"
+                )
+            }
+        }()
+
+        // 3. Heat / thermal check (warns at fair, blocks at serious or worse, `YS-76`)
+        let thermalRow: PreFlightCheckRow = {
+            switch thermalLevel {
+            case .nominal:
+                return PreFlightCheckRow(
+                    id: "thermal",
+                    state: .hidden,
+                    title: "Temperature",
+                    detail: "Normal"
+                )
+            case .fair:
+                return PreFlightCheckRow(
+                    id: "thermal",
+                    state: .warn,
+                    title: "Temperature",
+                    detail: "iPhone is warm. Rest it in the shade first."
+                )
+            case .serious, .critical:
+                return PreFlightCheckRow(
+                    id: "thermal",
+                    state: .block,
+                    title: "Temperature",
+                    detail: "iPhone is too hot to start."
+                )
+            }
+        }()
+
+        // 4. Daylight & Live Exposure Probe check (`YS-76`):
+        // - "light from a live exposure probe ('Too dark' is said here, never mid-walk)"
+        // - "Location is optional: if it's refused, the daylight row falls back to the exposure probe and never blocks."
+        let exposureIndex = exposureDurationS * max(50.0, iso)
+        let isProbeTooDark = (exposureDurationS >= 0.045 && iso >= 1000.0) || exposureIndex >= 50.0
+        let isProbeDim = (exposureDurationS > 0.020) || exposureIndex >= 14.0
+        let daylightRow: PreFlightCheckRow = {
+            if !isLocationAuthorized {
+                // Location refused: fall back to exposure probe and NEVER block (`YS-76`)
+                if isProbeTooDark || isProbeDim {
+                    return PreFlightCheckRow(
+                        id: "daylight",
+                        state: .warn,
+                        title: "Daylight",
+                        detail: "Getting dim. Walks take about 10 min."
+                    )
+                }
+                return PreFlightCheckRow(
+                    id: "daylight",
+                    state: .pass,
+                    title: "Daylight",
+                    detail: "Enough light"
+                )
+            }
+
+            if isProbeTooDark || (minutesUntilSunset != nil && minutesUntilSunset! <= -15.0) {
+                return PreFlightCheckRow(
+                    id: "daylight",
+                    state: .block,
+                    title: "Daylight",
+                    detail: "Too dark for sharp photos."
+                )
+            }
+            if let mins = minutesUntilSunset, mins <= 30.0 {
+                return PreFlightCheckRow(
+                    id: "daylight",
+                    state: .warn,
+                    title: "Daylight",
+                    detail: "Dark in \( max(1, Int(mins.rounded())) ) min. Walks take about 10."
+                )
+            }
+            if isProbeDim {
+                return PreFlightCheckRow(
+                    id: "daylight",
+                    state: .warn,
+                    title: "Daylight",
+                    detail: "Getting dim. Walks take about 10 min."
+                )
+            }
+            let detailText = sunsetTimeText.map { "Until \($0)" } ?? "Enough light"
+            return PreFlightCheckRow(
+                id: "daylight",
+                state: .pass,
+                title: "Daylight",
+                detail: detailText
+            )
+        }()
+
+        // 5. Lens smudge check (evaluated on a stable frame only, `YS-76`)
+        let lensRow: PreFlightCheckRow = {
+            if let probe = lensProbe, probe.isStableFrame, probe.isSmudged {
+                return PreFlightCheckRow(
+                    id: "lens",
+                    state: .warn,
+                    title: "Lens looks smudged",
+                    detail: "Wipe it, then Check Again",
+                    actionTitle: "Check Again"
+                )
+            }
+            return PreFlightCheckRow(
+                id: "lens",
+                state: .hidden,
+                title: "Lens",
+                detail: "Clean"
+            )
+        }()
+
+        // 6. Print check card (`YS-76`, `DESIGN-SPEC-NATIVE.md` §4d)
+        let cmVal = printedMarkerSizeMM / 10.0
+        let cmText = abs(cmVal.rounded() - cmVal) < 0.05
+            ? String(format: "%.0f cm", cmVal)
+            : String(format: "%.1f cm", cmVal)
+        let printCheckRow = PreFlightCheckRow(
+            id: "print_check",
+            state: isPrintSizeConfirmed ? .pass : .warn,
+            title: "Check your print",
+            detail: isPrintSizeConfirmed
+                ? "Checked (\(cmText)) ✓"
+                : "Lay a tape on the black square of marker 0. Does it measure \(cmText)?",
+            actionTitle: isPrintSizeConfirmed ? nil : "Check"
+        )
+
+        // 7. Pre-walk centre-to-centre Marker 0 -> Marker 1 tape measurement (`YS-77`)
+        let tapeMeasurementRow: PreFlightCheckRow = {
+            if let tapeM = preWalkTapeMeters0To1, tapeM > 0 {
+                return PreFlightCheckRow(
+                    id: "tape_measurement",
+                    state: .pass,
+                    title: "Tape measurement",
+                    detail: String(format: "%.2f m ✓", tapeM),
+                    actionTitle: "Edit"
+                )
+            }
+            return PreFlightCheckRow(
+                id: "tape_measurement",
+                state: .warn,
+                title: "Tape measurement",
+                detail: "Measure from the centre of marker 0 to the centre of marker 1.",
+                actionTitle: "Add"
+            )
+        }()
+
+        var blockers: [String] = []
+        for row in [daylightRow, storageRow, batteryRow, thermalRow] where row.state == .block {
+            blockers.append(row.detail)
+        }
+
+        return PreFlightChecklistReport(
+            daylightRow: daylightRow,
+            storageRow: storageRow,
+            batteryRow: batteryRow,
+            thermalRow: thermalRow,
+            lensRow: lensRow,
+            printCheckRow: printCheckRow,
+            tapeMeasurementRow: tapeMeasurementRow,
+            canStartWalk: blockers.isEmpty,
+            blockingReasons: blockers
+        )
+    }
+}
+
+// MARK: - YS-77: Centre-to-Centre Pre-Walk Tape Check (Marker 0 -> Marker 1)
+
+/// Represents a standard `session.json["tape_checks"]` entry (`contract/session.schema.json:406-480`)
+/// automatically generated from the locked 3D positions of Marker 0 and Marker 1 (`YS-77`).
+public struct PreWalkTapeCheckEntry: Sendable, Equatable {
+    public let id: Int
+    public let role: String
+    public let tAS: Double
+    public let tBS: Double
+    public let savedIndexA: Int
+    public let savedIndexB: Int
+    public let pointAWorldM: SIMD3<Double>
+    public let pointBWorldM: SIMD3<Double>
+    public let tapeM: Double
+    public let measuredM: Double
+    public let residualM: Double
+
+    public init(
+        id: Int = 0,
+        role: String = "primary",
+        tAS: Double,
+        tBS: Double,
+        savedIndexA: Int,
+        savedIndexB: Int,
+        pointAWorldM: SIMD3<Double>,
+        pointBWorldM: SIMD3<Double>,
+        tapeM: Double
+    ) {
+        self.id = id
+        self.role = role
+        self.tAS = tAS
+        self.tBS = tBS
+        self.savedIndexA = savedIndexA
+        self.savedIndexB = savedIndexB
+        self.pointAWorldM = pointAWorldM
+        self.pointBWorldM = pointBWorldM
+        self.tapeM = tapeM
+        let dist = simd_length(pointBWorldM - pointAWorldM)
+        self.measuredM = dist
+        self.residualM = abs(dist - tapeM)
+    }
+
+    /// Produces the exact dictionary validated by `contract/session.schema.json:406-480` and `recompute_tape_check` (`grading.py:37-57`).
+    public func toJSONDictionary() -> [String: Any] {
+        [
+            "id": id,
+            "role": role,
+            "t_a_s": tAS,
+            "t_b_s": tBS,
+            "saved_index_a": savedIndexA,
+            "saved_index_b": savedIndexB,
+            "point_a_world_m": [pointAWorldM.x, pointAWorldM.y, pointAWorldM.z],
+            "point_b_world_m": [pointBWorldM.x, pointBWorldM.y, pointBWorldM.z],
+            "tape_m": tapeM,
+            "measured_m": measuredM,
+            "residual_m": residualM,
+        ]
     }
 }
