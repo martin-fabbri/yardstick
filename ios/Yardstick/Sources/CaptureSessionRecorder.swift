@@ -20,6 +20,7 @@ import Foundation
 import ImageIO
 import UIKit
 import UniformTypeIdentifiers
+import os
 import simd
 
 #if canImport(ARKit)
@@ -400,13 +401,34 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var latestMagneticHeadingDeg: Double?
     private var latestHeadingAccuracyDeg: Double?
     private var latestLocation: CLLocation?
+    nonisolated private static let writerSignposter = OSSignposter(
+        subsystem: "io.yardstick.capture",
+        category: "WriterQueue"
+    )
+
     private var locationAuthStatus: String = "unavailable"
     private var northSamples: [[String: Double]] = []
-    private var marker0FirstPassPos: SIMD3<Double>?
-    private var marker0LastPassPos: SIMD3<Double>?
-    private var marker0FirstPassTimeS: Double?
-    private var marker0LastPassTimeS: Double?
-    private var marker0MaxExcursionM: Double = 0.0
+    private var phoneLoopState = PhoneLoopRuleState()
+    private var marker0FirstPassPos: SIMD3<Double>? {
+        get { phoneLoopState.marker0FirstPassPos }
+        set { phoneLoopState.marker0FirstPassPos = newValue }
+    }
+    private var marker0LastPassPos: SIMD3<Double>? {
+        get { phoneLoopState.marker0LastPassPos }
+        set { phoneLoopState.marker0LastPassPos = newValue }
+    }
+    private var marker0FirstPassTimeS: Double? {
+        get { phoneLoopState.marker0FirstPassTimeS }
+        set { phoneLoopState.marker0FirstPassTimeS = newValue }
+    }
+    private var marker0LastPassTimeS: Double? {
+        get { phoneLoopState.marker0LastPassTimeS }
+        set { phoneLoopState.marker0LastPassTimeS = newValue }
+    }
+    private var marker0MaxExcursionM: Double {
+        get { phoneLoopState.marker0MaxExcursionM }
+        set { phoneLoopState.marker0MaxExcursionM = newValue }
+    }
     private var tapeChecks: [[String: Any]] = []
     private var pendingTapeASavedIndex: Int = 0
     private var pendingTapeATimeS: Double = 0.0
@@ -542,14 +564,10 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         tapeChecks.removeAll()
         tapeCheckCount = 0
         tapeCheckSummaries.removeAll()
-        pendingTapeEndpointAWorld = nil
+         pendingTapeEndpointAWorld = nil
         pendingTapeEndpointBWorld = nil
+        phoneLoopState = PhoneLoopRuleState()
         loopClosureGapMeters = nil
-        marker0FirstPassPos = nil
-        marker0LastPassPos = nil
-        marker0FirstPassTimeS = nil
-        marker0LastPassTimeS = nil
-        marker0MaxExcursionM = 0.0
         t0MonotonicS = nil
         audioFirstSampleTS = nil
         lastNorthSampleTimeS = -10.0
@@ -1586,14 +1604,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.crosshairDepthMeters = finalCenterDepthM
             self.latestCrosshairWorld = finalCenterWorldPt
 
-            // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation
+            // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation (`YS-66`)
             let camPosW = SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z)
-            if let m0Pos = self.marker0FirstPassPos {
-                let distFromM0 = simd_length(camPosW - m0Pos)
-                if distFromM0 > self.marker0MaxExcursionM {
-                    self.marker0MaxExcursionM = distFromM0
-                }
-            }
+            self.phoneLoopState.updateCameraExcursion(cameraPositionWorld: camPosW)
 
             // Sample North calibration pairs while at Marker 0 start (spaced >= 0.15 s) (YS-14, Q020)
             let nearM0Start: Bool = {
@@ -1644,6 +1657,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.pendingWriterJobs += 1
             self.writerQueue.async { [weak self] in
                 guard let self, !engine.isClosed else { return }
+                let sp = Self.writerSignposter
+                let jobState = sp.beginInterval("WriterJob")
+                defer { sp.endInterval("WriterJob", jobState) }
 
                 do {
                     // Write any upstream gap rows first
@@ -1708,13 +1724,17 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     }
 
                     let rgbPB = sendableRGB.buffer
-                    guard adaptor.append(rgbPB, withPresentationTime: pts) else {
+                    let videoState = sp.beginInterval("VideoAppend")
+                    let appendedOK = adaptor.append(rgbPB, withPresentationTime: pts)
+                    sp.endInterval("VideoAppend", videoState)
+                    guard appendedOK else {
                         throw writer.error ?? NSError(domain: "Yardstick", code: -32, userInfo: [NSLocalizedDescriptionKey: "AVAssetWriter adaptor.append failed"])
                     }
 
                     let sIdx = engine.savedFrameCount
                     engine.savedFrameCount += 1
 
+                    let csvState = sp.beginInterval("CSVAppend")
                     let fLine = String(format: "%.6f,%d,false,,%@,%@\n", timestampS, sIdx, trackingStr, reasonStr)
                     try engine.appendLine(fLine, to: engine.framesFH)
 
@@ -1726,13 +1746,18 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         fx, fy, cx, cy, rgbW, rgbH
                     )
                     try engine.appendLine(pLine, to: engine.posesFH)
+                    sp.endInterval("CSVAppend", csvState)
 
+                    let pngState = sp.beginInterval("DepthConfidencePNG")
                     let depthURL = dir.appendingPathComponent(String(format: "depth/%06d.png", sIdx))
                     let confURL = dir.appendingPathComponent(String(format: "confidence/%06d.png", sIdx))
-                    guard Self.writeDepth16BitPNG(dPixels, width: wD, height: hD, to: depthURL) else {
+                    let depthOK = Self.writeDepth16BitPNG(dPixels, width: wD, height: hD, to: depthURL)
+                    let confOK = depthOK ? Self.writeConfidence8BitPNG(cPixels, width: wD, height: hD, to: confURL) : false
+                    sp.endInterval("DepthConfidencePNG", pngState)
+                    guard depthOK else {
                         throw NSError(domain: "Yardstick", code: -33, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(depthURL.lastPathComponent)"])
                     }
-                    guard Self.writeConfidence8BitPNG(cPixels, width: wD, height: hD, to: confURL) else {
+                    guard confOK else {
                         throw NSError(domain: "Yardstick", code: -34, userInfo: [NSLocalizedDescriptionKey: "Failed to write \(confURL.lastPathComponent)"])
                     }
 
@@ -1743,6 +1768,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     var saveStillNow = false
 
                     if shouldRunArUco || shouldConsiderPeriodicStill {
+                        let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
                         if let luma = Self.extractLumaBytes(from: rgbPB) {
                             if shouldRunArUco {
                                 let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
@@ -1777,10 +1803,13 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                 }
                             }
                         }
+                        sp.endInterval("ArUcoDetectAndMeasure", detectState)
                     }
 
                     // Write still JPEG AND its `stills.csv` row atomically on `writerQueue` so no still is ever orphaned when sealing starts!
                     if saveStillNow && !engine.savedStillsIndices.contains(sIdx) {
+                        let stillState = sp.beginInterval("StillJPEGWrite")
+                        defer { sp.endInterval("StillJPEGWrite", stillState) }
                         let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
                         let stillURL = dir.appendingPathComponent(stillRelPath)
                         let ciImg = CIImage(cvPixelBuffer: rgbPB)
@@ -1828,26 +1857,20 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         self.latestSavedIndex = sIdx
                         self.savedFrameCount = newSavedCount
 
-                        for m in finalDetected {
-                            self.detectedMarkerIDs.insert(m.markerID)
-                            if m.markerID == 0 {
-                                if self.marker0FirstPassPos == nil {
-                                    self.marker0FirstPassPos = m.positionWorld
-                                    self.marker0FirstPassTimeS = timestampS
-                                    self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
-                                } else if let firstT = self.marker0FirstPassTimeS,
-                                          let firstPos = self.marker0FirstPassPos,
-                                          (timestampS - firstT) >= 3.0,
-                                          (self.marker0MaxExcursionM >= 1.0 || (timestampS - firstT) >= 10.0),
-                                          simd_length(camPosW - m.positionWorld) <= 1.50 {
-                                    self.marker0LastPassPos = m.positionWorld
-                                    self.marker0LastPassTimeS = timestampS
-                                    let gap = simd_length(m.positionWorld - firstPos)
-                                    self.loopClosureGapMeters = gap
-                                    self.updateProvisionalGrade()
-                                    self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
-                                }
-                            }
+                        let hadM0First = (self.phoneLoopState.marker0FirstPassPos != nil)
+                        let updatedLoop = self.phoneLoopState.ingestSightings(
+                            finalDetected,
+                            timestampS: timestampS,
+                            cameraPositionWorld: camPosW
+                        )
+                        self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
+                        if !hadM0First && self.phoneLoopState.marker0FirstPassPos != nil {
+                            self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
+                        }
+                        if updatedLoop, let gap = self.phoneLoopState.loopClosureGapMeters {
+                            self.loopClosureGapMeters = gap
+                            self.updateProvisionalGrade()
+                            self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
                         }
                     }
                 } catch {
