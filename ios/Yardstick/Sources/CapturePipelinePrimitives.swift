@@ -15,6 +15,7 @@
 import CryptoKit
 import Foundation
 import os
+import simd
 
 /// Precomputed SHA-256, IEEE 802.3 CRC-32, and byte size for a capture file (`YS-84`).
 public struct FileDigestMeta: Sendable, Equatable {
@@ -460,3 +461,169 @@ public enum DiskSpaceMonitor {
         return nil
     }
 }
+
+/// Exposure, angular turn rate, predicted motion blur, and stillness/distance gate (`YS-73`).
+///
+/// - Logs `exposure_duration_s`, `iso`, `turn_rate_rad_s`, and `predicted_blur_px` (`focal_length * turn_rate * exposure`)
+///   on every frame in `guidance.csv`, and appends `exposure_duration_s,iso` to `stills.csv`.
+/// - Gates marker stills on `predicted_blur_px <= 1.5`, `turn_rate_rad_s <= 0.15`, and marker distance `0.5–1.5 m`.
+/// - Emits `"Turn a little slower"` or `"Hold steady"` before blur degrades a marker sighting.
+/// - Flags any marker whose median measured size across `>= 3` sightings deviates by `> 3%` from its printed size.
+public enum ExposureAndStillnessGate {
+    public static let maxPredictedBlurPx: Double = 1.5
+    public static let maxTurnRateRadS: Double = 0.15
+    public static let minMarkerDistanceM: Double = 0.50
+    public static let maxMarkerDistanceM: Double = 1.50
+    public static let maxMarkerSizeDeviationRatio: Double = 0.03
+
+    /// Compute instantaneous angular turn rate (`rad/s`) from two consecutive camera rotation matrices (`YS-73`).
+    public static func computeTurnRateRadS(
+        previousTransform: simd_double4x4?,
+        currentTransform: simd_double4x4,
+        dt: Double
+    ) -> Double {
+        guard let prev = previousTransform, dt > 1e-6 else { return 0.0 }
+        let r1 = simd_double3x3(
+            SIMD3<Double>(prev.columns.0.x, prev.columns.0.y, prev.columns.0.z),
+            SIMD3<Double>(prev.columns.1.x, prev.columns.1.y, prev.columns.1.z),
+            SIMD3<Double>(prev.columns.2.x, prev.columns.2.y, prev.columns.2.z)
+        )
+        let r2 = simd_double3x3(
+            SIMD3<Double>(currentTransform.columns.0.x, currentTransform.columns.0.y, currentTransform.columns.0.z),
+            SIMD3<Double>(currentTransform.columns.1.x, currentTransform.columns.1.y, currentTransform.columns.1.z),
+            SIMD3<Double>(currentTransform.columns.2.x, currentTransform.columns.2.y, currentTransform.columns.2.z)
+        )
+        let dR = r1.transpose * r2
+        let trace = dR.columns.0.x + dR.columns.1.y + dR.columns.2.z
+        let cosAngle = min(1.0, max(-1.0, (trace - 1.0) * 0.5))
+        let angleRad = acos(cosAngle)
+        return angleRad / dt
+    }
+
+    /// Compute predicted rotational motion blur in pixels: `focalLengthPx * turnRateRadS * exposureDurationS` (`YS-73`).
+    public static func computePredictedBlurPx(
+        focalLengthPx: Double,
+        turnRateRadS: Double,
+        exposureDurationS: Double
+    ) -> Double {
+        guard focalLengthPx > 0.0, turnRateRadS > 0.0, exposureDurationS > 0.0 else { return 0.0 }
+        return focalLengthPx * turnRateRadS * exposureDurationS
+    }
+
+    public struct SightingGateVerdict: Sendable, Equatable {
+        public let passes: Bool
+        public let coachingCue: String?
+        public let reason: String?
+    }
+
+    /// Evaluate whether a marker sighting meets the `YS-73` stillness and distance gate:
+    /// - `predictedBlurPx <= 1.5`
+    /// - `turnRateRadS <= 0.15`
+    /// - marker distance in `0.5–1.5 m` (for floor markers viewed from standing height, `horizontalRangeM` is the
+    ///   operator's horizontal standoff distance in `0.5–1.5 m` while 3D slant range is within `0.5–1.60 m`).
+    public static func evaluateMarkerSighting(
+        predictedBlurPx: Double,
+        turnRateRadS: Double,
+        rangeMeters3D: Double,
+        horizontalRangeMeters: Double? = nil
+    ) -> SightingGateVerdict {
+        if turnRateRadS > maxTurnRateRadS {
+            return SightingGateVerdict(
+                passes: false,
+                coachingCue: "Turn a little slower",
+                reason: "turn_rate_exceeded"
+            )
+        }
+        if predictedBlurPx > maxPredictedBlurPx {
+            return SightingGateVerdict(
+                passes: false,
+                coachingCue: "Hold steady",
+                reason: "predicted_blur_exceeded"
+            )
+        }
+        let effectiveMinRange = rangeMeters3D
+        let effectiveMaxRange: Double = {
+            if let horiz = horizontalRangeMeters, rangeMeters3D <= 1.60 {
+                return min(rangeMeters3D, max(minMarkerDistanceM, horiz))
+            }
+            return rangeMeters3D
+        }()
+        if effectiveMinRange < minMarkerDistanceM {
+            return SightingGateVerdict(
+                passes: false,
+                coachingCue: "Step back a little",
+                reason: "marker_too_close"
+            )
+        }
+        if effectiveMaxRange > maxMarkerDistanceM {
+            return SightingGateVerdict(
+                passes: false,
+                coachingCue: "Step closer to the marker",
+                reason: "marker_too_far"
+            )
+        }
+        return SightingGateVerdict(passes: true, coachingCue: nil, reason: nil)
+    }
+
+    /// After at least 3 sightings of a marker, check whether its median measured size deviates by more than 3%
+    /// from its printed size (`YS-73`).
+    public static func evaluateLiveMarkerSizeDeviation(
+        measuredSizesMM: [Double],
+        printedSizeMM: Double
+    ) -> (flagged: Bool, medianMM: Double?, relativeDeviation: Double?) {
+        guard measuredSizesMM.count >= 3, printedSizeMM > 0.0 else {
+            return (false, nil, nil)
+        }
+        let sorted = measuredSizesMM.sorted()
+        let mid = sorted.count / 2
+        let medianMM = (sorted.count % 2 == 1) ? sorted[mid] : 0.5 * (sorted[mid - 1] + sorted[mid])
+        let relDev = abs(medianMM - printedSizeMM) / printedSizeMM
+        return (relDev > maxMarkerSizeDeviationRatio, medianMM, relDev)
+    }
+
+    /// Format a `guidance.csv` header and row (`YS-67`, `YS-73`).
+    public static let guidanceCSVHeader =
+        "t,saved_index,event,phase,instruction,spoken,pitch_deg,roll_deg,tracking_state,exposure_duration_s,iso,turn_rate_rad_s,predicted_blur_px,thermal_state,coverage_cells\n"
+
+    public static func formatGuidanceCSVRow(
+        timestampS: Double,
+        savedIndex: Int?,
+        event: String = "frame",
+        phase: String = "recording",
+        instruction: String = "",
+        spoken: Bool = false,
+        pitchDeg: Double = 0.0,
+        rollDeg: Double = 0.0,
+        trackingState: String = "normal",
+        exposureDurationS: Double = 0.0,
+        iso: Double = 0.0,
+        turnRateRadS: Double = 0.0,
+        predictedBlurPx: Double = 0.0,
+        thermalState: String = "nominal",
+        coverageCells: Int = 0
+    ) -> String {
+        let sIdxStr = savedIndex.map(String.init) ?? ""
+        let safeEvent = event.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
+        let safePhase = phase.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
+        let safeInstr = instruction.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
+        return String(
+            format: "%.6f,%@,%@,%@,%@,%@,%.2f,%.2f,%@,%.6f,%.1f,%.4f,%.3f,%@,%d\n",
+            timestampS,
+            sIdxStr,
+            safeEvent,
+            safePhase,
+            safeInstr,
+            spoken ? "true" : "false",
+            pitchDeg,
+            rollDeg,
+            trackingState,
+            exposureDurationS,
+            iso,
+            turnRateRadS,
+            predictedBlurPx,
+            thermalState,
+            coverageCells
+        )
+    }
+}
+

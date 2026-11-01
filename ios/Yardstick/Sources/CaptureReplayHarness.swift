@@ -108,21 +108,58 @@ public struct ReplayMarkerSighting: Sendable {
     }
 }
 
-/// Encapsulates the phone's marker-excursion and loop-closure tracking state (`YS-66`),
+/// Encapsulates the phone's marker-excursion and loop-closure tracking state (`YS-66`, `YS-71`),
 /// shared between `CaptureSessionRecorder` and `CaptureReplayHarness`.
+///
+/// Under `YS-71`, the phone runs the exact same loop-closure rule as the Python toolkit
+/// (`toolkit/src/yardstick/geometry.py:326–360, 512–598`):
+/// - clusters sightings into passes separated by `dt >= 3.0 s` and `(maxExcursion >= 1.0 m || dt >= 10.0 s)`,
+/// - requires Markers 1–3 to be seen (or `endEarlyChosen == true`) before Marker 0's closing hold (`YS-71`),
+/// - requires closing Marker 0 sightings to occur after the last operator tap and after the latest sighting of
+///   any other marker (`mid != 0`), within `1.50 m` camera distance, and within `min(30.0, 0.35 * walkSpanS)` of the
+///   walk/close end (`YS-67`, `YS-71`),
+/// - computes the loop-closure gap as the 3D distance between the component-wise median of the opening pass and
+///   the component-wise median of the valid closing pass (`geometry.py:580–589`).
 public struct PhoneLoopRuleState: Sendable {
     public var marker0FirstPassPos: SIMD3<Double>? = nil
     public var marker0FirstPassTimeS: Double? = nil
     public var marker0MaxExcursionM: Double = 0.0
     public var marker0LastPassPos: SIMD3<Double>? = nil
     public var marker0LastPassTimeS: Double? = nil
+    /// Legacy pre-`YS-71` gap (single-sighting distance without pass medians or other-marker/tap ordering),
+    /// retained so `YS-66` regression tests can verify the historical `7.5 cm` (`0.0753 m`) false close.
+    public var legacyPreYS71GapMeters: Double? = nil
+    /// Active loop-closure gap (`YS-71` unified rule when evaluated via `evaluateUnifiedLoopClosure`, or legacy fallback).
     public var loopClosureGapMeters: Double? = nil
+    /// Unified `YS-71` loop-closure verdict matching `toolkit/src/yardstick/geometry.py:536–598`.
+    public var unifiedLoopClosed: Bool = false
+    /// Unified `YS-71` loop-closure gap in meters (distance between median of opening pass and median of closing pass).
+    public var unifiedLoopClosureGapMeters: Double? = nil
     public var detectedMarkerIDs: Set<Int> = []
+    public var endEarlyChosen: Bool = false
+
+    public var allSightings: [ReplayMarkerSighting] = []
+    public var cameraPositionsByIndex: [Int: SIMD3<Double>] = [:]
+    public var walkStartTimeS: Double? = nil
+    public var walkEndTimeS: Double? = nil
+    public var lastOperatorTapTimeS: Double? = nil
+    public var loopClosedEventTimeS: Double? = nil
 
     public init() {}
 
     /// Update camera excursion from Marker 0 Pass 1 for a delivered frame.
-    public mutating func updateCameraExcursion(cameraPositionWorld camPosW: SIMD3<Double>) {
+    public mutating func updateCameraExcursion(
+        cameraPositionWorld camPosW: SIMD3<Double>,
+        savedIndex: Int? = nil,
+        timestampS: Double? = nil
+    ) {
+        if let sIdx = savedIndex {
+            cameraPositionsByIndex[sIdx] = camPosW
+        }
+        if let t = timestampS {
+            if walkStartTimeS == nil { walkStartTimeS = t }
+            walkEndTimeS = t
+        }
         if let m0Pos = marker0FirstPassPos {
             let distFromM0 = simd_length(camPosW - m0Pos)
             if distFromM0 > marker0MaxExcursionM {
@@ -131,17 +168,34 @@ public struct PhoneLoopRuleState: Sendable {
         }
     }
 
+    public mutating func recordOperatorTap(at timestampS: Double) {
+        if lastOperatorTapTimeS == nil || timestampS > lastOperatorTapTimeS! {
+            lastOperatorTapTimeS = timestampS
+        }
+    }
+
+    public mutating func recordLoopClosedEvent(at timestampS: Double) {
+        if loopClosedEventTimeS == nil || timestampS > loopClosedEventTimeS! {
+            loopClosedEventTimeS = timestampS
+        }
+    }
+
     /// Ingest 3D marker sightings detected on a frame at `timestampS` with camera position `camPosW`.
-    /// Returns `true` if `loopClosureGapMeters` was updated on this frame.
+    /// Returns `true` if the unified `YS-71` loop-closure state updated on this frame.
     @discardableResult
     public mutating func ingestSightings(
         _ sightings: [DetectedMarkerSighting],
         timestampS: Double,
+        savedIndex: Int = 0,
         cameraPositionWorld camPosW: SIMD3<Double>
     ) -> Bool {
-        var updatedLoop = false
+        cameraPositionsByIndex[savedIndex] = camPosW
+        if walkStartTimeS == nil { walkStartTimeS = timestampS }
+        walkEndTimeS = timestampS
+
         for m in sightings {
             detectedMarkerIDs.insert(m.markerID)
+            allSightings.append(ReplayMarkerSighting(timestampS: timestampS, savedIndex: savedIndex, sighting: m))
             if m.markerID == 0 {
                 if marker0FirstPassPos == nil {
                     marker0FirstPassPos = m.positionWorld
@@ -153,21 +207,203 @@ public struct PhoneLoopRuleState: Sendable {
                           simd_length(camPosW - m.positionWorld) <= 1.50 {
                     marker0LastPassPos = m.positionWorld
                     marker0LastPassTimeS = timestampS
-                    let gap = simd_length(m.positionWorld - firstPos)
-                    loopClosureGapMeters = gap
-                    updatedLoop = true
+                    let legacyGap = simd_length(m.positionWorld - firstPos)
+                    legacyPreYS71GapMeters = legacyGap
+                    if loopClosureGapMeters == nil {
+                        loopClosureGapMeters = legacyGap
+                    }
                 }
             }
         }
-        return updatedLoop
+
+        let prevUnifiedGap = unifiedLoopClosureGapMeters
+        evaluateUnifiedLoopClosure()
+        return unifiedLoopClosureGapMeters != prevUnifiedGap
+    }
+
+    /// Group sightings of each `markerID` into passes separated by `dt >= 3.0 s` and
+    /// `(maxExcursion >= 1.0 m || dt >= 10.0 s)`, matching `toolkit/src/yardstick/geometry.py:326–360` (`YS-71`).
+    public static func clusterMarkerPasses(
+        sightings: [ReplayMarkerSighting],
+        cameraPositionsByIndex: [Int: SIMD3<Double>],
+        minTimeGapS: Double = 3.0,
+        minExcursionM: Double = 1.0
+    ) -> [Int: [[ReplayMarkerSighting]]] {
+        var byMarker: [Int: [ReplayMarkerSighting]] = [:]
+        for s in sightings {
+            byMarker[s.sighting.markerID, default: []].append(s)
+        }
+
+        var passesByMarker: [Int: [[ReplayMarkerSighting]]] = [:]
+        for (mid, rows) in byMarker {
+            let sortedRows = rows.sorted { $0.timestampS < $1.timestampS }
+            guard let firstRow = sortedRows.first else { continue }
+            var passes: [[ReplayMarkerSighting]] = [[firstRow]]
+
+            for r in sortedRows.dropFirst() {
+                let prev = passes[passes.count - 1].last!
+                let dt = r.timestampS - prev.timestampS
+                if dt >= minTimeGapS {
+                    let idxPrev = prev.savedIndex
+                    let idxCurr = r.savedIndex
+                    let mPos = prev.sighting.positionWorld
+                    var maxExc = 0.0
+                    if idxPrev <= idxCurr {
+                        for k in idxPrev...idxCurr {
+                            if let camP = cameraPositionsByIndex[k] {
+                                let d = simd_length(camP - mPos)
+                                if d > maxExc { maxExc = d }
+                            }
+                        }
+                    }
+                    if maxExc >= minExcursionM || dt >= 10.0 {
+                        passes.append([r])
+                        continue
+                    }
+                }
+                passes[passes.count - 1].append(r)
+            }
+            passesByMarker[mid] = passes
+        }
+        return passesByMarker
+    }
+
+    /// Compute component-wise median of 3D positions (`geometry.py:580–587`).
+    public static func medianPosition3D(_ positions: [SIMD3<Double>]) -> SIMD3<Double> {
+        guard !positions.isEmpty else { return .zero }
+        func med(_ vals: [Double]) -> Double {
+            let s = vals.sorted()
+            let m = s.count / 2
+            return (s.count % 2 == 1) ? s[m] : 0.5 * (s[m - 1] + s[m])
+        }
+        return SIMD3<Double>(
+            med(positions.map(\.x)),
+            med(positions.map(\.y)),
+            med(positions.map(\.z))
+        )
+    }
+
+    /// Evaluate the unified `YS-71` loop-closure rule (`toolkit/src/yardstick/geometry.py:512–598`).
+    public mutating func evaluateUnifiedLoopClosure(
+        confirmedMarker0StillIndices: Set<Int>? = nil,
+        requireAllFourMarkersOrEndEarly: Bool = true,
+        maxClosingDistanceM: Double = 1.50,
+        poseJumpSumM: Double = 0.0
+    ) {
+        let passesByMarker = Self.clusterMarkerPasses(
+            sightings: allSightings,
+            cameraPositionsByIndex: cameraPositionsByIndex
+        )
+        guard let m0Passes = passesByMarker[0], m0Passes.count >= 2 else {
+            unifiedLoopClosed = false
+            unifiedLoopClosureGapMeters = nil
+            return
+        }
+
+        // YS-71: Finish requires markers 1–3 seen/locked (or "End early" chosen) before Marker 0's closing hold
+        if requireAllFourMarkersOrEndEarly && !endEarlyChosen {
+            let hasM123 = detectedMarkerIDs.contains(1) && detectedMarkerIDs.contains(2) && detectedMarkerIDs.contains(3)
+            if !hasM123 {
+                unifiedLoopClosed = false
+                unifiedLoopClosureGapMeters = nil
+                return
+            }
+        }
+
+        var latestOtherMarkerTimeS: Double? = nil
+        for (mid, mPasses) in passesByMarker where mid != 0 {
+            for mp in mPasses {
+                for r in mp {
+                    if let lcT = loopClosedEventTimeS, r.timestampS > lcT + 1e-6 {
+                        continue
+                    }
+                    if latestOtherMarkerTimeS == nil || r.timestampS > latestOtherMarkerTimeS! {
+                        latestOtherMarkerTimeS = r.timestampS
+                    }
+                }
+            }
+        }
+
+        let effectiveEndTimeS = loopClosedEventTimeS ?? walkEndTimeS
+        let effectiveLastTapTimeS: Double? = {
+            guard let tapT = lastOperatorTapTimeS else { return nil }
+            if let lcT = loopClosedEventTimeS, tapT > lcT + 1e-6 {
+                return nil
+            }
+            return tapT
+        }()
+
+        let walkSpanS: Double = {
+            guard let endT = effectiveEndTimeS, let startT = walkStartTimeS, endT >= startT else {
+                return 0.0
+            }
+            return endT - startT
+        }()
+
+        let lastPassM0: [ReplayMarkerSighting]
+        if let lcT = loopClosedEventTimeS {
+            let returnPasses = m0Passes.dropFirst().map { mp in
+                mp.filter { $0.timestampS <= lcT + 1e-6 }
+            }.filter { !$0.isEmpty }
+            lastPassM0 = returnPasses.last ?? []
+        } else {
+            lastPassM0 = m0Passes.last ?? []
+        }
+
+        var validClosingRows: [ReplayMarkerSighting] = []
+        for r in lastPassM0 {
+            let rT = r.timestampS
+            let rIdx = r.savedIndex
+            if let endT = effectiveEndTimeS {
+                if (endT - rT) > 30.0 {
+                    continue
+                }
+                if walkSpanS > 5.0 && (endT - rT) > min(30.0, 0.35 * walkSpanS) {
+                    continue
+                }
+            }
+            if let tapT = effectiveLastTapTimeS, rT < tapT - 1e-6 {
+                continue
+            }
+            if let otherT = latestOtherMarkerTimeS, rT < otherT - 1e-6 {
+                continue
+            }
+            guard let camP = cameraPositionsByIndex[rIdx] else {
+                continue
+            }
+            if simd_length(camP - r.sighting.positionWorld) > maxClosingDistanceM {
+                continue
+            }
+            if let confirmedSet = confirmedMarker0StillIndices, !confirmedSet.contains(rIdx) {
+                continue
+            }
+            validClosingRows.append(r)
+        }
+
+        guard !validClosingRows.isEmpty else {
+            unifiedLoopClosed = false
+            unifiedLoopClosureGapMeters = nil
+            return
+        }
+
+        let firstPass = m0Passes[0]
+        let pFirst = Self.medianPosition3D(firstPass.map(\.sighting.positionWorld))
+        let pLast = Self.medianPosition3D(validClosingRows.map(\.sighting.positionWorld))
+        let rawGap = simd_length(pLast - pFirst)
+        let effGap = max(rawGap, poseJumpSumM)
+
+        unifiedLoopClosed = true
+        unifiedLoopClosureGapMeters = effGap
+        marker0FirstPassPos = pFirst
+        marker0FirstPassTimeS = firstPass.first?.timestampS
+        marker0LastPassPos = pLast
+        marker0LastPassTimeS = validClosingRows.last?.timestampS
     }
 }
 
 /// Toolkit reference verdict loaded from the checked-in Python toolkit golden file
 /// (`ios/Yardstick/Tests/Fixtures/toolkit_golden_walks_1_5.json`, generated by
 /// `toolkit/scripts/generate_ys66_replay_fixtures.py`).
-/// Note (`YS-66` / `YS-71`): Before `YS-71`, toolkit verdicts come strictly from the Python toolkit's
-/// golden output rather than a duplicate Swift port.
 public struct ToolkitGoldenMarkerEntry: Codable, Sendable {
     public let sightings_count: Int
     public let size_mm_printed: Double
@@ -213,9 +449,9 @@ public struct ToolkitGoldenFile: Codable, Sendable {
 }
 
 public enum CaptureReplayDetectionMode: Sendable {
-    /// Decode saved JPEGs (`stills/%06d.jpg`) to BT.601 full-range luma and run `ArUcoDetector.detectMarkers2D` + 3D LiDAR plane fit.
+    /// Decode saved JPEGs (`stills/%06d.jpg`) to BT.601 full-range luma and run `ArUcoDetector.detectMarkers2D` + 3D LiDAR plane fit (`YS-69`, `YS-70`).
     case liveDetectorOnStills
-    /// Use the 2D corner UV coordinates recorded in `markers.csv` and run `ArUcoDetector.measureMarker3DOnLiDARPlane` against the depth/confidence PNGs.
+    /// Use the 2D corner UV coordinates recorded in `markers.csv` and run `ArUcoDetector.measureMarker3DOnLiDARPlane` against the depth/confidence PNGs (`YS-66`).
     case recordedCornersFromCSV
 }
 
@@ -229,6 +465,16 @@ public struct CaptureReplayResult: Sendable {
     public let replayedSightings: [ReplayMarkerSighting]
     public let phoneLoopState: PhoneLoopRuleState
     public let elapsedSeconds: Double
+    /// Count of still-backed rows in `originalSightings` rejected by OpenCV `DICT_5X5_250` + sub-pixel corner shift (`YS-70`, `YS-73`).
+    public let openCVRejectedOriginalSightingsCount: Int
+    /// Count of those OpenCV-rejected sightings that are also flagged by the `YS-73` stillness and distance gate (`turnRate <= 0.15 rad/s`, `0.5–1.5 m`).
+    public let ys73FlaggedOfOpenCVRejectedCount: Int
+    /// Count of good OpenCV-confirmed sightings per marker kept after applying the `YS-73` stillness and distance gate.
+    public let ys73KeptGoodSightingsByMarker: [Int: Int]
+    /// Count of replayed sightings that were written without OpenCV JPEG confirmation (`0` under `YS-70`).
+    public let unconfirmedSightingsCount: Int
+    /// Count of replayed sightings that disagree with OpenCV on the saved JPEG (`0` under `YS-70`).
+    public let markerOpenCVDisagreementCount: Int
 
     /// Compute the median `sizeMMMeasured` for `markerID` in `sightings`.
     public static func medianSizeMM(for markerID: Int, in sightings: [ReplayMarkerSighting]) -> Double? {
@@ -236,6 +482,42 @@ public struct CaptureReplayResult: Sendable {
         guard !vals.isEmpty else { return nil }
         let mid = vals.count / 2
         return (vals.count % 2 == 1) ? vals[mid] : 0.5 * (vals[mid - 1] + vals[mid])
+    }
+
+    /// Compute the multi-frame pass-fused marker size in millimeters matching `toolkit/src/yardstick/markers.py:332–347` (`YS-69`).
+    public static func fusedPassSizeMM(
+        for markerID: Int,
+        in sightings: [ReplayMarkerSighting],
+        cameraPositionsByIndex: [Int: SIMD3<Double>]
+    ) -> Double? {
+        let passesByMarker = PhoneLoopRuleState.clusterMarkerPasses(
+            sightings: sightings,
+            cameraPositionsByIndex: cameraPositionsByIndex
+        )
+        guard let passes = passesByMarker[markerID], !passes.isEmpty else {
+            return medianSizeMM(for: markerID, in: sightings)
+        }
+        var fusedPassSizes: [Double] = []
+        for passRows in passes {
+            let validCorners = passRows.map(\.sighting.cornersWorld).filter { $0.count == 4 }
+            guard !validCorners.isEmpty else { continue }
+            var meanCorners = [SIMD3<Double>](repeating: .zero, count: 4)
+            let invCount = 1.0 / Double(validCorners.count)
+            for cw in validCorners {
+                for i in 0..<4 {
+                    meanCorners[i] += cw[i] * invCount
+                }
+            }
+            var edgeSum = 0.0
+            for i in 0..<4 {
+                edgeSum += simd_length(meanCorners[(i + 1) % 4] - meanCorners[i])
+            }
+            fusedPassSizes.append((edgeSum * 0.25) * 1000.0)
+        }
+        guard !fusedPassSizes.isEmpty else {
+            return medianSizeMM(for: markerID, in: sightings)
+        }
+        return fusedPassSizes.reduce(0.0, +) / Double(fusedPassSizes.count)
     }
 }
 
@@ -291,36 +573,12 @@ public enum CaptureReplayHarness {
 
     /// Decode a saved JPEG still into an 8-bit ITU-R BT.601 full-range luma buffer matching `kCVPixelFormatType_420YpCbCr8BiPlanarFullRange`.
     public static func loadLumaFromJPEG(at url: URL) -> (luma: [UInt8], width: Int, height: Int)? {
-        guard let src = CGImageSourceCreateWithURL(url as CFURL, nil),
-              let cgImg = CGImageSourceCreateImageAtIndex(src, 0, nil)
-        else { return nil }
-        let w = cgImg.width
-        let h = cgImg.height
-        var rgba = [UInt8](repeating: 0, count: w * h * 4)
-        guard let cs = CGColorSpace(name: CGColorSpace.sRGB),
-              let ctx = CGContext(
-                  data: &rgba,
-                  width: w,
-                  height: h,
-                  bitsPerComponent: 8,
-                  bytesPerRow: w * 4,
-                  space: cs,
-                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-              )
-        else { return nil }
-        ctx.draw(cgImg, in: CGRect(x: 0, y: 0, width: w, height: h))
-        var luma = [UInt8](repeating: 0, count: w * h)
-        for i in 0..<(w * h) {
-            let r = Int(rgba[i * 4])
-            let g = Int(rgba[i * 4 + 1])
-            let b = Int(rgba[i * 4 + 2])
-            luma[i] = UInt8(clamping: (77 * r + 150 * g + 29 * b + 128) >> 8)
-        }
-        return (luma, w, h)
+        guard let data = try? Data(contentsOf: url) else { return nil }
+        return ArUcoDetector.decodeLumaFromJPEGData(data)
     }
 
     /// Replay a recorded capture folder on disk (`frames.csv`, `poses.csv`, `stills.csv`, `markers.csv`, `events.csv`,
-    /// `stills/*.jpg`, `depth/*.png`, `confidence/*.png`) through the phone's detector and rules (`YS-66`).
+    /// `stills/*.jpg`, `depth/*.png`, `confidence/*.png`) through the phone's detector and rules (`YS-66`, `YS-69`, `YS-70`, `YS-71`, `YS-73`).
     public static func replayCaptureDirectory(
         at dirURL: URL,
         mode: CaptureReplayDetectionMode = .liveDetectorOnStills,
@@ -329,7 +587,7 @@ public enum CaptureReplayHarness {
         let tStart = CFAbsoluteTimeGetCurrent()
         let sessionID = dirURL.lastPathComponent
 
-        // 1. Parse poses.csv
+        // 1. Parse poses.csv and compute per-frame angular turn rates (rad/s, YS-73)
         let posesText = try String(contentsOf: dirURL.appendingPathComponent("poses.csv"), encoding: .utf8)
         struct PoseEntry: Sendable {
             let t: Double
@@ -337,8 +595,12 @@ public enum CaptureReplayHarness {
             let cMat: simd_double4x4
             let fx: Double, fy: Double, cx: Double, cy: Double
             let w: Int, h: Int
+            let turnRateRadS: Double
         }
         var posesByIdx: [Int: PoseEntry] = [:]
+        var orderedPoses: [PoseEntry] = []
+        var prevPoseMat: simd_double4x4? = nil
+        var prevPoseT: Double = 0.0
         for line in posesText.split(separator: "\n").dropFirst() {
             let cols = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
             guard cols.count >= 15,
@@ -352,7 +614,16 @@ public enum CaptureReplayHarness {
             let q = simd_normalize(simd_quatd(ix: qx, iy: qy, iz: qz, r: qw))
             var cMat = simd_double4x4(q)
             cMat.columns.3 = SIMD4<Double>(px, py, pz, 1.0)
-            posesByIdx[idx] = PoseEntry(t: t, savedIndex: idx, cMat: cMat, fx: fx, fy: fy, cx: cx, cy: cy, w: w, h: h)
+            let tr = ExposureAndStillnessGate.computeTurnRateRadS(
+                previousTransform: prevPoseMat,
+                currentTransform: cMat,
+                dt: t - prevPoseT
+            )
+            prevPoseMat = cMat
+            prevPoseT = t
+            let entry = PoseEntry(t: t, savedIndex: idx, cMat: cMat, fx: fx, fy: fy, cx: cx, cy: cy, w: w, h: h, turnRateRadS: tr)
+            posesByIdx[idx] = entry
+            orderedPoses.append(entry)
         }
 
         // 2. Parse original markers.csv
@@ -399,6 +670,7 @@ public enum CaptureReplayHarness {
 
         // 3. Parse stills.csv
         var stillPathByIdx: [Int: String] = [:]
+        var stillExposureByIdx: [Int: Double] = [:]
         let stillsURL = dirURL.appendingPathComponent("stills.csv")
         if FileManager.default.fileExists(atPath: stillsURL.path),
            let stillsText = try? String(contentsOf: stillsURL, encoding: .utf8) {
@@ -406,6 +678,41 @@ public enum CaptureReplayHarness {
                 let cols = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
                 guard cols.count >= 3, let idx = Int(cols[1]) else { continue }
                 stillPathByIdx[idx] = cols[2]
+                if cols.count >= 17, let expS = Double(cols[16]) {
+                    stillExposureByIdx[idx] = expS
+                }
+            }
+        }
+
+        // 3b. Parse events.csv & guidance.csv for operator taps and loop_closed anchor (`YS-67`, `YS-71`)
+        let operatorTapKinds: Set<String> = ["marker", "note", "tape_a", "tape_b"]
+        var operatorTapTimes: [Double] = []
+        var loopClosedTimes: [Double] = []
+        let eventsURL = dirURL.appendingPathComponent("events.csv")
+        if FileManager.default.fileExists(atPath: eventsURL.path),
+           let eventsText = try? String(contentsOf: eventsURL, encoding: .utf8) {
+            for line in eventsText.split(separator: "\n").dropFirst() {
+                let cols = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+                guard cols.count >= 3, let t = Double(cols[0]) else { continue }
+                let kind = cols[2].trimmingCharacters(in: .whitespacesAndNewlines)
+                if operatorTapKinds.contains(kind) {
+                    operatorTapTimes.append(t)
+                }
+                if kind == "loop_closed" {
+                    loopClosedTimes.append(t)
+                }
+            }
+        }
+        let guidanceURL = dirURL.appendingPathComponent("guidance.csv")
+        if FileManager.default.fileExists(atPath: guidanceURL.path),
+           let guidanceText = try? String(contentsOf: guidanceURL, encoding: .utf8) {
+            for line in guidanceText.split(separator: "\n").dropFirst() {
+                let cols = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+                guard cols.count >= 3, let t = Double(cols[0]) else { continue }
+                let ev = cols[2].trimmingCharacters(in: .whitespacesAndNewlines)
+                if ev == "loop_closed" {
+                    loopClosedTimes.append(t)
+                }
             }
         }
 
@@ -444,6 +751,7 @@ public enum CaptureReplayHarness {
 
         // 5. Run marker detection & 3D LiDAR plane measurement across candidate frames in parallel
         let detectionsLock = OSAllocatedUnfairLock(initialState: [Int: [DetectedMarkerSighting]]())
+        let detected2DLock = OSAllocatedUnfairLock(initialState: [Int: Set<Int>]())
         let immutablePoses = posesByIdx
         let immutablePrintedSizes = printedSizeByMarker
 
@@ -453,11 +761,18 @@ public enum CaptureReplayHarness {
             DispatchQueue.concurrentPerform(iterations: sortedStillPairs.count) { i in
                 let (sIdx, relPath) = sortedStillPairs[i]
                 guard let pose = immutablePoses[sIdx],
-                      let (luma, w, h) = loadLumaFromJPEG(at: dirURL.appendingPathComponent(relPath)),
+                      let jpegData = try? Data(contentsOf: dirURL.appendingPathComponent(relPath)),
+                      let (luma, w, h) = ArUcoDetector.decodeLumaFromJPEGData(jpegData),
                       let (dMM, dW, dH) = loadDepth16BitPNG(at: dirURL.appendingPathComponent(String(format: "depth/%06d.png", sIdx))),
                       let (cMap, _, _) = loadConfidence8BitPNG(at: dirURL.appendingPathComponent(String(format: "confidence/%06d.png", sIdx)))
                 else { return }
-                let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: w, height: h)
+                let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: w, height: h, maxCornerShiftRatio: 0.03)
+                if !dets2D.isEmpty {
+                    let ids2D = Set(dets2D.map(\.markerID))
+                    detected2DLock.withLock { state in
+                        state[sIdx] = ids2D
+                    }
+                }
                 var measured: [DetectedMarkerSighting] = []
                 for d2 in dets2D {
                     let pSize = immutablePrintedSizes[d2.markerID] ?? defaultPrintedSizeMM
@@ -475,7 +790,9 @@ public enum CaptureReplayHarness {
                         fy: pose.fy,
                         cx: pose.cx,
                         cy: pose.cy,
-                        cameraToWorld: pose.cMat
+                        cameraToWorld: pose.cMat,
+                        maxEdgeDisagreementRatio: 0.04,
+                        maxPlaneTiltFromViewDeg: 60.0
                     ) {
                         measured.append(s3D)
                     }
@@ -500,6 +817,8 @@ public enum CaptureReplayHarness {
                 else { return }
                 var measured: [DetectedMarkerSighting] = []
                 for r in rows {
+                    // In `.recordedCornersFromCSV` (YS-66 historical reproduction mode), disable the YS-69 4% edge gate
+                    // and use the original 75° plane tilt so all 432 recorded rows reconstruct within 0.01 mm.
                     if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
                         markerID: r.sighting.markerID,
                         cornersUV: r.sighting.cornersUV,
@@ -514,7 +833,9 @@ public enum CaptureReplayHarness {
                         fy: pose.fy,
                         cx: pose.cx,
                         cy: pose.cy,
-                        cameraToWorld: pose.cMat
+                        cameraToWorld: pose.cMat,
+                        maxEdgeDisagreementRatio: 0.0,
+                        maxPlaneTiltFromViewDeg: 75.0
                     ) {
                         measured.append(s3D)
                     }
@@ -528,23 +849,100 @@ public enum CaptureReplayHarness {
             }
         }
         let detectionsBySavedIndex = detectionsLock.withLock { $0 }
+        let detected2DBySavedIndex = detected2DLock.withLock { $0 }
 
         // 6. Feed all frames sequentially in timestamp order through the phone's rules
         var phoneLoopState = PhoneLoopRuleState()
+        phoneLoopState.walkStartTimeS = orderedPoses.first?.t
+        phoneLoopState.walkEndTimeS = orderedPoses.last?.t
+        phoneLoopState.loopClosedEventTimeS = loopClosedTimes.max()
+        let filteredTaps = operatorTapTimes.filter { tapT in
+            guard let lcT = phoneLoopState.loopClosedEventTimeS else { return true }
+            return tapT <= lcT + 1e-6
+        }
+        phoneLoopState.lastOperatorTapTimeS = filteredTaps.max()
+
         var replayedSightings: [ReplayMarkerSighting] = []
         for frame in frames {
             guard !frame.dropped,
                   let sIdx = frame.savedIndex,
                   let camPosW = frame.cameraPositionWorld
             else { continue }
-            phoneLoopState.updateCameraExcursion(cameraPositionWorld: camPosW)
+            phoneLoopState.updateCameraExcursion(
+                cameraPositionWorld: camPosW,
+                savedIndex: sIdx,
+                timestampS: frame.timestampS
+            )
             if let dets = detectionsBySavedIndex[sIdx] {
-                phoneLoopState.ingestSightings(dets, timestampS: frame.timestampS, cameraPositionWorld: camPosW)
+                phoneLoopState.ingestSightings(
+                    dets,
+                    timestampS: frame.timestampS,
+                    savedIndex: sIdx,
+                    cameraPositionWorld: camPosW
+                )
                 for d in dets {
                     replayedSightings.append(ReplayMarkerSighting(timestampS: frame.timestampS, savedIndex: sIdx, sighting: d))
                 }
             }
         }
+
+        // Finalize unified YS-71 loop closure evaluation at the end of the walk
+        let confirmedM0Stills: Set<Int>? = (mode == .liveDetectorOnStills)
+            ? Set(replayedSightings.filter { $0.sighting.markerID == 0 }.map(\.savedIndex))
+            : nil
+        phoneLoopState.evaluateUnifiedLoopClosure(
+            confirmedMarker0StillIndices: confirmedM0Stills,
+            requireAllFourMarkersOrEndEarly: true
+        )
+
+        // 7. Evaluate YS-70 confirmation and YS-73 stillness & distance gate across sightings
+        var openCVRejectedCount = 0
+        var ys73FlaggedOfRejectedCount = 0
+        var ys73KeptByMarker: [Int: Int] = [:]
+
+        if mode == .liveDetectorOnStills {
+            for orig in originalSightings {
+                let sIdx = orig.savedIndex
+                let mid = orig.sighting.markerID
+                guard let pose = posesByIdx[sIdx] else { continue }
+                let camPos = SIMD3<Double>(pose.cMat.columns.3.x, pose.cMat.columns.3.y, pose.cMat.columns.3.z)
+                let mPos = orig.sighting.positionWorld
+                let rng3D = simd_length(camPos - mPos)
+                let rngXZ = hypot(camPos.x - mPos.x, camPos.z - mPos.z)
+                let expS = stillExposureByIdx[sIdx] ?? (1.0 / 120.0)
+                let predBlur = ExposureAndStillnessGate.computePredictedBlurPx(
+                    focalLengthPx: 0.5 * (pose.fx + pose.fy),
+                    turnRateRadS: pose.turnRateRadS,
+                    exposureDurationS: expS
+                )
+                let verdict = ExposureAndStillnessGate.evaluateMarkerSighting(
+                    predictedBlurPx: predBlur,
+                    turnRateRadS: pose.turnRateRadS,
+                    rangeMeters3D: rng3D,
+                    horizontalRangeMeters: rngXZ
+                )
+
+                let hasStill = (stillPathByIdx[sIdx] != nil)
+                let confirmed2D = detected2DBySavedIndex[sIdx]?.contains(mid) ?? false
+                if hasStill && !confirmed2D {
+                    openCVRejectedCount += 1
+                    if !verdict.passes {
+                        ys73FlaggedOfRejectedCount += 1
+                    }
+                } else if verdict.passes {
+                    ys73KeptByMarker[mid, default: 0] += 1
+                }
+            }
+        }
+
+        // Under YS-70, in `.liveDetectorOnStills`, every replayed sighting comes from a saved still JPEG and is
+        // confirmed by OpenCV on that JPEG (`unconfirmedSightingsCount == 0`, `markerOpenCVDisagreementCount == 0`).
+        let unconfirmedCount = (mode == .liveDetectorOnStills)
+            ? replayedSightings.filter { stillPathByIdx[$0.savedIndex] == nil }.count
+            : 0
+        let disagreementCount = (mode == .liveDetectorOnStills)
+            ? replayedSightings.filter { !(detected2DBySavedIndex[$0.savedIndex]?.contains($0.sighting.markerID) ?? false) }.count
+            : 0
 
         return CaptureReplayResult(
             sessionID: sessionID,
@@ -555,8 +953,12 @@ public enum CaptureReplayHarness {
             originalSightings: originalSightings,
             replayedSightings: replayedSightings,
             phoneLoopState: phoneLoopState,
-            elapsedSeconds: CFAbsoluteTimeGetCurrent() - tStart
+            elapsedSeconds: CFAbsoluteTimeGetCurrent() - tStart,
+            openCVRejectedOriginalSightingsCount: openCVRejectedCount,
+            ys73FlaggedOfOpenCVRejectedCount: ys73FlaggedOfRejectedCount,
+            ys73KeptGoodSightingsByMarker: ys73KeptByMarker,
+            unconfirmedSightingsCount: unconfirmedCount,
+            markerOpenCVDisagreementCount: disagreementCount
         )
     }
 }
-

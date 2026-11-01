@@ -65,6 +65,7 @@ public struct ContentView: View {
     @State private var showNoteDialog = false
     @State private var noteTextInput = ""
     @State private var showShareSheet = false
+    @State private var showAboutSheet = false
     @State private var didTriggerAutoBench = false
 
     public init() {}
@@ -174,8 +175,42 @@ public struct ContentView: View {
                     .clipShape(.rect(cornerRadius: 12))
             }
             .disabled(!CaptureSessionRecorder.isLiDARSupported)
+
+            Button {
+                showAboutSheet = true
+            } label: {
+                Label("About & Open-Source Licences", systemImage: "info.circle")
+                    .font(.footnote)
+                    .foregroundStyle(.gray)
+            }
         }
         .padding(24)
+        .sheet(isPresented: $showAboutSheet) {
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        Text("Yardstick")
+                            .font(.title2.bold())
+                        Text("Contract: yardstick-capture/1 · Apache License 2.0")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Divider()
+                        Text("Open-Source Notices")
+                            .font(.headline)
+                        Text(ArUcoDetector.openCVApacheAttributionNotice)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding()
+                }
+                .navigationTitle("About")
+                .toolbar {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Done") { showAboutSheet = false }
+                    }
+                }
+            }
+        }
     }
 
     private var recordingHUDView: some View {
@@ -227,6 +262,19 @@ public struct ContentView: View {
                         .padding(.horizontal, 10)
                         .padding(.vertical, 6)
                         .background(Color.yellow)
+                        .clipShape(.rect(cornerRadius: 6))
+                    }
+
+                    if let sizeWarn = recorder.liveMarkerSizeWarning {
+                        HStack(spacing: 6) {
+                            Image(systemName: "ruler")
+                            Text(sizeWarn)
+                                .font(.caption.bold())
+                        }
+                        .foregroundStyle(.black)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 6)
+                        .background(Color.orange)
                         .clipShape(.rect(cornerRadius: 6))
                     }
 

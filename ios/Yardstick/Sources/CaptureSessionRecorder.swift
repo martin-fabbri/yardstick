@@ -56,6 +56,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var stillsFH: FileHandle?
     var markersFH: FileHandle?
     var eventsFH: FileHandle?
+    var guidanceFH: FileHandle?
     var audioFH: FileHandle?
 
     var framesDigest = IncrementalByteDigest()
@@ -63,6 +64,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var stillsDigest = IncrementalByteDigest()
     var markersDigest = IncrementalByteDigest()
     var eventsDigest = IncrementalByteDigest()
+    var guidanceDigest = IncrementalByteDigest()
 
     var audioConverter: AVAudioConverter?
     var audioInputFormat: AVAudioFormat?
@@ -120,7 +122,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             registry: digestRegistry
         )
         try Self.createFileWithHeader(
-            "t,saved_index,file,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height\n",
+            "t,saved_index,file,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height,exposure_duration_s,iso\n",
             at: captureDirURL.appendingPathComponent("stills.csv"),
             digest: &stillsDigest,
             registry: digestRegistry
@@ -137,6 +139,12 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             digest: &eventsDigest,
             registry: digestRegistry
         )
+        try Self.createFileWithHeader(
+            ExposureAndStillnessGate.guidanceCSVHeader,
+            at: captureDirURL.appendingPathComponent("guidance.csv"),
+            digest: &guidanceDigest,
+            registry: digestRegistry
+        )
         try Self.initializeAudioWavHeader(at: captureDirURL.appendingPathComponent("audio.wav"))
         digestRegistry.addRecordedBytes(44)
 
@@ -150,6 +158,8 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         try self.markersFH?.seekToEnd()
         self.eventsFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("events.csv"))
         try self.eventsFH?.seekToEnd()
+        self.guidanceFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("guidance.csv"))
+        try self.guidanceFH?.seekToEnd()
         self.audioFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("audio.wav"))
         try self.audioFH?.seekToEnd()
 
@@ -238,6 +248,8 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             markersDigest.update(with: data)
         } else if fh === eventsFH {
             eventsDigest.update(with: data)
+        } else if fh === guidanceFH {
+            guidanceDigest.update(with: data)
         }
         digestRegistry.addRecordedBytes(UInt64(data.count))
     }
@@ -327,12 +339,14 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         try? stillsFH?.close()
         try? markersFH?.close()
         try? eventsFH?.close()
+        try? guidanceFH?.close()
 
         digestRegistry.record(framesDigest.finalize(), forRelativePath: "frames.csv")
         digestRegistry.record(posesDigest.finalize(), forRelativePath: "poses.csv")
         digestRegistry.record(stillsDigest.finalize(), forRelativePath: "stills.csv")
         digestRegistry.record(markersDigest.finalize(), forRelativePath: "markers.csv")
         digestRegistry.record(eventsDigest.finalize(), forRelativePath: "events.csv")
+        digestRegistry.record(guidanceDigest.finalize(), forRelativePath: "guidance.csv")
 
         var audioFinalizeErr: Error?
         if let aFH = audioFH {
@@ -405,6 +419,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var sealingProgress: Double = 0.0
     @Published public private(set) var sealingStatusText: String = "Saving your walk"
     @Published public private(set) var lowDiskSpaceWarning: String? = nil
+    @Published public private(set) var latestExposureDurationS: Double = 0.0
+    @Published public private(set) var latestISO: Double = 100.0
+    @Published public private(set) var latestTurnRateRadS: Double = 0.0
+    @Published public private(set) var latestPredictedBlurPx: Double = 0.0
+    @Published public private(set) var liveMarkerSizeWarning: String? = nil
+    @Published public private(set) var isLoopClosed: Bool = false
 
     private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM"
 
@@ -656,6 +676,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         sealingProgress = 0.0
         sealingStatusText = "Saving your walk"
         lowDiskSpaceWarning = nil
+        latestExposureDurationS = 0.0
+        latestISO = 100.0
+        latestTurnRateRadS = 0.0
+        latestPredictedBlurPx = 0.0
+        liveMarkerSizeWarning = nil
+        isLoopClosed = false
 
         #if canImport(ARKit) && !targetEnvironment(simulator)
         let config = ARWorldTrackingConfiguration()
@@ -745,6 +771,11 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
         let t = latestTimestampS
         let sIdx = max(0, latestSavedIndex)
+        if ["marker", "note", "tape_a", "tape_b"].contains(kind) {
+            phoneLoopState.recordOperatorTap(at: t)
+        } else if kind == "loop_closed" {
+            phoneLoopState.recordLoopClosedEvent(at: t)
+        }
         let safeDetail = detail.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
         let line = String(format: "%.6f,%d,%@,%@\n", t, sIdx, kind, safeDetail)
         writerQueue.async { [weak self] in
@@ -1218,16 +1249,21 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         filesArray.sort { ($0["path"] as? String ?? "") < ($1["path"] as? String ?? "") }
         progressHandler?(0.15, "Saving your walk")
 
+        var streamsDeclared = [
+            "session", "frames", "rgb_video", "depth", "confidence",
+            "poses", "audio", "events", "stills", "markers",
+        ]
+        if precomputedCRCByRelPath["guidance.csv"] != nil {
+            streamsDeclared.append("guidance")
+        }
+
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         let manifestObj: [String: Any] = [
             "contract": "yardstick-capture/1",
             "capture_id": resolvedDir.lastPathComponent,
             "sealed_at_utc": formatter.string(from: Date()),
-            "streams_declared": [
-                "session", "frames", "rgb_video", "depth", "confidence",
-                "poses", "audio", "events", "stills", "markers",
-            ],
+            "streams_declared": streamsDeclared,
             "files": filesArray,
         ]
         let manifestURL = resolvedDir.appendingPathComponent("manifest.json")
@@ -1681,6 +1717,17 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         let intrinsics = frame.camera.intrinsics
         let deliveredW = CVPixelBufferGetWidth(frame.capturedImage)
         let deliveredH = CVPixelBufferGetHeight(frame.capturedImage)
+        let exposureDurationS = max(1e-5, Double(frame.camera.exposureDuration))
+        let isoVal = max(32.0, min(6400.0, 100.0 * pow(2.0, Double(frame.camera.exposureOffset))))
+        let thermalStr: String = {
+            switch ProcessInfo.processInfo.thermalState {
+            case .nominal: return "nominal"
+            case .fair: return "fair"
+            case .serious: return "serious"
+            case .critical: return "critical"
+            @unknown default: return "nominal"
+            }
+        }()
 
         // Compute grip-invariant pitch from optical look ray (-Z_c dot +Y_w, YS-05)
         let lookRayY = Double(-cTransform.columns.2.y)
@@ -1828,7 +1875,26 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                 }
             }
             let finalGapLines = gapLines
+            let prevTimestampS = self.lastDeliveredFrameTimestampS
+            let prevTransform = (prevTimestampS != nil) ? self.latestCameraTransform : nil
+            let frameDt = prevTimestampS.map { max(1e-4, timestampS - $0) } ?? expectedDt
             self.lastDeliveredFrameTimestampS = timestampS
+
+            let fx = Double(intrinsics.columns.0.x)
+            let fy = Double(intrinsics.columns.1.y)
+            let cx = Double(intrinsics.columns.2.x)
+            let cy = Double(intrinsics.columns.2.y)
+            let meanFocalPx = 0.5 * (fx + fy)
+            let turnRateRadS = ExposureAndStillnessGate.computeTurnRateRadS(
+                previousTransform: prevTransform,
+                currentTransform: cMat,
+                dt: frameDt
+            )
+            let predictedBlurPx = ExposureAndStillnessGate.computePredictedBlurPx(
+                focalLengthPx: meanFocalPx,
+                turnRateRadS: turnRateRadS,
+                exposureDurationS: exposureDurationS
+            )
 
             self.latestTimestampS = timestampS
             self.latestCameraTransform = cMat
@@ -1837,10 +1903,19 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.trackingStateText = trackingStr
             self.crosshairDepthMeters = finalCenterDepthM
             self.latestCrosshairWorld = finalCenterWorldPt
+            self.latestExposureDurationS = exposureDurationS
+            self.latestISO = isoVal
+            self.latestTurnRateRadS = turnRateRadS
+            self.latestPredictedBlurPx = predictedBlurPx
+            let currentInstruction = self.statusBanner
 
-            // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation (`YS-66`)
+            // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation (`YS-66`, `YS-71`)
             let camPosW = SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z)
-            self.phoneLoopState.updateCameraExcursion(cameraPositionWorld: camPosW)
+            self.phoneLoopState.updateCameraExcursion(
+                cameraPositionWorld: camPosW,
+                savedIndex: self.savedFrameCount,
+                timestampS: timestampS
+            )
 
             // Sample North calibration pairs while at Marker 0 start (spaced >= 0.15 s) (YS-14, Q020)
             let nearM0Start: Bool = {
@@ -1871,10 +1946,6 @@ extension CaptureSessionRecorder: ARSessionDelegate {
 
             let rawQuat = simd_quatd(cMat)
             let normQuat = simd_normalize(rawQuat)
-            let fx = Double(intrinsics.columns.0.x)
-            let fy = Double(intrinsics.columns.1.y)
-            let cx = Double(intrinsics.columns.2.x)
-            let cy = Double(intrinsics.columns.2.y)
             let rgbW = deliveredW
             let rgbH = deliveredH
             let wD = finalDepthW
@@ -1979,6 +2050,25 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         fx, fy, cx, cy, rgbW, rgbH
                     )
                     try engine.appendLine(pLine, to: engine.posesFH)
+
+                    let gLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
+                        timestampS: timestampS,
+                        savedIndex: sIdx,
+                        event: "frame",
+                        phase: "recording",
+                        instruction: currentInstruction,
+                        spoken: false,
+                        pitchDeg: pitchDegrees,
+                        rollDeg: rollDegrees,
+                        trackingState: trackingStr,
+                        exposureDurationS: exposureDurationS,
+                        iso: isoVal,
+                        turnRateRadS: turnRateRadS,
+                        predictedBlurPx: predictedBlurPx,
+                        thermalState: thermalStr,
+                        coverageCells: 0
+                    )
+                    try engine.appendLine(gLine, to: engine.guidanceFH)
                     sp.endInterval("CSVAppend", csvState)
 
                     let pngState = sp.beginInterval("DepthConfidencePNG")
@@ -2020,15 +2110,18 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         self.savedFrameCount = newSavedCount
                     }
 
-                    // Offload ArUco detection, 3D plane measurement, rate-limited still gate (`YS-68`), and
-                    // JPEG encoding onto the single-slot `detectionScheduler` so `writerQueue` is never blocked!
+                    // Offload ArUco detection, 3D plane measurement, stillness/distance gate (`YS-73`),
+                    // rate-limited still gate (`YS-68`), and OpenCV JPEG confirmation (`YS-70`) onto the
+                    // single-slot `detectionScheduler` so `writerQueue` is never blocked!
                     let shouldRunArUco = (sIdx % 3 == 0) || forceArUco
                     let shouldConsiderPeriodicStill = (timestampS - engine.lastAnyStillTimeS) >= 2.0
                     if shouldRunArUco || shouldConsiderPeriodicStill {
                         self.detectionScheduler.submitIfIdle { [weak self] in
                             guard let self, !engine.isClosed else { return }
                             let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
-                            var detected3D: [DetectedMarkerSighting] = []
+                            var rawDetected3D: [DetectedMarkerSighting] = []
+                            var eligibleSightings: [DetectedMarkerSighting] = []
+                            var rejectedCoachingCue: String? = nil
                             var sharpnessVal: Double? = nil
 
                             if let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
@@ -2052,25 +2145,51 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                             cy: cy,
                                             cameraToWorld: cMat
                                         ) {
-                                            detected3D.append(s3D)
+                                            rawDetected3D.append(s3D)
+                                            let rngXZ = hypot(
+                                                camPosW.x - s3D.positionWorld.x,
+                                                camPosW.z - s3D.positionWorld.z
+                                            )
+                                            let verdict = ExposureAndStillnessGate.evaluateMarkerSighting(
+                                                predictedBlurPx: predictedBlurPx,
+                                                turnRateRadS: turnRateRadS,
+                                                rangeMeters3D: s3D.rangeMeters,
+                                                horizontalRangeMeters: rngXZ
+                                            )
+                                            if verdict.passes || forceArUco {
+                                                eligibleSightings.append(s3D)
+                                            } else if rejectedCoachingCue == nil {
+                                                rejectedCoachingCue = verdict.coachingCue
+                                            }
                                         }
                                     }
                                 }
-                                if detected3D.isEmpty && shouldConsiderPeriodicStill {
+                                if eligibleSightings.isEmpty && shouldConsiderPeriodicStill {
                                     sharpnessVal = ArUcoDetector.computeLaplacianSharpness(lumaBytes: luma, width: rgbW, height: rgbH)
                                 }
                             }
                             sp.endInterval("ArUcoDetectAndMeasure", detectState)
 
+                            if let cue = rejectedCoachingCue, eligibleSightings.isEmpty {
+                                Task { @MainActor [weak self] in
+                                    guard let self, self.phase == .recording, self.lowDiskSpaceWarning == nil else { return }
+                                    self.statusBanner = cue
+                                }
+                            }
+
                             let gateDecision = engine.evaluateStillGate(
                                 timestampS: timestampS,
-                                detectedMarkerIDs: detected3D.map(\.markerID),
+                                detectedMarkerIDs: eligibleSightings.map(\.markerID),
                                 forceOperatorMarkerTap: forceArUco,
                                 sharpness: sharpnessVal
                             )
 
-                            // Encode JPEG and compute SHA-256 + CRC-32 in memory on `detectionQueue` (`YS-68`, `YS-84`)
+                            // Encode JPEG, compute SHA-256 + CRC-32, and re-confirm markers on the encoded JPEG bytes (`YS-68`, `YS-70`, `YS-84`).
+                            // Under YS-70: No row goes in `markers.csv`, and no marker-triggered still goes in `stills.csv`,
+                            // unless OpenCV confirms it on the saved JPEG frame!
                             var encodedStill: (relPath: String, data: Data, meta: FileDigestMeta, csvLine: String)? = nil
+                            var confirmedSightings: [DetectedMarkerSighting] = []
+
                             if gateDecision.shouldSave {
                                 let stillState = sp.beginInterval("StillJPEGEncode")
                                 let stillRelPath = String(format: "stills/%06d.jpg", sIdx)
@@ -2081,21 +2200,45 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     colorSpace: cs,
                                     options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]
                                 ) {
-                                    let meta = IncrementalByteDigest.compute(for: jpegData)
-                                    let sLine = String(
-                                        format: "%.6f,%d,%@,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d\n",
-                                        timestampS, sIdx, stillRelPath,
-                                        camPosW.x, camPosW.y, camPosW.z,
-                                        normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
-                                        fx, fy, cx, cy, rgbW, rgbH
-                                    )
-                                    encodedStill = (stillRelPath, jpegData, meta, sLine)
+                                    let isMarkerTriggered = (gateDecision.reason == "marker_hold") || !eligibleSightings.isEmpty
+                                    if isMarkerTriggered {
+                                        let jpegConfirmed = ArUcoDetector.confirmSightingsInJPEGData(
+                                            jpegData,
+                                            printedSizesByMarker: sizesSnapshot,
+                                            defaultPrintedSizeMM: 250.0,
+                                            depthMapMM: dPixels,
+                                            confidenceMap: cPixels,
+                                            depthWidth: wD,
+                                            depthHeight: hD,
+                                            fx: fx,
+                                            fy: fy,
+                                            cx: cx,
+                                            cy: cy,
+                                            cameraToWorld: cMat
+                                        )
+                                        let eligibleIDSet = Set(eligibleSightings.map(\.markerID))
+                                        confirmedSightings = jpegConfirmed.filter { eligibleIDSet.contains($0.markerID) }
+                                    }
+
+                                    // Write the still if it is a periodic still OR if at least one marker was confirmed on the JPEG (`YS-70`)
+                                    if gateDecision.reason != "marker_hold" || !confirmedSightings.isEmpty {
+                                        let meta = IncrementalByteDigest.compute(for: jpegData)
+                                        let sLine = String(
+                                            format: "%.6f,%d,%@,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.4f,%.4f,%.4f,%d,%d,%.6f,%.1f\n",
+                                            timestampS, sIdx, stillRelPath,
+                                            camPosW.x, camPosW.y, camPosW.z,
+                                            normQuat.imag.x, normQuat.imag.y, normQuat.imag.z, normQuat.real,
+                                            fx, fy, cx, cy, rgbW, rgbH,
+                                            exposureDurationS, isoVal
+                                        )
+                                        encodedStill = (stillRelPath, jpegData, meta, sLine)
+                                    }
                                 }
                                 sp.endInterval("StillJPEGEncode", stillState)
                             }
 
                             var markerLines: [String] = []
-                            for m in detected3D {
+                            for m in confirmedSightings {
                                 let mq = m.quaternionXYZW
                                 let c = m.cornersUV
                                 let mLine = String(
@@ -2109,7 +2252,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                 markerLines.append(mLine)
                             }
 
-                            let finalDetected = detected3D
+                            let finalDetected = confirmedSightings
                             let finalEncodedStill = encodedStill
                             let finalMarkerLines = markerLines
 
@@ -2143,16 +2286,37 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     let updatedLoop = self.phoneLoopState.ingestSightings(
                                         finalDetected,
                                         timestampS: timestampS,
+                                        savedIndex: sIdx,
                                         cameraPositionWorld: camPosW
                                     )
                                     self.detectedMarkerIDs = self.phoneLoopState.detectedMarkerIDs
+                                    self.isLoopClosed = self.phoneLoopState.unifiedLoopClosed
+
+                                    // YS-73: After 3 sightings of a marker, check if median measured size is > 3% off
+                                    for m in finalDetected {
+                                        let markerMeas = self.phoneLoopState.allSightings
+                                            .filter { $0.sighting.markerID == m.markerID }
+                                            .map(\.sighting.sizeMMMeasured)
+                                        let sizeCheck = ExposureAndStillnessGate.evaluateLiveMarkerSizeDeviation(
+                                            measuredSizesMM: markerMeas,
+                                            printedSizeMM: m.sizeMMPrinted
+                                        )
+                                        if sizeCheck.flagged, let medMM = sizeCheck.medianMM {
+                                            self.liveMarkerSizeWarning = String(
+                                                format: "Marker %d size %.1f mm differs from %.0f mm setting (> 3%%)",
+                                                m.markerID, medMM, m.sizeMMPrinted
+                                            )
+                                        }
+                                    }
+
                                     if !hadM0First && self.phoneLoopState.marker0FirstPassPos != nil {
                                         if self.lowDiskSpaceWarning == nil {
                                             self.statusBanner = "Marker 0 Origin locked — walk yard & return to Marker 0 at end"
                                         }
                                     }
-                                    if updatedLoop, let gap = self.phoneLoopState.loopClosureGapMeters {
+                                    if updatedLoop, let gap = self.phoneLoopState.unifiedLoopClosureGapMeters {
                                         self.loopClosureGapMeters = gap
+                                        self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
                                         self.updateProvisionalGrade()
                                         if self.lowDiskSpaceWarning == nil {
                                             self.statusBanner = String(format: "Marker 0 Loop Closed (gap %.1f cm) — tap Done", gap * 100.0)
