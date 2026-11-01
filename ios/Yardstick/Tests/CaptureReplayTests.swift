@@ -605,6 +605,32 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-74: Fix now must require re-locking Marker 2 and Marker 0 at the end")
         XCTAssertEqual(engine.phase, .markers1To3)
         XCTAssertEqual(engine.activeInstruction, "Walk to marker 2")
+
+        // 10. Adversarial regression checks:
+        // (a) Pairwise 3D spread > 2.5 cm (e.g., [-0.02, 0.0, +0.02] m -> 4.0 cm pairwise, 2.0 cm from median) must exceed 0.025 m!
+        let spreadSamples: [ConfirmedMarkerStillSample] = [
+            ConfirmedMarkerStillSample(timestampS: 10.0, savedIndex: 1, sighting: makeSighting(id: 2, pos: SIMD3<Double>(-0.020, 0, 0))),
+            ConfirmedMarkerStillSample(timestampS: 10.5, savedIndex: 2, sighting: makeSighting(id: 2, pos: SIMD3<Double>(0.000, 0, 0))),
+            ConfirmedMarkerStillSample(timestampS: 11.1, savedIndex: 3, sighting: makeSighting(id: 2, pos: SIMD3<Double>(0.020, 0, 0))),
+        ]
+        XCTAssertGreaterThan(MarkerHoldProgress.maxSpreadFromMedianM(spreadSamples), 0.025, "YS-74: Pairwise 3D spread of 4.0 cm must exceed 2.5 cm gate")
+
+        // (b) Portrait coordinate rotation for landscape-right 1920x1440 sensor buffers (`YS-74` HUD ring):
+        let sensorRing = MarkerRingVisualState(
+            markerID: 0,
+            isClosingHold: false,
+            confirmedSegments: 1,
+            isPaused: false,
+            pauseReason: nil,
+            showStepCloserChevron: false,
+            isLocked: false,
+            positionWorld: .zero,
+            cornersUV: [SIMD2<Double>(480.0, 360.0)],
+            rangeMeters: 1.0
+        )
+        let normPt = sensorRing.normalizedPortraitCenter(rgbWidth: 1920.0, rgbHeight: 1440.0)
+        XCTAssertEqual(normPt.x, 0.75, accuracy: 1e-4, "YS-74: Portrait X must be 1.0 - (v / 1440)")
+        XCTAssertEqual(normPt.y, 0.25, accuracy: 1e-4, "YS-74: Portrait Y must be u / 1920")
     }
 
     /// `YS-78`: Always-on unit test verifying the `0.25 m` `GroundCoverageGrid` filters depth to
@@ -612,7 +638,10 @@ final class CaptureReplayTests: XCTestCase {
     /// and matches toolkit ground cells `>= 90%`.
     func testYS78_GroundCoverageGrid_FiltersRangeHeightNormalAndMatchesToolkitCellsAtLeast90Percent() throws {
         var grid = GroundCoverageGrid(cellSizeM: 0.25)
+        let marker0Origin = SIMD3<Double>(0.10, 0.0, -0.15)
+        let marker0XAxis = SIMD3<Double>(cos(0.25), 0.0, sin(0.25))
         grid.anchorGroundPlaneY(0.0)
+        grid.anchorMarker0Frame(originWorld: marker0Origin, xAxisWorld: marker0XAxis)
 
         // Create a synthetic 64x48 depth map where the camera is at (0, 1.30, 0) pitched down -30°
         let dW = 64
@@ -688,7 +717,10 @@ final class CaptureReplayTests: XCTestCase {
 
         let agreement = GroundCoverageGrid.computeCellAgreementWithToolkitGroundPoints(
             worldGroundPoints: toolkitGroundSamples,
-            groundYWorld: 0.0
+            groundYWorld: 0.0,
+            originWorld: marker0Origin,
+            xAxisWorld: marker0XAxis,
+            ingestedGrid: grid
         )
         XCTAssertGreaterThanOrEqual(
             agreement.agreementRatio,

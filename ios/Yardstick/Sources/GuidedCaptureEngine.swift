@@ -119,6 +119,10 @@ public struct GroundCoverageGrid: Sendable, Equatable {
     public let maxSurfaceTiltFromVerticalDeg: Double
 
     public private(set) var groundPlaneYWorld: Double? = nil
+    public private(set) var isAnchoredToMarker: Bool = false
+    public private(set) var originXZ: SIMD2<Double> = .zero
+    public private(set) var uAxisXZ: SIMD2<Double> = SIMD2<Double>(1.0, 0.0)
+    public private(set) var vAxisXZ: SIMD2<Double> = SIMD2<Double>(0.0, 1.0)
     public private(set) var coveredCells: Set<GroundGridCell> = []
     public private(set) var highConfidenceCells: Set<GroundGridCell> = []
     public private(set) var lastUpdatedTimestampS: Double = -100.0
@@ -146,12 +150,56 @@ public struct GroundCoverageGrid: Sendable, Equatable {
         Double(coveredCells.count) * cellSizeM * cellSizeM
     }
 
+    /// Anchor the ground plane height to a measured floor marker (`YS-78`).
+    /// On the first marker sighting, snaps directly to `yWorld` (replacing any startup depth heuristic)
+    /// and purges any unanchored cells if the heuristic height differed by `> 0.10 m`.
     public mutating func anchorGroundPlaneY(_ yWorld: Double) {
-        if groundPlaneYWorld == nil {
+        if !isAnchoredToMarker {
+            if let unanchoredY = groundPlaneYWorld, abs(unanchoredY - yWorld) > 0.10 {
+                coveredCells.removeAll()
+                highConfidenceCells.removeAll()
+            }
             groundPlaneYWorld = yWorld
+            isAnchoredToMarker = true
         } else if let existing = groundPlaneYWorld {
             groundPlaneYWorld = 0.8 * existing + 0.2 * yWorld
+        } else {
+            groundPlaneYWorld = yWorld
+            isAnchoredToMarker = true
         }
+    }
+
+    /// Anchor the ground coverage grid to Marker 0's horizontal origin and yaw (`YS-78`) so cell indices `(ix, iz)`
+    /// align with the Marker-0 Yard Frame used by `coverage.json`.
+    public mutating func anchorMarker0Frame(
+        originWorld: SIMD3<Double>,
+        xAxisWorld: SIMD3<Double> = SIMD3<Double>(1.0, 0.0, 0.0)
+    ) {
+        anchorGroundPlaneY(originWorld.y)
+        let newOriginXZ = SIMD2<Double>(originWorld.x, originWorld.z)
+        let rawU = SIMD2<Double>(xAxisWorld.x, xAxisWorld.z)
+        let lenU = simd_length(rawU)
+        let newU = lenU > 1e-6 ? (rawU / lenU) : SIMD2<Double>(1.0, 0.0)
+        // Right-handed horizontal frame where world +Y is up -> second horizontal axis is (-u.z, u.x) or (u.z, -u.x)
+        // To match default identity (u=(1,0) -> v=(0,1)), v = (-u.y, u.x)
+        let newV = SIMD2<Double>(-newU.y, newU.x)
+        if simd_length(newOriginXZ - originXZ) > 0.05 || simd_dot(newU, uAxisXZ) < 0.995 {
+            coveredCells.removeAll()
+            highConfidenceCells.removeAll()
+        }
+        originXZ = newOriginXZ
+        uAxisXZ = newU
+        vAxisXZ = newV
+    }
+
+    /// Map a 3D world point onto the Marker-0 anchored `0.25 m` horizontal grid (`YS-78`).
+    public func cell(forWorldPoint pt: SIMD3<Double>) -> GroundGridCell {
+        let relXZ = SIMD2<Double>(pt.x - originXZ.x, pt.z - originXZ.y)
+        let localX = simd_dot(relXZ, uAxisXZ)
+        let localZ = simd_dot(relXZ, vAxisXZ)
+        let ix = Int(floor(localX / cellSizeM))
+        let iz = Int(floor(localZ / cellSizeM))
+        return GroundGridCell(ix: ix, iz: iz)
     }
 
     /// Check whether enough time has elapsed for the next coverage update (`2 Hz` normal, `0.5 Hz` serious thermal).
@@ -274,9 +322,7 @@ public struct GroundCoverageGrid: Sendable, Equatable {
                         if len > 1e-6 {
                             let normalUpAbs = abs(crossVec.y / len)
                             if normalUpAbs >= cosMaxTilt {
-                                let ix = Int(floor(center.pt.x / cellSizeM))
-                                let iz = Int(floor(center.pt.z / cellSizeM))
-                                let cell = GroundGridCell(ix: ix, iz: iz)
+                                let cell = cell(forWorldPoint: center.pt)
                                 coveredCells.insert(cell)
                                 if center.conf >= 2 {
                                     highConfidenceCells.insert(cell)
@@ -293,31 +339,36 @@ public struct GroundCoverageGrid: Sendable, Equatable {
         return (coveredCells.count - beforeCount, validDepthSamples, elevatedPointsAbove2m)
     }
 
-    /// Transform world-frame `(ix, iz)` ground cells into Marker-0 Yard Frame `0.25 m` cells and compute
+    /// Transform world-frame ground points into Marker-0 Yard Frame `0.25 m` cells and compute
     /// the cell agreement ratio against a reference set of yard-frame ground points (`YS-78`).
     public static func computeCellAgreementWithToolkitGroundPoints(
         worldGroundPoints: [(positionWorld: SIMD3<Double>, confidence: UInt8, rangeM: Double)],
         groundYWorld: Double,
+        originWorld: SIMD3<Double> = .zero,
+        xAxisWorld: SIMD3<Double> = SIMD3<Double>(1.0, 0.0, 0.0),
+        ingestedGrid: GroundCoverageGrid? = nil,
         cellSizeM: Double = 0.25,
         maxAbsZ: Double = 0.25,
         minRangeM: Double = 0.50,
         maxRangeM: Double = 4.00
     ) -> (phoneCells: Set<GroundGridCell>, toolkitCells: Set<GroundGridCell>, agreementRatio: Double) {
-        var phoneSet: Set<GroundGridCell> = []
+        var refGrid = GroundCoverageGrid(cellSizeM: cellSizeM)
+        refGrid.anchorMarker0Frame(originWorld: SIMD3<Double>(originWorld.x, groundYWorld, originWorld.z), xAxisWorld: xAxisWorld)
+
+        var phoneSet: Set<GroundGridCell> = ingestedGrid?.coveredCells ?? []
+        let useIngested = (ingestedGrid != nil)
         var toolkitSet: Set<GroundGridCell> = []
 
         for sample in worldGroundPoints {
             guard sample.confidence >= 1 else { continue }
             let dh = abs(sample.positionWorld.y - groundYWorld)
-            let ix = Int(floor(sample.positionWorld.x / cellSizeM))
-            let iz = Int(floor(sample.positionWorld.z / cellSizeM))
-            let cell = GroundGridCell(ix: ix, iz: iz)
+            let cell = refGrid.cell(forWorldPoint: sample.positionWorld)
 
             // Phone rule (YS-78): 0.5–4.0 m, within ±0.25 m of marker plane
-            if sample.rangeM >= minRangeM && sample.rangeM <= maxRangeM && dh <= maxAbsZ {
+            if !useIngested && sample.rangeM >= minRangeM && sample.rangeM <= maxRangeM && dh <= maxAbsZ {
                 phoneSet.insert(cell)
             }
-            // Toolkit rule (geometry.py:876): range <= 4.0 m, within ±0.25 m of marker plane
+            // Toolkit rule (geometry.py:876): range <= 4.0 m, within ±0.25 m of marker plane in Marker-0 Yard Frame
             if sample.rangeM <= maxRangeM && dh <= maxAbsZ {
                 toolkitSet.insert(cell)
             }
@@ -393,7 +444,7 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
            pitchDeg <= Self.maxTargetPitchDeg,
            dt > 0.0 {
             accumulatedValidDurationS += min(dt, 0.25)
-            if accumulatedValidDurationS >= Self.requiredDurationS {
+            if accumulatedValidDurationS >= Self.requiredDurationS && elevatedPointsAbove2mCount > 0 {
                 isCompleted = true
             }
         }
@@ -462,6 +513,27 @@ public struct MarkerRingVisualState: Sendable, Equatable {
         self.cornersUV = cornersUV
         self.rangeMeters = rangeMeters
     }
+
+    /// Computes normalized portrait HUD coordinates `(x, y)` in `[0.1, 0.9]` from sensor pixel coordinates `(u, v)`.
+    /// ARKit `capturedImage` sensor buffers are landscape-right (`1920x1440`), while the HUD runs in portrait:
+    /// `portraitX = 1.0 - (v / rgbHeight)`, `portraitY = u / rgbWidth`.
+    public func normalizedPortraitCenter(rgbWidth: Double = 1920.0, rgbHeight: Double = 1440.0) -> SIMD2<Double> {
+        guard !cornersUV.isEmpty else {
+            return SIMD2<Double>(0.5, 0.5)
+        }
+        let sumU = cornersUV.reduce(0.0) { $0 + $1.x }
+        let sumV = cornersUV.reduce(0.0) { $0 + $1.y }
+        let avgU = sumU / Double(cornersUV.count)
+        let avgV = sumV / Double(cornersUV.count)
+        let safeW = max(1.0, rgbWidth)
+        let safeH = max(1.0, rgbHeight)
+        if avgU > 1.5 || avgV > 1.5 {
+            let portraitX = min(0.9, max(0.1, 1.0 - (avgV / safeH)))
+            let portraitY = min(0.9, max(0.1, avgU / safeW))
+            return SIMD2<Double>(portraitX, portraitY)
+        }
+        return SIMD2<Double>(min(0.9, max(0.1, avgU)), min(0.9, max(0.1, avgV)))
+    }
 }
 
 /// High-level phase of the guided yard walk (`YS-74`, `YS-79`).
@@ -527,14 +599,18 @@ public struct MarkerHoldProgress: Sendable, Equatable {
         return min(3, confirmedSamples.count)
     }
 
-    /// Compute the maximum 3D distance from the component-wise median of `samples`.
+    /// Compute the maximum 3D position spread across `samples` (maximum pairwise 3D distance and distance from median, `YS-74`).
     public static func maxSpreadFromMedianM(_ samples: [ConfirmedMarkerStillSample]) -> Double {
         guard samples.count >= 2 else { return 0.0 }
         let med = PhoneLoopRuleState.medianPosition3D(samples.map(\.positionWorld))
         var maxDist = 0.0
-        for s in samples {
-            let d = simd_length(s.positionWorld - med)
-            if d > maxDist { maxDist = d }
+        for i in 0..<samples.count {
+            let dMed = simd_length(samples[i].positionWorld - med)
+            if dMed > maxDist { maxDist = dMed }
+            for j in (i + 1)..<samples.count {
+                let dPair = simd_length(samples[i].positionWorld - samples[j].positionWorld)
+                if dPair > maxDist { maxDist = dPair }
+            }
         }
         return maxDist
     }
@@ -581,6 +657,7 @@ public struct GuidedCaptureEngine: Sendable {
     )
 
     // Debounce & dwell state
+    private var activeInstructionIsCorrection: Bool = false
     private var pendingCandidateKey: String? = nil
     private var pendingCandidateText: String? = nil
     private var pendingCandidateSinceS: Double = 0.0
@@ -615,6 +692,7 @@ public struct GuidedCaptureEngine: Sendable {
             commitInstruction(
                 key: "note_recording",
                 text: "Listening… tap to stop",
+                isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
             )
@@ -623,11 +701,12 @@ public struct GuidedCaptureEngine: Sendable {
 
     public mutating func markEndEarlyChosen(at timestampS: Double) {
         endEarlyChosen = true
-        if phase == .markers1To3 {
+        if phase == .markers1To3 || phase == .houseWallLookUp {
             phase = .closingMarker0
             commitInstruction(
                 key: "return_marker_0",
                 text: "Head back to marker 0",
+                isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
             )
@@ -647,6 +726,7 @@ public struct GuidedCaptureEngine: Sendable {
             commitInstruction(
                 key: "walk_to_marker_\(mid)",
                 text: "Walk to marker \(mid)",
+                isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
             )
@@ -655,6 +735,7 @@ public struct GuidedCaptureEngine: Sendable {
             commitInstruction(
                 key: "return_marker_0",
                 text: "Head back to marker 0",
+                isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
             )
@@ -668,6 +749,7 @@ public struct GuidedCaptureEngine: Sendable {
             commitInstruction(
                 key: "return_marker_0",
                 text: "Head back to marker 0",
+                isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
             )
@@ -694,7 +776,6 @@ public struct GuidedCaptureEngine: Sendable {
         lowDiskSpaceWarning: Bool = false,
         hasValidDepthForLookUp: Bool = true,
         elevatedPointsAbove2m: Int = 0,
-        relaxViewingAngleAndSizeForLegacyReplay: Bool = false,
         didRunMarkerDetection: Bool = true
     ) -> (
         instruction: String,
@@ -708,6 +789,9 @@ public struct GuidedCaptureEngine: Sendable {
             instructionHistory.append((timestampS, activeInstructionKey, activeInstruction))
         }
 
+        let phaseBeforeStep = phase
+        var didLockMarkerThisStep = false
+        var didStartHoldThisStep = false
         var emittedHaptic: GuidedHapticEvent? = nil
         var activeHoldMarkerID: Int? = nil
         let holdGraceActive = !didRunMarkerDetection && ((timestampS - lastRingSightingTimestampS) <= 0.45)
@@ -778,6 +862,7 @@ public struct GuidedCaptureEngine: Sendable {
             let wasFirstSeen = (hold.firstSeenTimestampS == nil)
             if wasFirstSeen {
                 hold.firstSeenTimestampS = timestampS
+                didStartHoldThisStep = true
                 emittedHaptic = .markerFirstSeen(markerID: mid)
             }
             hold.lastSeenTimestampS = timestampS
@@ -795,16 +880,17 @@ public struct GuidedCaptureEngine: Sendable {
                 rangeMeters3D: target.sighting.rangeMeters,
                 horizontalRangeMeters: rngXZ
             )
-            let maxAngle = relaxViewingAngleAndSizeForLegacyReplay ? 65.0 : Self.maxViewingAngleDeg
+            let maxAngle = Self.maxViewingAngleDeg
             let maxSizeDev = Self.maxSizeDeviationRatio
-            let maxSpread = relaxViewingAngleAndSizeForLegacyReplay ? 0.08 : Self.maxPositionSpreadM
+            let maxSpread = Self.maxPositionSpreadM
 
             let angleOK = target.sighting.viewingAngleDeg <= maxAngle
             let sizeOK = target.sighting.sizeMMPrinted > 0
                 ? (abs(target.sighting.sizeMMMeasured - target.sighting.sizeMMPrinted) / target.sighting.sizeMMPrinted) <= maxSizeDev
                 : true
+            let conditionsOK = (trackingState == "normal") && gateVerdict.passes && angleOK && sizeOK
 
-            if trackingState == "normal" && target.isConfirmedStill && gateVerdict.passes && angleOK && sizeOK {
+            if conditionsOK && target.isConfirmedStill {
                 let sample = ConfirmedMarkerStillSample(
                     timestampS: timestampS,
                     savedIndex: savedIndex,
@@ -845,6 +931,7 @@ public struct GuidedCaptureEngine: Sendable {
                            (lastS.timestampS - firstS.timestampS) >= (Self.minHoldSpanS - 1e-6) {
                             hold.isLocked = true
                             hold.lockedAtTimestampS = timestampS
+                            didLockMarkerThisStep = true
                             let lockedPos = PhoneLoopRuleState.medianPosition3D(hold.confirmedSamples.map(\.positionWorld))
                             lockedPositionsByMarkerID[mid] = lockedPos
 
@@ -875,15 +962,33 @@ public struct GuidedCaptureEngine: Sendable {
                         hold.pauseReason = "moving"
                     }
                 } else {
+                    // If `candidateSamples.count == 2` and `dtLast >= 0.30` but `(timestampS - first.timestampS) < 1.00`,
+                    // check if `first` was an approach outlier relative to `[last, sample]`. If so, slide out `first`.
+                    if candidateSamples.count == 2,
+                       let first = candidateSamples.first,
+                       let last = candidateSamples.last,
+                       (timestampS - last.timestampS) >= 0.30 {
+                        if MarkerHoldProgress.maxSpreadFromMedianM([first, sample]) > maxSpread,
+                           MarkerHoldProgress.maxSpreadFromMedianM([last, sample]) <= maxSpread {
+                            hold.confirmedSamples = [last, sample]
+                        }
+                    }
                     hold.isPaused = false
                     hold.pauseReason = nil
                 }
+            } else if conditionsOK && !target.isConfirmedStill {
+                // Intermediate 10 Hz detection frame between 0.35 s JPEG stills while all hold conditions remain valid:
+                // keep the ring active and unpaused (`YS-74`).
+                hold.isPaused = false
+                hold.pauseReason = nil
             } else if !hold.isLocked {
-                // Condition broke: pause rather than reset (YS-74)
+                // Condition broke: pause rather than reset (`YS-74`)
                 hold.isPaused = !hold.confirmedSamples.isEmpty
                 if gateVerdict.reason == "marker_too_far" {
                     hold.pauseReason = "too_far"
-                } else if !gateVerdict.passes || !angleOK {
+                } else if gateVerdict.reason == "marker_too_close" {
+                    hold.pauseReason = "too_close"
+                } else if !gateVerdict.passes || !angleOK || trackingState != "normal" {
                     hold.pauseReason = "moving"
                 } else {
                     hold.pauseReason = nil
@@ -997,15 +1102,21 @@ public struct GuidedCaptureEngine: Sendable {
                 if ring.pauseReason == "too_far" {
                     return ("hold_too_far_\(ring.markerID)", "Step closer to marker \(ring.markerID)", false)
                 }
+                if ring.pauseReason == "too_close" {
+                    return ("hold_too_close_\(ring.markerID)", "Step back from marker \(ring.markerID)", false)
+                }
                 if ring.isPaused && ring.confirmedSegments > 0 {
                     return ("hold_paused_moving", "Hold steady… almost there", false)
                 }
                 return ("hold_steady", "Hold steady", true)
             }
 
-            // Corrections are silent while a hold is counting; outside a hold, check pace & tilt
-            if turnRateRadS > ExposureAndStillnessGate.maxTurnRateRadS && predictedBlurPx > ExposureAndStillnessGate.maxPredictedBlurPx {
+            // Corrections are silent while a hold is counting; outside a hold, check pace & tilt (`YS-73`, `YS-74`)
+            if turnRateRadS > ExposureAndStillnessGate.maxTurnRateRadS {
                 return ("pace_turn_slower", "Turn a little slower", false)
+            }
+            if predictedBlurPx > ExposureAndStillnessGate.maxPredictedBlurPx {
+                return ("pace_hold_steady", "Hold steady", false)
             }
             if phase == .houseWallLookUp {
                 if lookUpTracker.skyWarningActive {
@@ -1038,27 +1149,55 @@ public struct GuidedCaptureEngine: Sendable {
             }
         }()
 
-        // Apply 0.7 s debounce for transient corrections and 1.5 s minimum dwell
+        // Apply 0.7 s debounce for transient corrections (both on entry and when clearing back to baseline)
+        // and 1.5 s minimum dwell (`YS-74`, `DESIGN-SPEC-NATIVE.md` §4c).
         if candKey != activeInstructionKey {
-            if isImmediatePhaseOrLockCue {
+            let phaseChangedThisStep = (phase != phaseBeforeStep)
+            let isUrgentOverride = candKey == "note_recording"
+                || candKey == "storage_low"
+                || candKey == "thermal_serious"
+                || candKey == "all_done_finish"
+                || candKey.hasPrefix("locked_marker_")
+                || phaseChangedThisStep
+                || didLockMarkerThisStep
+                || (candKey == "hold_steady" && didStartHoldThisStep && !activeInstructionIsCorrection)
+
+            if isImmediatePhaseOrLockCue && !activeInstructionIsCorrection {
                 let dwellElapsed = (timestampS - activeInstructionSinceS) >= (Self.minInstructionDwellS - 1e-6)
-                // Final completion ("All done. Tap Finish.") or "Head back to marker 0" when all 1..3 lock transitions immediately
-                let isTerminalOrPhaseShift = candKey == "all_done_finish"
-                    || candKey == "return_marker_0"
-                    || candKey == "lookup_step"
-                    || candKey.hasPrefix("locked_marker_")
-                    || candKey == "hold_steady"
-                if dwellElapsed || isTerminalOrPhaseShift {
-                    commitInstruction(key: candKey, text: candText, at: timestampS, forceImmediate: true)
+                if dwellElapsed || isUrgentOverride || candKey == "hold_steady" {
+                    commitInstruction(
+                        key: candKey,
+                        text: candText,
+                        isCorrection: !isImmediatePhaseOrLockCue,
+                        at: timestampS,
+                        forceImmediate: true
+                    )
                 }
+            } else if isUrgentOverride {
+                commitInstruction(
+                    key: candKey,
+                    text: candText,
+                    isCorrection: !isImmediatePhaseOrLockCue,
+                    at: timestampS,
+                    forceImmediate: true
+                )
             } else {
+                // Either entering a correction OR clearing an active correction back to the phase baseline:
+                // require the condition/fix to hold for `0.7 s` (`debounceDurationS`) AND the active instruction
+                // to have dwelled for `>= 1.5 s` (`minInstructionDwellS`).
                 if pendingCandidateKey != candKey {
                     pendingCandidateKey = candKey
                     pendingCandidateText = candText
                     pendingCandidateSinceS = timestampS
                 } else if (timestampS - pendingCandidateSinceS) >= (Self.debounceDurationS - 1e-6),
                           (timestampS - activeInstructionSinceS) >= (Self.minInstructionDwellS - 1e-6) {
-                    commitInstruction(key: candKey, text: candText, at: timestampS, forceImmediate: true)
+                    commitInstruction(
+                        key: candKey,
+                        text: candText,
+                        isCorrection: !isImmediatePhaseOrLockCue,
+                        at: timestampS,
+                        forceImmediate: true
+                    )
                 }
             }
         } else {
@@ -1090,12 +1229,14 @@ public struct GuidedCaptureEngine: Sendable {
     private mutating func commitInstruction(
         key: String,
         text: String,
+        isCorrection: Bool,
         at timestampS: Double,
         forceImmediate: Bool
     ) {
         guard key != activeInstructionKey || text != activeInstruction else { return }
         activeInstructionKey = key
         activeInstruction = text
+        activeInstructionIsCorrection = isCorrection
         activeInstructionSinceS = timestampS
         pendingCandidateKey = nil
         pendingCandidateText = nil

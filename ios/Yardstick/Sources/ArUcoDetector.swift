@@ -1082,12 +1082,14 @@ public enum ArUcoDetector {
 
         var normalCam = fitPlaneNormalPCA(points: interiorCamPts, centroid: centroidCam)
         let viewDir = simd_normalize(-centroidCam)
+        let rawCosViewAngle = min(1.0, max(-1.0, abs(simd_dot(normalCam, viewDir))))
+        let viewingAngleDeg = acos(rawCosViewAngle) * 180.0 / .pi
         // Guard against grazing-angle degenerate plane fits (matching toolkit `markers.py:160`: cos(60 deg))
-        if abs(simd_dot(normalCam, viewDir)) < cos(maxPlaneTiltFromViewDeg * .pi / 180.0) {
+        // Note: `viewingAngleDeg` is computed BEFORE this fallback so grazing-angle sightings (> 60 deg)
+        // never masquerade as 0.0 deg fronto-parallel sightings in `GuidedCaptureEngine` (`YS-69`, `YS-74`).
+        if rawCosViewAngle < cos(maxPlaneTiltFromViewDeg * .pi / 180.0) {
             normalCam = viewDir
         }
-        let cosViewAngle = min(1.0, max(-1.0, abs(simd_dot(normalCam, viewDir))))
-        let viewingAngleDeg = acos(cosViewAngle) * 180.0 / .pi
         let dCam = -simd_dot(normalCam, centroidCam)
 
         // Intersect the 4 full-res RGB corner rays with the fitted LiDAR depth plane

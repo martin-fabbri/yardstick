@@ -82,6 +82,70 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var audioFirstSampleTS: Double? = nil
     var savedStillsIndices: Set<Int> = []
     var isClosed: Bool = false
+    var lastGuidanceTimestampS: Double = -1.0
+    var lastGuidanceSavedIndex: Int = 0
+    var lastEventTimestampS: Double = -1.0
+    var lastEventSavedIndex: Int = 0
+
+    func appendMonotonicGuidanceRow(
+        timestampS: Double,
+        savedIndex: Int?,
+        event: String,
+        phase: String,
+        instruction: String,
+        spoken: Bool,
+        pitchDeg: Double,
+        rollDeg: Double,
+        trackingState: String,
+        exposureDurationS: Double,
+        iso: Double,
+        turnRateRadS: Double,
+        predictedBlurPx: Double,
+        thermalState: String,
+        coverageCells: Int? = nil
+    ) throws {
+        let t = max(timestampS, lastGuidanceTimestampS)
+        lastGuidanceTimestampS = t
+        let maxWrittenIdx = savedFrameCount > 0 ? (savedFrameCount - 1) : 0
+        let resolvedIdx = savedIndex.map { min(maxWrittenIdx, max($0, lastGuidanceSavedIndex)) }
+        if let rIdx = resolvedIdx {
+            lastGuidanceSavedIndex = rIdx
+        }
+        let gLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
+            timestampS: t,
+            savedIndex: resolvedIdx,
+            event: event,
+            phase: phase,
+            instruction: instruction,
+            spoken: spoken,
+            pitchDeg: pitchDeg,
+            rollDeg: rollDeg,
+            trackingState: trackingState,
+            exposureDurationS: exposureDurationS,
+            iso: iso,
+            turnRateRadS: turnRateRadS,
+            predictedBlurPx: predictedBlurPx,
+            thermalState: thermalState,
+            coverageCells: coverageCells ?? coveredCellCount
+        )
+        try appendLine(gLine, to: guidanceFH)
+    }
+
+    func appendMonotonicEventRow(
+        timestampS: Double,
+        savedIndex: Int,
+        kind: String,
+        detail: String
+    ) throws {
+        let t = max(timestampS, lastEventTimestampS)
+        lastEventTimestampS = t
+        let maxWrittenIdx = savedFrameCount > 0 ? (savedFrameCount - 1) : 0
+        let resolvedIdx = min(maxWrittenIdx, max(savedIndex, lastEventSavedIndex))
+        lastEventSavedIndex = resolvedIdx
+        let safeDetail = detail.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
+        let line = String(format: "%.6f,%d,%@,%@\n", t, resolvedIdx, kind, safeDetail)
+        try appendLine(line, to: eventsFH)
+    }
 
     var lastAnyStillTimeS: Double {
         stillGateLock.withLock { $0.lastAnyStillTimeS }
@@ -122,6 +186,12 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     func anchorGroundPlaneY(_ yWorld: Double) {
         coverageGridLock.withLock { grid in
             grid.anchorGroundPlaneY(yWorld)
+        }
+    }
+
+    func anchorMarker0Frame(originWorld: SIMD3<Double>, xAxisWorld: SIMD3<Double>) {
+        coverageGridLock.withLock { grid in
+            grid.anchorMarker0Frame(originWorld: originWorld, xAxisWorld: xAxisWorld)
         }
     }
 
@@ -499,6 +569,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         isMarkerHoldActive: false
     )
     @Published public private(set) var latestHapticEvent: GuidedHapticEvent? = nil
+    @Published public private(set) var hapticDispatchCount: Int = 0
+    public private(set) var dispatchedHaptics: [GuidedHapticEvent] = []
+    @Published public private(set) var isRecordingVoiceNote: Bool = false
     /// Injectable thermal level for deterministic testing of `YS-85` serious-thermal adaptation.
     public var injectedThermalLevelForTesting: CaptureThermalLevel? = nil
 
@@ -560,8 +633,8 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var requestedWidth: Int = 1920
     private var requestedHeight: Int = 1440
     private var requestedFPS: Int = 30
-    private var actualWidth: Int = 1920
-    private var actualHeight: Int = 1440
+    public private(set) var actualWidth: Int = 1920
+    public private(set) var actualHeight: Int = 1440
     private var actualFPS: Int = 30
 
     private var latestCameraTransform: simd_double4x4 = matrix_identity_double4x4
@@ -641,12 +714,52 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         if UserDefaults.standard.dictionary(forKey: Self.markerSizesDefaultsKey) == nil {
             persistMarkerSizes()
         }
+        let args = ProcessInfo.processInfo.arguments
+        if args.contains("--force-thermal-serious") {
+            injectedThermalLevelForTesting = .serious
+        }
+        if args.contains("--force-low-space") {
+            availableDiskBytesProvider = { _ in 800 * 1024 * 1024 }
+        }
         locationManager.delegate = self
         locationManager.headingFilter = kCLHeadingFilterNone
         #if canImport(ARKit)
         arSession.delegate = self
         #endif
         registerLifecycleObservers()
+    }
+
+    /// Dispatch a `GuidedHapticEvent` through native `UIKit` feedback generators while respecting
+    /// voice-note recording suppression (`YS-74`, `DESIGN-SPEC-NATIVE.md` §5).
+    public func dispatchHapticIfNeeded(_ event: GuidedHapticEvent?) {
+        guard let event, !guidedEngine.isRecordingVoiceNote else { return }
+        latestHapticEvent = event
+        hapticDispatchCount += 1
+        dispatchedHaptics.append(event)
+        #if canImport(UIKit) && !targetEnvironment(macCatalyst)
+        switch event {
+        case .sessionStart, .sessionStop, .markerFirstSeen:
+            let gen = UIImpactFeedbackGenerator(style: .light)
+            gen.prepare()
+            gen.impactOccurred()
+        case .holdSegmentConfirmed(_, _, let intensity):
+            let gen = UIImpactFeedbackGenerator(style: .rigid)
+            gen.prepare()
+            gen.impactOccurred(intensity: CGFloat(min(1.0, max(0.2, intensity))))
+        case .markerLocked, .loopClosedPathComplete:
+            let gen = UINotificationFeedbackGenerator()
+            gen.prepare()
+            gen.notificationOccurred(.success)
+        case .warning:
+            let gen = UINotificationFeedbackGenerator()
+            gen.prepare()
+            gen.notificationOccurred(.warning)
+        case .error:
+            let gen = UINotificationFeedbackGenerator()
+            gen.prepare()
+            gen.notificationOccurred(.error)
+        }
+        #endif
     }
 
     /// Exact hardware model identifier (e.g. `"iPhone18,2"`) via `uname` (`YS-00`).
@@ -714,6 +827,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
 
         UIApplication.shared.isIdleTimerDisabled = true
+        try? AVAudioSession.sharedInstance().setAllowHapticsAndSystemSoundsDuringRecording(true)
         locationManager.requestWhenInUseAuthorization()
         locationManager.startUpdatingLocation()
         if CLLocationManager.headingAvailable() {
@@ -732,6 +846,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         captureDirURL = dir
         savedFrameCount = 0
         droppedFrameCount = 0
+        latestSavedIndex = 0
+        latestTimestampS = 0.0
+        lastHeartbeatS = 0.0
         detectedMarkerIDs.removeAll()
         northSamples.removeAll()
         northSampleCount = 0
@@ -771,9 +888,12 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         coveredGroundCells = []
         lookUpProgressFraction = 0.0
         isLookUpDone = false
+        isRecordingVoiceNote = false
         thermalSchedule = ThermalAdaptationSchedule.evaluate(thermalLevel: .nominal, isMarkerHoldActive: false)
-        latestHapticEvent = .sessionStart
-        latestValidDepthSamplesCount = 100
+        hapticDispatchCount = 0
+        dispatchedHaptics = []
+        dispatchHapticIfNeeded(.sessionStart)
+        latestValidDepthSamplesCount = 0
         latestElevatedPointsAbove2m = 0
 
         #if canImport(ARKit) && !targetEnvironment(simulator)
@@ -873,11 +993,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             isLoopClosed = phoneLoopState.unifiedLoopClosed
             loopClosureGapMeters = phoneLoopState.unifiedLoopClosureGapMeters
         }
-        let safeDetail = detail.replacingOccurrences(of: ",", with: ";").replacingOccurrences(of: "\n", with: " ")
-        let line = String(format: "%.6f,%d,%@,%@\n", t, sIdx, kind, safeDetail)
         writerQueue.async { [weak self] in
             do {
-                try engine.appendLine(line, to: engine.eventsFH)
+                try engine.appendMonotonicEventRow(timestampS: t, savedIndex: sIdx, kind: kind, detail: detail)
             } catch {
                 Task { @MainActor in
                     self?.handleStreamFailure(stream: "events", message: error.localizedDescription)
@@ -886,9 +1004,123 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// Toggle or set voice-note recording state (`YS-74`, `YS-75`), suppressing haptics while active.
+    public func setRecordingVoiceNote(_ active: Bool) {
+        let t = latestTimestampS
+        guidedEngine.setRecordingVoiceNote(active, at: t)
+        isRecordingVoiceNote = guidedEngine.isRecordingVoiceNote
+        statusBanner = guidedEngine.activeInstruction
+        if active {
+            logEvent(kind: "note", detail: "Spoken note anchor")
+        }
+    }
+
+    /// Mark `"End early"` chosen (`YS-71`, `YS-72`, `YS-74`), synchronizing `PhoneLoopRuleState` and `GuidedCaptureEngine`
+    /// and logging `event = "end_early"` to `guidance.csv`.
+    public func markEndEarlyChosen() {
+        let t = latestTimestampS
+        let sIdx = max(0, latestSavedIndex)
+        phoneLoopState.endEarlyChosen = true
+        phoneLoopState.evaluateUnifiedLoopClosure()
+        guidedEngine.markEndEarlyChosen(at: t)
+        guidedWalkPhase = guidedEngine.phase
+        isLoopClosed = phoneLoopState.unifiedLoopClosed
+        isFinishAvailable = guidedEngine.isFinishAvailable(unifiedLoopClosed: phoneLoopState.unifiedLoopClosed)
+        statusBanner = guidedEngine.activeInstruction
+
+        guard phase == .recording, let engine = writerEngine else { return }
+        let phaseStr = guidedEngine.phase.rawValue
+        let instr = guidedEngine.activeInstruction
+        let pDeg = pitchDeg
+        let rDeg = rollDeg
+        let trk = trackingStateText
+        let expS = latestExposureDurationS
+        let isoV = latestISO
+        let trS = latestTurnRateRadS
+        let blurP = latestPredictedBlurPx
+        let thermS = thermalSchedule.thermalLevel.rawValue
+        let covC = coveredGroundCellCount
+        writerQueue.async { [weak self] in
+            do {
+                try engine.appendMonotonicGuidanceRow(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    event: "end_early",
+                    phase: phaseStr,
+                    instruction: instr,
+                    spoken: false,
+                    pitchDeg: pDeg,
+                    rollDeg: rDeg,
+                    trackingState: trk,
+                    exposureDurationS: expS,
+                    iso: isoV,
+                    turnRateRadS: trS,
+                    predictedBlurPx: blurP,
+                    thermalState: thermS,
+                    coverageCells: covC
+                )
+            } catch {
+                Task { @MainActor in
+                    self?.handleStreamFailure(stream: "guidance", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
+    /// Begin a `"Fix now"` action (`YS-71`, `YS-72`, `YS-74`), unlocking `targetMarkerID` (if in `1...3`),
+    /// clearing `loopClosedEventTimeS` in `PhoneLoopRuleState`, and requiring a fresh closing hold on Marker 0.
+    public func beginFixNow(targetMarkerID: Int? = nil) {
+        let t = latestTimestampS
+        let sIdx = max(0, latestSavedIndex)
+        phoneLoopState.clearLoopClosedForFixNow()
+        guidedEngine.beginFixNowRequiringReturnToMarker0(targetMarkerID: targetMarkerID, at: t)
+        guidedWalkPhase = guidedEngine.phase
+        lockedMarkerIDs = guidedEngine.lockedMarkerIDs
+        isLoopClosed = phoneLoopState.unifiedLoopClosed
+        isFinishAvailable = guidedEngine.isFinishAvailable(unifiedLoopClosed: phoneLoopState.unifiedLoopClosed)
+        statusBanner = guidedEngine.activeInstruction
+
+        guard phase == .recording, let engine = writerEngine else { return }
+        let phaseStr = guidedEngine.phase.rawValue
+        let instr = guidedEngine.activeInstruction
+        let pDeg = pitchDeg
+        let rDeg = rollDeg
+        let trk = trackingStateText
+        let expS = latestExposureDurationS
+        let isoV = latestISO
+        let trS = latestTurnRateRadS
+        let blurP = latestPredictedBlurPx
+        let thermS = thermalSchedule.thermalLevel.rawValue
+        let covC = coveredGroundCellCount
+        writerQueue.async { [weak self] in
+            do {
+                try engine.appendMonotonicGuidanceRow(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    event: "fix_now",
+                    phase: phaseStr,
+                    instruction: instr,
+                    spoken: false,
+                    pitchDeg: pDeg,
+                    rollDeg: rDeg,
+                    trackingState: trk,
+                    exposureDurationS: expS,
+                    iso: isoV,
+                    turnRateRadS: trS,
+                    predictedBlurPx: blurP,
+                    thermalState: thermS,
+                    coverageCells: covC
+                )
+            } catch {
+                Task { @MainActor in
+                    self?.handleStreamFailure(stream: "guidance", message: error.localizedDescription)
+                }
+            }
+        }
+    }
+
     /// One-tap `Skip` for the `YS-79` house-wall and roof-edge look-up step, recorded in `guidance.csv`.
     public func skipLookUpStep() {
-        guard phase == .recording, let engine = writerEngine else { return }
         let t = latestTimestampS
         let sIdx = max(0, latestSavedIndex)
         guidedEngine.skipLookUpStep(at: t)
@@ -897,26 +1129,37 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         lookUpProgressFraction = guidedEngine.lookUpTracker.progressFraction
         statusBanner = guidedEngine.activeInstruction
 
-        let gLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
-            timestampS: t,
-            savedIndex: sIdx,
-            event: "lookup_skipped",
-            phase: guidedEngine.phase.rawValue,
-            instruction: guidedEngine.activeInstruction,
-            spoken: false,
-            pitchDeg: pitchDeg,
-            rollDeg: rollDeg,
-            trackingState: trackingStateText,
-            exposureDurationS: latestExposureDurationS,
-            iso: latestISO,
-            turnRateRadS: latestTurnRateRadS,
-            predictedBlurPx: latestPredictedBlurPx,
-            thermalState: thermalSchedule.thermalLevel.rawValue,
-            coverageCells: coveredGroundCellCount
-        )
+        guard phase == .recording, let engine = writerEngine else { return }
+        let phaseStr = guidedEngine.phase.rawValue
+        let instr = guidedEngine.activeInstruction
+        let pDeg = pitchDeg
+        let rDeg = rollDeg
+        let trk = trackingStateText
+        let expS = latestExposureDurationS
+        let isoV = latestISO
+        let trS = latestTurnRateRadS
+        let blurP = latestPredictedBlurPx
+        let thermS = thermalSchedule.thermalLevel.rawValue
+        let covC = coveredGroundCellCount
         writerQueue.async { [weak self] in
             do {
-                try engine.appendLine(gLine, to: engine.guidanceFH)
+                try engine.appendMonotonicGuidanceRow(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    event: "lookup_skipped",
+                    phase: phaseStr,
+                    instruction: instr,
+                    spoken: false,
+                    pitchDeg: pDeg,
+                    rollDeg: rDeg,
+                    trackingState: trk,
+                    exposureDurationS: expS,
+                    iso: isoV,
+                    turnRateRadS: trS,
+                    predictedBlurPx: blurP,
+                    thermalState: thermS,
+                    coverageCells: covC
+                )
             } catch {
                 Task { @MainActor in
                     self?.handleStreamFailure(stream: "guidance", message: error.localizedDescription)
@@ -1073,6 +1316,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     /// Cleanly stop the recording, finish `rgb.mp4`, seal `manifest.json` using incremental digests (`YS-84`), and build the store-mode `.zip` (`YS-21`, `YS-22`, `YS-84`).
     public func stopAndSealCapture() {
         guard let dir = captureDirURL, phase == .recording, let engine = writerEngine else { return }
+        dispatchHapticIfNeeded(.sessionStop)
         // Keep the screen awake with a determinate "Saving your walk" progress bar until `.zip` finishes (`YS-84`)
         UIApplication.shared.isIdleTimerDisabled = true
         logEvent(kind: "done", detail: "User tapped Done")
@@ -1847,6 +2091,18 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         }
     }
 
+    nonisolated private static func extractCameraISO(from frame: ARFrame) -> Double {
+        if let exifDict = CMGetAttachment(frame.capturedImage, key: kCGImagePropertyExifDictionary, attachmentModeOut: nil) as? [CFString: Any] {
+            if let isoArr = exifDict[kCGImagePropertyExifISOSpeedRatings] as? [NSNumber], let firstISO = isoArr.first?.doubleValue, firstISO > 0 {
+                return max(16.0, min(12800.0, firstISO))
+            }
+            if let isoNum = exifDict[kCGImagePropertyExifISOSpeedRatings] as? NSNumber, isoNum.doubleValue > 0 {
+                return max(16.0, min(12800.0, isoNum.doubleValue))
+            }
+        }
+        return max(32.0, min(6400.0, 100.0 * pow(2.0, Double(frame.camera.exposureOffset))))
+    }
+
     nonisolated public func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let timestampS = frame.timestamp
         let cTransform = frame.camera.transform
@@ -1854,16 +2110,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         let deliveredW = CVPixelBufferGetWidth(frame.capturedImage)
         let deliveredH = CVPixelBufferGetHeight(frame.capturedImage)
         let exposureDurationS = max(1e-5, Double(frame.camera.exposureDuration))
-        let isoVal = max(32.0, min(6400.0, 100.0 * pow(2.0, Double(frame.camera.exposureOffset))))
-        let thermalStr: String = {
-            switch ProcessInfo.processInfo.thermalState {
-            case .nominal: return "nominal"
-            case .fair: return "fair"
-            case .serious: return "serious"
-            case .critical: return "critical"
-            @unknown default: return "nominal"
-            }
-        }()
+        let isoVal = Self.extractCameraISO(from: frame)
 
         // Compute grip-invariant pitch from optical look ray (-Z_c dot +Y_w, YS-05)
         let lookRayY = Double(-cTransform.columns.2.y)
@@ -1909,6 +2156,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         var confCopyU8: [UInt8]? = nil
         var depthW = 0
         var depthH = 0
+        var frameValidDepthSampleCount = 0
 
         let cMat = simd_double4x4(
             SIMD4<Double>(cTransform.columns.0),
@@ -1936,16 +2184,22 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     let baseIdx = v * depthW
                     for u in 0..<depthW {
                         let z = dRow[u]
+                        let confVal = min(2, cRow[u])
+                        cArr[baseIdx + u] = confVal
                         if z.isFinite && z > 0.0 && z < 65.535 {
-                            dArr[baseIdx + u] = UInt16(clamping: Int((z * 1000.0).rounded()))
+                            let mm = UInt16(clamping: Int((z * 1000.0).rounded()))
+                            dArr[baseIdx + u] = mm
+                            if (v & 7 == 0) && (u & 7 == 0) && confVal >= 1 && mm >= 500 && mm <= 4500 {
+                                frameValidDepthSampleCount += 1
+                            }
                         }
-                        cArr[baseIdx + u] = min(2, cRow[u])
                     }
                 }
                 depthCopyMM = dArr
                 confCopyU8 = cArr
 
-                // 5x5 center crosshair depth patch (YS-40)
+                // 5x5 center crosshair depth patch (`YS-40`, `YS-79` — requires confidence >= 1 so low-confidence
+                // sky fill never masks `"Point at the roof edge, not the sky"`)
                 var validDepths: [UInt16] = []
                 let uC = depthW / 2
                 let vC = depthH / 2
@@ -1953,8 +2207,10 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     let v = min(depthH - 1, max(0, vC + dv))
                     for du in -2...2 {
                         let u = min(depthW - 1, max(0, uC + du))
-                        let mm = dArr[v * depthW + u]
-                        if mm >= 200 && mm <= 4500 {
+                        let idx = v * depthW + u
+                        let mm = dArr[idx]
+                        let conf = cArr[idx]
+                        if conf >= 1 && mm >= 200 && mm <= 4500 {
                             validDepths.append(mm)
                         }
                     }
@@ -1978,6 +2234,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         let finalDepthH = depthH
         let finalCenterDepthM = centerDepthM
         let finalCenterWorldPt = centerWorldPt
+        let finalFrameValidDepthCount = frameValidDepthSampleCount
 
         Task { @MainActor [weak self] in
             guard let self, self.phase == .recording, let dir = self.captureDirURL, let engine = self.writerEngine else { return }
@@ -2043,9 +2300,11 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.latestISO = isoVal
             self.latestTurnRateRadS = turnRateRadS
             self.latestPredictedBlurPx = predictedBlurPx
+            self.latestValidDepthSamplesCount = finalFrameValidDepthCount
 
             let activeThermalLevel = self.injectedThermalLevelForTesting ?? CaptureThermalLevel.fromSystem(ProcessInfo.processInfo.thermalState)
             let effectiveThermalStr = activeThermalLevel.rawValue
+            let prevInstructionKey = self.guidedEngine.activeInstructionKey
             let stepOut = self.guidedEngine.step(
                 timestampS: timestampS,
                 savedIndex: self.savedFrameCount,
@@ -2061,7 +2320,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                 unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed,
                 thermalLevel: activeThermalLevel,
                 lowDiskSpaceWarning: self.lowDiskSpaceWarning != nil,
-                hasValidDepthForLookUp: self.latestValidDepthSamplesCount >= 8 || finalCenterDepthM != nil,
+                hasValidDepthForLookUp: finalFrameValidDepthCount >= 8 || finalCenterDepthM != nil,
                 elevatedPointsAbove2m: self.latestElevatedPointsAbove2m,
                 didRunMarkerDetection: false
             )
@@ -2073,16 +2332,21 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
             self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
             self.thermalSchedule = stepOut.thermalSchedule
-            if let hap = stepOut.haptic {
-                self.latestHapticEvent = hap
-            }
-            if self.lowDiskSpaceWarning == nil {
-                self.statusBanner = stepOut.instruction
-            }
+            self.dispatchHapticIfNeeded(stepOut.haptic)
+            self.statusBanner = stepOut.instruction
             let currentInstruction = self.statusBanner
             let currentGuidedPhaseStr = self.guidedEngine.phase.rawValue
             let detectionStride = stepOut.thermalSchedule.detectionFrameStrideAt30FPS
             let coverageMinIntervalS = stepOut.thermalSchedule.coverageMinIntervalS
+            let lockedMarkersSnapshot = self.guidedEngine.lockedMarkerIDs
+            let isClosingM0LockedSnapshot = self.guidedEngine.isClosingMarker0Locked
+            let guidedPhaseSnapshot = self.guidedEngine.phase
+            let emittedSafetyEvent: String? = {
+                guard stepOut.instructionKey != prevInstructionKey else { return nil }
+                if stepOut.instructionKey == "thermal_serious" { return "thermal_serious" }
+                if stepOut.instructionKey == "storage_low" { return "storage_low" }
+                return nil
+            }()
 
             // Track camera excursion from Marker 0 Pass 1 for multi-pass loop closure separation (`YS-66`, `YS-71`)
             let camPosW = SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z)
@@ -2226,7 +2490,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     )
                     try engine.appendLine(pLine, to: engine.posesFH)
 
-                    let gLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
+                    try engine.appendMonotonicGuidanceRow(
                         timestampS: timestampS,
                         savedIndex: sIdx,
                         event: "frame",
@@ -2240,10 +2504,26 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         iso: isoVal,
                         turnRateRadS: turnRateRadS,
                         predictedBlurPx: predictedBlurPx,
-                        thermalState: effectiveThermalStr,
-                        coverageCells: engine.coveredCellCount
+                        thermalState: effectiveThermalStr
                     )
-                    try engine.appendLine(gLine, to: engine.guidanceFH)
+                    if let safetyEv = emittedSafetyEvent {
+                        try engine.appendMonotonicGuidanceRow(
+                            timestampS: timestampS,
+                            savedIndex: sIdx,
+                            event: safetyEv,
+                            phase: currentGuidedPhaseStr,
+                            instruction: currentInstruction,
+                            spoken: false,
+                            pitchDeg: pitchDegrees,
+                            rollDeg: rollDegrees,
+                            trackingState: trackingStr,
+                            exposureDurationS: exposureDurationS,
+                            iso: isoVal,
+                            turnRateRadS: turnRateRadS,
+                            predictedBlurPx: predictedBlurPx,
+                            thermalState: effectiveThermalStr
+                        )
+                    }
                     sp.endInterval("CSVAppend", csvState)
 
                     let pngState = sp.beginInterval("DepthConfidencePNG")
@@ -2296,25 +2576,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                     if shouldRunArUco || shouldConsiderPeriodicStill || shouldConsiderCoverage {
                         self.detectionScheduler.submitIfIdle { [weak self] in
                             guard let self, !engine.isClosed else { return }
-                            let covResult = engine.updateCoverageGridIfDue(
-                                timestampS: timestampS,
-                                minIntervalS: coverageMinIntervalS,
-                                depthMapMM: dPixels,
-                                confidenceMap: cPixels,
-                                depthWidth: wD,
-                                depthHeight: hD,
-                                rgbWidth: rgbW,
-                                rgbHeight: rgbH,
-                                fx: fx,
-                                fy: fy,
-                                cx: cx,
-                                cy: cy,
-                                cameraToWorld: cMat
-                            )
                             let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
                             var rawDetected3D: [DetectedMarkerSighting] = []
                             var eligibleSightings: [DetectedMarkerSighting] = []
-                            var rejectedCoachingCue: String? = nil
                             var sharpnessVal: Double? = nil
 
                             if (shouldRunArUco || shouldConsiderPeriodicStill),
@@ -2340,6 +2604,12 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                             cameraToWorld: cMat
                                         ) {
                                             rawDetected3D.append(s3D)
+                                            // Anchor Marker 0 ground plane BEFORE updating ground coverage (`YS-78`)
+                                            if s3D.markerID == 0 {
+                                                let mq = simd_quatd(ix: s3D.quaternionXYZW.x, iy: s3D.quaternionXYZW.y, iz: s3D.quaternionXYZW.z, r: s3D.quaternionXYZW.w)
+                                                let m0XAxis = simd_act(mq, SIMD3<Double>(1.0, 0.0, 0.0))
+                                                engine.anchorMarker0Frame(originWorld: s3D.positionWorld, xAxisWorld: m0XAxis)
+                                            }
                                             let rngXZ = hypot(
                                                 camPosW.x - s3D.positionWorld.x,
                                                 camPosW.z - s3D.positionWorld.z
@@ -2350,10 +2620,22 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                                 rangeMeters3D: s3D.rangeMeters,
                                                 horizontalRangeMeters: rngXZ
                                             )
-                                            if verdict.passes || forceArUco {
+                                            let angleOK = s3D.viewingAngleDeg <= GuidedCaptureEngine.maxViewingAngleDeg
+                                            let sizeOK = s3D.sizeMMPrinted > 0
+                                                ? (abs(s3D.sizeMMMeasured - s3D.sizeMMPrinted) / s3D.sizeMMPrinted) <= GuidedCaptureEngine.maxSizeDeviationRatio
+                                                : true
+                                            let isUnlockedPhaseTarget: Bool = {
+                                                switch guidedPhaseSnapshot {
+                                                case .openingMarker0:
+                                                    return s3D.markerID == 0 && !lockedMarkersSnapshot.contains(0)
+                                                case .markers1To3:
+                                                    return (1...3).contains(s3D.markerID) && !lockedMarkersSnapshot.contains(s3D.markerID)
+                                                case .houseWallLookUp, .closingMarker0, .readyToFinish:
+                                                    return s3D.markerID == 0 && !isClosingM0LockedSnapshot
+                                                }
+                                            }()
+                                            if (trackingStr == "normal" && verdict.passes && angleOK && sizeOK && isUnlockedPhaseTarget) || forceArUco {
                                                 eligibleSightings.append(s3D)
-                                            } else if rejectedCoachingCue == nil {
-                                                rejectedCoachingCue = verdict.coachingCue
                                             }
                                         }
                                     }
@@ -2364,12 +2646,21 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             }
                             sp.endInterval("ArUcoDetectAndMeasure", detectState)
 
-                            if let cue = rejectedCoachingCue, eligibleSightings.isEmpty {
-                                Task { @MainActor [weak self] in
-                                    guard let self, self.phase == .recording, self.lowDiskSpaceWarning == nil else { return }
-                                    self.statusBanner = cue
-                                }
-                            }
+                            let covResult = engine.updateCoverageGridIfDue(
+                                timestampS: timestampS,
+                                minIntervalS: coverageMinIntervalS,
+                                depthMapMM: dPixels,
+                                confidenceMap: cPixels,
+                                depthWidth: wD,
+                                depthHeight: hD,
+                                rgbWidth: rgbW,
+                                rgbHeight: rgbH,
+                                fx: fx,
+                                fy: fy,
+                                cx: cx,
+                                cy: cy,
+                                cameraToWorld: cMat
+                            )
 
                             let gateDecision = engine.evaluateStillGate(
                                 timestampS: timestampS,
@@ -2456,7 +2747,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             let finalEncodedStill = encodedStill
                             let finalMarkerLines = markerLines
                             if let m0 = finalDetected.first(where: { $0.markerID == 0 }) {
-                                engine.anchorGroundPlaneY(m0.positionWorld.y)
+                                let mq = simd_quatd(ix: m0.quaternionXYZW.x, iy: m0.quaternionXYZW.y, iz: m0.quaternionXYZW.z, r: m0.quaternionXYZW.w)
+                                let m0XAxis = simd_act(mq, SIMD3<Double>(1.0, 0.0, 0.0))
+                                engine.anchorMarker0Frame(originWorld: m0.positionWorld, xAxisWorld: m0XAxis)
                             }
 
                             if finalEncodedStill != nil || !finalMarkerLines.isEmpty {
@@ -2482,14 +2775,13 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                 }
                             }
 
-                            if !finalDetected.isEmpty || !finalRawDetected.isEmpty || covResult != nil {
+                            if shouldRunArUco || !finalDetected.isEmpty || !finalRawDetected.isEmpty || covResult != nil {
                                 Task { @MainActor [weak self] in
                                     guard let self, self.phase == .recording else { return }
                                     if let cov = covResult {
                                         self.coveredGroundCellCount = cov.snapshot.coveredCellCount
                                         self.coveredGroundAreaM2 = cov.snapshot.coveredAreaM2
                                         self.coveredGroundCells = cov.snapshot.coveredCells
-                                        self.latestValidDepthSamplesCount = cov.validDepthSamples
                                         self.latestElevatedPointsAbove2m += cov.elevatedPointsAbove2m
                                     }
                                     if !finalDetected.isEmpty {
@@ -2523,8 +2815,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     }
 
                                     let wasClosingLocked = self.guidedEngine.isClosingMarker0Locked
+                                    let monotonicT = max(timestampS, self.latestTimestampS)
                                     let detStep = self.guidedEngine.step(
-                                        timestampS: timestampS,
+                                        timestampS: monotonicT,
                                         savedIndex: sIdx,
                                         dt: 0.0,
                                         trackingState: trackingStr,
@@ -2542,28 +2835,44 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         elevatedPointsAbove2m: 0,
                                         didRunMarkerDetection: shouldRunArUco
                                     )
+
+                                    // Prevent 5-still hold cap deadlock (`YS-68`, `YS-74`): if a `marker_hold` still was saved
+                                    // but `GuidedCaptureEngine` did not consume it into a segment or lock, roll back the hold counter
+                                    if gateDecision.shouldSave, gateDecision.reason == "marker_hold" {
+                                        let didConsumeSegmentOrLock: Bool = {
+                                            switch detStep.haptic {
+                                            case .holdSegmentConfirmed, .markerLocked, .loopClosedPathComplete:
+                                                return true
+                                            default:
+                                                return false
+                                            }
+                                        }()
+                                        if !didConsumeSegmentOrLock && !forceArUco {
+                                            engine.restoreStillGate(gateDecision.snapshotBefore)
+                                        }
+                                    }
+
                                     self.guidedWalkPhase = self.guidedEngine.phase
                                     self.activeRingState = self.guidedEngine.activeRingState
                                     self.lockedMarkerIDs = self.guidedEngine.lockedMarkerIDs
-                                    self.isFinishAvailable = self.guidedEngine.isFinishAvailable(unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed)
                                     self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
                                     self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
                                     self.thermalSchedule = detStep.thermalSchedule
-                                    if let hap = detStep.haptic {
-                                        self.latestHapticEvent = hap
-                                    }
-                                    if self.lowDiskSpaceWarning == nil {
-                                        self.statusBanner = detStep.instruction
-                                    }
+                                    self.dispatchHapticIfNeeded(detStep.haptic)
+                                    self.statusBanner = detStep.instruction
 
                                     // YS-67 / YS-71 / YS-74: Only a completed 3-still closing hold on Marker 0 writes `loop_closed`
                                     // so all 3 confirmed stills of the closing hold precede `loop_closed_t_s`!
                                     if !wasClosingLocked && self.guidedEngine.isClosingMarker0Locked {
-                                        let gap = self.phoneLoopState.unifiedLoopClosureGapMeters ?? 0.0
+                                        self.phoneLoopState.recordLoopClosedEvent(at: monotonicT)
+                                        self.isLoopClosed = self.phoneLoopState.unifiedLoopClosed
                                         self.loopClosureGapMeters = self.phoneLoopState.unifiedLoopClosureGapMeters
-                                        self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
+                                        if self.phoneLoopState.unifiedLoopClosed, let gap = self.phoneLoopState.unifiedLoopClosureGapMeters {
+                                            self.logEvent(kind: "loop_closed", detail: String(format: "gap_m=%.4f", gap))
+                                        }
                                         self.updateProvisionalGrade()
                                     }
+                                    self.isFinishAvailable = self.guidedEngine.isFinishAvailable(unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed)
 
                                     // Log explicit `marker_locked` / `loop_closed` guidance event rows to `guidance.csv` (`YS-67`, `YS-74`)
                                     let guidanceEventName: String? = {
@@ -2574,27 +2883,29 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         }
                                     }()
                                     if let evName = guidanceEventName {
-                                        let lockLine = ExposureAndStillnessGate.formatGuidanceCSVRow(
-                                            timestampS: timestampS,
-                                            savedIndex: sIdx,
-                                            event: evName,
-                                            phase: self.guidedEngine.phase.rawValue,
-                                            instruction: detStep.instruction,
-                                            spoken: false,
-                                            pitchDeg: pitchDegrees,
-                                            rollDeg: rollDegrees,
-                                            trackingState: trackingStr,
-                                            exposureDurationS: exposureDurationS,
-                                            iso: isoVal,
-                                            turnRateRadS: turnRateRadS,
-                                            predictedBlurPx: predictedBlurPx,
-                                            thermalState: effectiveThermalStr,
-                                            coverageCells: self.coveredGroundCellCount
-                                        )
+                                        let phaseNow = self.guidedEngine.phase.rawValue
+                                        let instrNow = detStep.instruction
+                                        let covCellsNow = self.coveredGroundCellCount
                                         self.writerQueue.async { [weak self] in
                                             guard let self, !engine.isClosed else { return }
                                             do {
-                                                try engine.appendLine(lockLine, to: engine.guidanceFH)
+                                                try engine.appendMonotonicGuidanceRow(
+                                                    timestampS: monotonicT,
+                                                    savedIndex: sIdx,
+                                                    event: evName,
+                                                    phase: phaseNow,
+                                                    instruction: instrNow,
+                                                    spoken: false,
+                                                    pitchDeg: pitchDegrees,
+                                                    rollDeg: rollDegrees,
+                                                    trackingState: trackingStr,
+                                                    exposureDurationS: exposureDurationS,
+                                                    iso: isoVal,
+                                                    turnRateRadS: turnRateRadS,
+                                                    predictedBlurPx: predictedBlurPx,
+                                                    thermalState: effectiveThermalStr,
+                                                    coverageCells: covCellsNow
+                                                )
                                             } catch {
                                                 Task { @MainActor in
                                                     self.handleStreamFailure(stream: "guidance", message: error.localizedDescription)

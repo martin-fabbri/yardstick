@@ -224,7 +224,11 @@ public struct ContentView: View {
             // 3-Segment Marker Lock Ring drawn on the marker in the camera view (YS-74)
             if let ringState = recorder.activeRingState {
                 GeometryReader { proxy in
-                    let normCenter = MarkerRingOverlayView.normalizedCenter(for: ringState)
+                    let normCenter = MarkerRingOverlayView.normalizedCenter(
+                        for: ringState,
+                        rgbWidth: Double(recorder.actualWidth),
+                        rgbHeight: Double(recorder.actualHeight)
+                    )
                     MarkerRingOverlayView(
                         ringState: ringState,
                         animationsStatic: recorder.thermalSchedule.animationsStatic
@@ -361,10 +365,22 @@ public struct ContentView: View {
                             showTapeBKeypad = true
                         }
                     }
-                    hudButton(title: "Note", icon: "mic.fill", color: .purple) {
-                        recorder.logEvent(kind: "note", detail: "Spoken note anchor")
+                    hudButton(
+                        title: recorder.isRecordingVoiceNote ? "Note On" : "Note",
+                        icon: recorder.isRecordingVoiceNote ? "mic.badge.xmark" : "mic.fill",
+                        color: .purple
+                    ) {
+                        let nextState = !recorder.isRecordingVoiceNote
+                        recorder.setRecordingVoiceNote(nextState)
+                        if nextState {
+                            recorder.logEvent(kind: "note", detail: "Spoken note anchor")
+                        }
                     }
-                    hudButton(title: "Done", icon: "checkmark.seal.fill", color: .green) {
+                    hudButton(
+                        title: recorder.isFinishAvailable ? "Finish" : "Done",
+                        icon: "checkmark.seal.fill",
+                        color: recorder.isFinishAvailable ? .green : .gray
+                    ) {
                         recorder.stopAndSealCapture()
                     }
                 }
@@ -540,16 +556,8 @@ public struct MarkerRingOverlayView: View {
     }
 
     public static func normalizedCenter(for ringState: MarkerRingVisualState, rgbWidth: Double = 1920.0, rgbHeight: Double = 1440.0) -> CGPoint {
-        guard !ringState.cornersUV.isEmpty else {
-            return CGPoint(x: 0.5, y: 0.5)
-        }
-        let sumU = ringState.cornersUV.reduce(0.0) { $0 + $1.x }
-        let sumV = ringState.cornersUV.reduce(0.0) { $0 + $1.y }
-        let avgU = sumU / Double(ringState.cornersUV.count)
-        let avgV = sumV / Double(ringState.cornersUV.count)
-        let normX = avgU > 1.5 ? min(0.9, max(0.1, avgU / rgbWidth)) : min(0.9, max(0.1, avgU))
-        let normY = avgV > 1.5 ? min(0.9, max(0.1, avgV / rgbHeight)) : min(0.9, max(0.1, avgV))
-        return CGPoint(x: normX, y: normY)
+        let pt = ringState.normalizedPortraitCenter(rgbWidth: rgbWidth, rgbHeight: rgbHeight)
+        return CGPoint(x: pt.x, y: pt.y)
     }
 
     public var body: some View {

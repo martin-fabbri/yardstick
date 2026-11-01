@@ -182,6 +182,13 @@ public struct PhoneLoopRuleState: Sendable {
         evaluateUnifiedLoopClosure()
     }
 
+    /// Clear `loopClosedEventTimeS` when `"Fix now"` re-opens the walk (`YS-71`, `YS-72`, `YS-74`)
+    /// so sightings captured during the fix and the subsequent return to Marker 0 are included.
+    public mutating func clearLoopClosedForFixNow() {
+        loopClosedEventTimeS = nil
+        evaluateUnifiedLoopClosure()
+    }
+
     /// Ingest 3D marker sightings detected on a frame at `timestampS` with camera position `camPosW`.
     /// Returns `true` if the unified `YS-71` loop-closure state updated on this frame.
     @discardableResult
@@ -926,7 +933,9 @@ public enum CaptureReplayHarness {
                 confirmedSightings: dets,
                 rawSightings: dets,
                 unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
-                relaxViewingAngleAndSizeForLegacyReplay: !hasGuidanceStream
+                hasValidDepthForLookUp: true,
+                elevatedPointsAbove2m: pitchDeg >= 15.0 ? 10 : 0,
+                didRunMarkerDetection: !dets.isEmpty
             )
         }
 
@@ -954,7 +963,7 @@ public enum CaptureReplayHarness {
                 confirmedSightings: [],
                 rawSightings: [],
                 unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
-                relaxViewingAngleAndSizeForLegacyReplay: !hasGuidanceStream
+                didRunMarkerDetection: false
             )
         }
 
