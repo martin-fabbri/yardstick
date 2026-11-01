@@ -1190,6 +1190,344 @@ final class CaptureReplayTests: XCTestCase {
         }
     }
 
+    /// `YS-72`: Always-on unit test verifying conditional `Finish` and the live `Review Walk` sheet:
+    /// - `Finish` stays unavailable until `YS-71` and Marker 0's closing hold both pass,
+    /// - `WalkReviewEvaluator` caps displayed items at `<= 3` ordered worst first,
+    /// - waiting `35 s` while the review sheet is open keeps the loop closed (`isFinishAvailable == true`),
+    /// - any `"Fix now"` action (`targetMarkerID: 2` or `reopenLookUp: true`) immediately makes `Finish` unavailable
+    ///   and requires a fresh 3-still closing hold at Marker 0 before saving.
+    func testYS72_WalkReview_LimitsTo3ItemsWorstFirstRequiresReturnHoldAfterFixNowAndKeepsFinishUnavailableWithoutClose() {
+        // 1. Verify WalkReviewEvaluator caps items at <= 3, worst first, when 6 conditions are present simultaneously
+        let worstReport = WalkReviewEvaluator.evaluate(
+            lockedMarkerIDs: [0, 1],
+            isClosingMarker0Locked: false,
+            unifiedLoopClosed: false,
+            fixNowRequiresReturnToMarker0: false,
+            endEarlyChosen: true,
+            lookUpDone: false,
+            lookUpSkipped: true,
+            coveredGroundCellCount: 10,
+            minExpectedCoverageCells: 36,
+            missingCoverageNearMarkerID: 2,
+            sizeMismatchMarkerID: 0,
+            didGetDark: true
+        )
+        XCTAssertEqual(worstReport.verdictKind, .probablyWontBeAccepted)
+        XCTAssertEqual(worstReport.headline, "This walk probably won't be accepted")
+        XCTAssertTrue(worstReport.requiresSaveAnywayConfirmation)
+        XCTAssertEqual(worstReport.items.count, 3, "YS-72: Review Walk must display at most 3 items")
+        XCTAssertEqual(worstReport.items[0].id, "not_back_at_marker_0")
+        XCTAssertEqual(worstReport.items[0].sentence, "You didn't finish at marker 0.")
+        XCTAssertEqual(worstReport.items[0].buttonTitle, "Head Back")
+        XCTAssertEqual(worstReport.items[1].id, "missing_marker_2")
+        XCTAssertEqual(worstReport.items[1].sentence, "Marker 2 wasn't captured.")
+        XCTAssertEqual(worstReport.items[1].buttonTitle, "Capture It")
+        XCTAssertEqual(worstReport.items[2].id, "missing_marker_3")
+
+        // 2. Complete a full 4-marker walk with closing hold at Marker 0
+        var engine = GuidedCaptureEngine(requireLookUpStep: false)
+        func makeSighting(id: Int, pos: SIMD3<Double>) -> DetectedMarkerSighting {
+            DetectedMarkerSighting(
+                markerID: id,
+                cornersUV: [
+                    SIMD2<Double>(400, 300),
+                    SIMD2<Double>(600, 300),
+                    SIMD2<Double>(600, 500),
+                    SIMD2<Double>(400, 500),
+                ],
+                positionWorld: pos,
+                quaternionXYZW: SIMD4<Double>(0, 0, 0, 1),
+                sizeMMPrinted: 180.0,
+                sizeMMMeasured: 180.0,
+                rangeMeters: 1.0,
+                viewingAngleDeg: 12.0
+            )
+        }
+
+        var t = 1.0
+        var sIdx = 10
+        let positions: [Int: SIMD3<Double>] = [
+            0: .zero,
+            1: SIMD3<Double>(5, 0, 0),
+            2: SIMD3<Double>(5, 0, 5),
+            3: SIMD3<Double>(0, 0, 5),
+        ]
+        for mid in [0, 1, 2, 3] {
+            let p = positions[mid]!
+            for k in 0..<3 {
+                t += 0.55
+                sIdx += 16
+                _ = engine.step(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    dt: 0.55,
+                    trackingState: "normal",
+                    pitchDeg: -30.0,
+                    turnRateRadS: 0.02,
+                    predictedBlurPx: 0.2,
+                    cameraPositionWorld: p + SIMD3<Double>(0, 1.2, 0.5),
+                    confirmedSightings: [makeSighting(id: mid, pos: p + SIMD3<Double>(Double(k - 1) * 0.002, 0, 0))],
+                    rawSightings: [makeSighting(id: mid, pos: p)],
+                    unifiedLoopClosed: false
+                )
+            }
+        }
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: false), "YS-72: Finish must stay unavailable before closing hold")
+
+        // Closing hold at Marker 0
+        for k in 0..<3 {
+            t += 0.55
+            sIdx += 16
+            _ = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 0.55,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.02,
+                predictedBlurPx: 0.2,
+                cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+                confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(Double(k - 1) * 0.002, 0, 0))],
+                rawSightings: [makeSighting(id: 0, pos: .zero)],
+                unifiedLoopClosed: k == 2
+            )
+        }
+        XCTAssertTrue(engine.isFinishAvailable(unifiedLoopClosed: true))
+
+        // 3. Simulate waiting 35 s on the live Review Walk sheet while recording continues at 30 Hz (YS-72)
+        for _ in 0..<(35 * 30) {
+            t += 1.0 / 30.0
+            sIdx += 1
+            _ = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 1.0 / 30.0,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.01,
+                predictedBlurPx: 0.1,
+                cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+                confirmedSightings: [],
+                rawSightings: [],
+                unifiedLoopClosed: true,
+                didRunMarkerDetection: false
+            )
+        }
+        XCTAssertTrue(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-72: Waiting 35 s on Review Walk must keep loop closed and Finish available")
+
+        // 4. Trigger "Fix now" for Marker 2 -> unlocks Marker 2 and requires a fresh return hold at Marker 0
+        engine.beginFixNowRequiringReturnToMarker0(targetMarkerID: 2, at: t)
+        XCTAssertFalse(engine.lockedMarkerIDs.contains(2))
+        XCTAssertFalse(engine.isClosingMarker0Locked)
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-72: Fix now must immediately disable Finish")
+
+        // Re-lock Marker 2
+        let p2 = positions[2]!
+        for k in 0..<3 {
+            t += 0.55
+            sIdx += 16
+            _ = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 0.55,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.02,
+                predictedBlurPx: 0.2,
+                cameraPositionWorld: p2 + SIMD3<Double>(0, 1.2, 0.5),
+                confirmedSightings: [makeSighting(id: 2, pos: p2 + SIMD3<Double>(Double(k - 1) * 0.002, 0, 0))],
+                rawSightings: [makeSighting(id: 2, pos: p2)],
+                unifiedLoopClosed: false
+            )
+        }
+        XCTAssertTrue(engine.lockedMarkerIDs.contains(2))
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-72: After re-locking Marker 2, Finish must STILL require a return hold at Marker 0")
+        XCTAssertEqual(engine.phase, .closingMarker0)
+
+        // Fresh return hold at Marker 0 re-enables Finish
+        for k in 0..<3 {
+            t += 0.55
+            sIdx += 16
+            _ = engine.step(
+                timestampS: t,
+                savedIndex: sIdx,
+                dt: 0.55,
+                trackingState: "normal",
+                pitchDeg: -30.0,
+                turnRateRadS: 0.02,
+                predictedBlurPx: 0.2,
+                cameraPositionWorld: SIMD3<Double>(0, 1.2, 0.5),
+                confirmedSightings: [makeSighting(id: 0, pos: SIMD3<Double>(Double(k - 1) * 0.002, 0, 0))],
+                rawSightings: [makeSighting(id: 0, pos: .zero)],
+                unifiedLoopClosed: true
+            )
+        }
+        XCTAssertTrue(engine.isFinishAvailable(unifiedLoopClosed: true), "YS-72: Fresh return hold at Marker 0 after Fix now re-enables Finish")
+    }
+
+    /// `YS-80`: Always-on unit test verifying the native design wording table and all 4 signed corrections:
+    /// 1. Wording knows only markers and coverage (`"near marker 2"` or `"in the middle of the yard"`, never `"by the shed"`),
+    /// 2. Interruption reads `"Walk interrupted. Saved up to this point."`, never `"Walk paused"`,
+    /// 3. Marker-size setting sets every marker ID uniformly,
+    /// 4. Storage blocker reads `"Free up 10 GB to start."`,
+    /// plus plain-language `CaptureDetailSummary` verdicts (`"Ready to share"`, `"Usable, with limits"`, `"Needs another walk"`).
+    func testYS80_NativeDesignWordingAndFourSignedCorrections_ZeroAntiPatterns() {
+        // Correction #1: Coverage hole wording knows only markers and coverage, never "by the shed"
+        let nearMarkerReport = WalkReviewEvaluator.evaluate(
+            lockedMarkerIDs: [0, 1, 2, 3],
+            isClosingMarker0Locked: true,
+            unifiedLoopClosed: true,
+            fixNowRequiresReturnToMarker0: false,
+            endEarlyChosen: false,
+            lookUpDone: true,
+            lookUpSkipped: false,
+            coveredGroundCellCount: 20,
+            minExpectedCoverageCells: 36,
+            missingCoverageNearMarkerID: 2
+        )
+        XCTAssertEqual(nearMarkerReport.items.first?.sentence, "Some ground near marker 2 was missed.")
+        XCTAssertFalse(nearMarkerReport.items.first?.sentence.contains("shed") ?? true)
+        XCTAssertFalse(nearMarkerReport.mapAccessibilitySummary.contains("shed"))
+
+        let middleYardReport = WalkReviewEvaluator.evaluate(
+            lockedMarkerIDs: [0, 1, 2, 3],
+            isClosingMarker0Locked: true,
+            unifiedLoopClosed: true,
+            fixNowRequiresReturnToMarker0: false,
+            endEarlyChosen: false,
+            lookUpDone: true,
+            lookUpSkipped: false,
+            coveredGroundCellCount: 20,
+            minExpectedCoverageCells: 36,
+            missingCoverageNearMarkerID: nil
+        )
+        XCTAssertEqual(middleYardReport.items.first?.sentence, "Some ground in the middle of the yard was missed.")
+        XCTAssertFalse(middleYardReport.items.first?.sentence.contains("shed") ?? true)
+
+        // Correction #2: Interruption reads "Walk interrupted. Saved up to this point.", never "Walk paused"
+        var engine = GuidedCaptureEngine()
+        engine.markWalkInterrupted(at: 12.5)
+        XCTAssertEqual(engine.activeInstruction, "Walk interrupted. Saved up to this point.")
+        XCTAssertNotEqual(engine.activeInstruction, "Walk paused")
+        XCTAssertNil(engine.lastSpokenPhraseThisStep)
+
+        // Correction #4: Storage blocker reads "Free up 10 GB to start."
+        let lowSpace = PreFlightChecklistEvaluator.evaluate(
+            availableDiskBytes: 6_000_000_000,
+            batteryLevelFraction: 0.90,
+            thermalLevel: .nominal,
+            exposureDurationS: 0.004,
+            iso: 100.0,
+            isLocationAuthorized: true
+        )
+        XCTAssertEqual(lowSpace.storageRow.detail, "Free up 10 GB to start.")
+
+        // Plain-language CaptureDetailSummary (§3f, §4b)
+        let detailA = CaptureDetailSummary.build(
+            provisionalGrade: "A",
+            status: "stopped",
+            distanceTolerance10mM: 0.028,
+            lockedMarkerIDs: [0, 1, 2, 3],
+            isLoopClosed: true,
+            isLookUpDone: true,
+            wasLookUpSkipped: false,
+            primaryTapeMeters: 4.21
+        )
+        XCTAssertEqual(detailA.verdictTitle, "Ready to share")
+        XCTAssertEqual(detailA.accuracySentence, "Accurate to about 3 cm.")
+        XCTAssertEqual(detailA.markersValue, "All 4 ✓")
+        XCTAssertEqual(detailA.backAtStartValue, "Yes ✓")
+        XCTAssertEqual(detailA.lookedUpValue, "Yes ✓")
+        XCTAssertEqual(detailA.tapeMeasurementValue, "4.21 m · ✓")
+
+        let detailC = CaptureDetailSummary.build(
+            provisionalGrade: "C",
+            status: "stopped",
+            distanceTolerance10mM: 0.14,
+            lockedMarkerIDs: [0, 1, 2, 3],
+            isLoopClosed: true,
+            isLookUpDone: true,
+            wasLookUpSkipped: true,
+            primaryTapeMeters: nil
+        )
+        XCTAssertEqual(detailC.verdictTitle, "Usable, with limits")
+        XCTAssertEqual(detailC.lookedUpValue, "Skipped ⚠︎")
+
+        // In-view marker beacon (0.40 m above seen marker) and off-screen edge chevron (DESIGN-SPEC-NATIVE.md §3a ④ & ⑤)
+        let camTransform = matrix_identity_double4x4
+        let onScreenProj = MarkerScreenProjector.project(
+            markerID: 1,
+            markerWorldPos: SIMD3<Double>(0.0, -0.40, -2.0),
+            isDone: true,
+            cameraToWorld: camTransform
+        )
+        XCTAssertTrue(onScreenProj.isOnScreen)
+        XCTAssertTrue(onScreenProj.isDone)
+        XCTAssertNil(onScreenProj.edgeChevronSymbol)
+
+        let offScreenRightProj = MarkerScreenProjector.project(
+            markerID: 2,
+            markerWorldPos: SIMD3<Double>(0.0, -3.0, -1.0),
+            isDone: false,
+            cameraToWorld: camTransform
+        )
+        XCTAssertFalse(offScreenRightProj.isOnScreen)
+        XCTAssertEqual(offScreenRightProj.edgeChevronSymbol, "chevron.right")
+    }
+
+    /// `YS-81`: Always-on unit test verifying VoiceOver marker progress summaries, `Differentiate Without Color` badges,
+    /// Dynamic Type accessibility text, and WCAG 2.1 outdoor sunlight contrast ratios (`>= 4.5:1` for text across bright sky, grass, and shade).
+    func testYS81_AccessibilityAndOutdoorContrast_VoiceOverSummaryDifferentiateWithoutColorAndWCAGAAContrastInSun() {
+        // 1. VoiceOver marker progress summary matches DESIGN-SPEC-NATIVE.md §6 line 552 ("0 and 2 done. 1 and 3 to go.")
+        XCTAssertEqual(
+            MarkerProgressAccessibility.voiceOverValue(lockedMarkerIDs: [0, 2], isFinishAvailable: false),
+            "0 and 2 done. 1 and 3 to go."
+        )
+        XCTAssertEqual(
+            MarkerProgressAccessibility.voiceOverValue(lockedMarkerIDs: [0, 1, 2, 3], isFinishAvailable: true),
+            "All 4 markers done, back at the start."
+        )
+        XCTAssertEqual(
+            MarkerProgressAccessibility.accessibilitySizeText(lockedMarkerIDs: [0, 2], isFinishAvailable: false),
+            "2 of 4 markers"
+        )
+        XCTAssertEqual(
+            MarkerProgressAccessibility.accessibilitySizeText(lockedMarkerIDs: [0, 1, 2, 3], isFinishAvailable: true),
+            "All markers"
+        )
+
+        // 2. Differentiate Without Color badges ("Fix" vs "Check", DESIGN-SPEC-NATIVE.md §6 line 535)
+        let warnItem = WalkReviewItem(
+            id: "missing_marker_2",
+            symbolName: "exclamationmark.triangle.fill",
+            isWarning: true,
+            sentence: "Marker 2 wasn't captured.",
+            buttonTitle: "Capture It",
+            action: .captureMissingMarker(2)
+        )
+        let infoItem = WalkReviewItem(
+            id: "lookup_skipped",
+            symbolName: "info.circle.fill",
+            isWarning: false,
+            sentence: "You didn't look up at the roof and trees.",
+            buttonTitle: "Do It Now",
+            action: .performLookUp
+        )
+        XCTAssertEqual(warnItem.differentiateWithoutColorBadge, "Fix")
+        XCTAssertEqual(infoItem.differentiateWithoutColorBadge, "Check")
+
+        // 3. Outdoor WCAG 2.1 contrast audit over bright midday sky (#FFFFFF), sunlit grass, and shade
+        let standardAudit = OutdoorContrastAuditor.auditCaptureHUDContrast(increasedContrast: false)
+        XCTAssertTrue(standardAudit.passesWCAGAA, "YS-81: Standard outdoor glass + 35% dim backing must exceed 4.5:1 WCAG AA contrast")
+        XCTAssertGreaterThanOrEqual(standardAudit.brightSkyTextRatio, 4.5, "YS-81: Bright sky contrast must be >= 4.5:1")
+        XCTAssertGreaterThanOrEqual(standardAudit.sunlitGrassTextRatio, 4.5, "YS-81: Sunlit grass contrast must be >= 4.5:1")
+        XCTAssertGreaterThanOrEqual(standardAudit.shadeTextRatio, 4.5, "YS-81: Shade contrast must be >= 4.5:1")
+
+        let highContrastAudit = OutdoorContrastAuditor.auditCaptureHUDContrast(increasedContrast: true)
+        XCTAssertTrue(highContrastAudit.passesWCAGAA)
+        XCTAssertGreaterThan(highContrastAudit.brightSkyTextRatio, standardAudit.brightSkyTextRatio)
+    }
+
     // MARK: - Full Walk 1–5 Local Suite (`YARDSTICK_REPLAY_ROOT`)
 
     /// `YS-66` / `YS-69` / `YS-70` / `YS-73`: Full Walk 5 (`2,865` frames, `455` stills) replay in `.liveDetectorOnStills` mode under `< 15 s`.

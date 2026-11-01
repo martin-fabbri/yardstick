@@ -40,6 +40,18 @@ private struct ARCameraPreviewView: UIViewRepresentable {
             .disableCameraGrain,
             .disableHDR,
         ])
+        let coachingOverlay = ARCoachingOverlayView()
+        coachingOverlay.session = session
+        coachingOverlay.goal = .horizontalPlane
+        coachingOverlay.activatesAutomatically = true
+        coachingOverlay.translatesAutoresizingMaskIntoConstraints = false
+        view.addSubview(coachingOverlay)
+        NSLayoutConstraint.activate([
+            coachingOverlay.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            coachingOverlay.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            coachingOverlay.topAnchor.constraint(equalTo: view.topAnchor),
+            coachingOverlay.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+        ])
         return view
     }
 
@@ -51,167 +63,603 @@ private struct ARCameraPreviewView: UIViewRepresentable {
 }
 #endif
 
-/// Main SwiftUI operator interface for Yardstick (`YS-00`, `YS-05`, `YS-07`, `YS-12`, `YS-22`, `YS-40`, `YS-44`, `YS-83`, `YS-84`).
+/// Root SwiftUI navigation and guided capture experience (`YS-72`, `YS-80`, `YS-81`, `YS-83`, `YS-84`, `DESIGN-SPEC-NATIVE.md`).
 ///
-/// Screens:
-/// 1. **Pre-walk Setup**: verifies LiDAR support (`YS-00`), configures printed marker sizes (`250 mm` Letter/A4 or `180 mm` clipboard) for Markers `0–5` (`YS-33`).
-/// 2. **Live Recording HUD**: camera preview + center crosshair for 5×5 LiDAR patch tape checks (`YS-40`), live pitch/roll guide (`YS-05`, `YS-12`), marker & North calibration badges (`YS-14`), low-space warning (`YS-84`), determinate `"Saving your walk"` progress overlay (`YS-84`), and 5 action buttons (`Marker`, `Tape A`, `Tape B`, `Note`, `Done`, `YS-07`).
-/// 3. **Post-walk Summary**: displays loop-closure gap (`YS-32`), provisional grade & reasons (`YS-42`, `YS-44`), and one-tap AirDrop / Files export (`YS-22`).
+/// Architecture (`DESIGN-SPEC-NATIVE.md` §2a):
+/// - **Captures** (`NavigationStack`, root): follows the user's system Light/Dark color scheme (`P7`), shows `ContentUnavailableView`
+///   when empty or an `.insetGrouped` `List` of completed walks, with a toolbar Settings button and a bottom `.glassProminent` **New Capture** button.
+/// - **Welcome / Get Your Markers / Lay Your Markers**: 3-step onboarding `.sheet`, re-openable from Settings and the empty state.
+/// - **Before You Start** (`.sheet`, `.large` detent): `Form` of pre-flight checks (`YS-76`), print check card, centre-to-centre
+///   `Marker 0 -> Marker 1` tape entry (`YS-77`), and **Start Walk**.
+/// - **Walk** (`.fullScreenCover`, forced `.dark` scheme): full-screen RealityKit `ARView`, top-leading `✕` (`End walk`),
+///   single-line regular Liquid Glass instruction capsule with outdoor contrast backing (`YS-81`), trailing tilt gauge,
+///   3-segment marker lock ring (`YS-74`), and bottom `GlassEffectContainer` (`Note` / `Skip`, `Marker progress`, and conditional `Finish`).
+/// - **Review Walk** (`.sheet` over the still-running walk, `.medium` / `.large` detents): top-down yard map on `.regularMaterial`,
+///   verdict headline, at most 3 fix items (`YS-72`, `YS-80` #1), **Save Capture** (swapping to determinate `"Saving your walk"` progress),
+///   and **Keep Walking**.
+/// - **Capture Detail**: pushed onto `Captures` with plain-language verdict, accuracy sentence, `CAPTURED` rows, `DETAILS` disclosure group,
+///   and `ShareLink`.
 public struct ContentView: View {
     @StateObject private var recorder = CaptureSessionRecorder()
-    @State private var showTapeBKeypad = false
-    @State private var tapeMetersInput = "5.00"
-    @State private var preWalkTapeInput = ""
-    @State private var customPrintSizeCMInput = "18.0"
-    @State private var showPrintCustomSizeField = false
-    @State private var tapeRoleInput = "primary"
-    @State private var showNoteDialog = false
-    @State private var noteTextInput = ""
-    @State private var showShareSheet = false
-    @State private var showAboutSheet = false
-    @State private var didTriggerAutoBench = false
+    @State private var navigationPath: [SavedCaptureRecord.ID] = []
+    @State private var showOnboardingSheet = false
+    @State private var showBeforeYouStartSheet = false
+    @State private var showSettingsSheet = false
+    @State private var showWalkFullScreenCover = false
+    @State private var showReviewWalkSheet = false
+    @State private var renamingRecordID: String? = nil
+    @State private var renamingTitleInput: String = ""
+    @State private var didTriggerLaunchArgs = false
 
     public init() {}
 
     public var body: some View {
-        ZStack {
-            Color.black.ignoresSafeArea()
-
-            switch recorder.phase {
-            case .setup:
-                setupView
-            case .recording, .sealing:
-                recordingHUDView
-            case .completed, .failed:
-                summaryView
+        NavigationStack(path: $navigationPath) {
+            capturesRootView
+                .navigationTitle("Captures")
+                .toolbar {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button {
+                            showSettingsSheet = true
+                        } label: {
+                            Image(systemName: "gearshape")
+                        }
+                        .accessibilityLabel("Settings")
+                    }
+                }
+                .safeAreaInset(edge: .bottom) {
+                    Button {
+                        recorder.resetToSetupForNewCapture()
+                        showBeforeYouStartSheet = true
+                    } label: {
+                        Label("New Capture", systemImage: "plus")
+                            .font(.headline)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.glassProminent)
+                    .controlSize(.large)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .accessibilityShowsLargeContentViewer()
+                }
+                .navigationDestination(for: SavedCaptureRecord.ID.self) { recordID in
+                    if let record = recorder.savedCaptureRecords.first(where: { $0.id == recordID }) {
+                        CaptureDetailView(record: record)
+                    }
+                }
+        }
+        .sheet(isPresented: $showOnboardingSheet) {
+            WelcomeOnboardingSheetView(isPresented: $showOnboardingSheet)
+        }
+        .sheet(isPresented: $showBeforeYouStartSheet) {
+            BeforeYouStartSheetView(
+                recorder: recorder,
+                isPresented: $showBeforeYouStartSheet,
+                onStartWalk: {
+                    showBeforeYouStartSheet = false
+                    showWalkFullScreenCover = true
+                    recorder.requestPermissionsAndStart()
+                }
+            )
+            .presentationDetents([.large])
+        }
+        .sheet(isPresented: $showSettingsSheet) {
+            SettingsSheetView(
+                recorder: recorder,
+                isPresented: $showSettingsSheet,
+                onOpenOnboarding: {
+                    showSettingsSheet = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        showOnboardingSheet = true
+                    }
+                }
+            )
+        }
+        .fullScreenCover(isPresented: $showWalkFullScreenCover) {
+            WalkFullScreenCoverView(
+                recorder: recorder,
+                showReviewWalkSheet: $showReviewWalkSheet,
+                onDismissAfterSave: { savedRecordID in
+                    showReviewWalkSheet = false
+                    showWalkFullScreenCover = false
+                    if let id = savedRecordID {
+                        navigationPath = [id]
+                    }
+                }
+            )
+        }
+        .onChange(of: recorder.phase) { _, newPhase in
+            if newPhase == .completed, showWalkFullScreenCover {
+                let latestID = recorder.savedCaptureRecords.first?.id
+                showReviewWalkSheet = false
+                showWalkFullScreenCover = false
+                if let id = latestID {
+                    navigationPath = [id]
+                }
             }
         }
-        .preferredColorScheme(.dark)
         .onAppear {
-            guard !didTriggerAutoBench else { return }
-            let args = ProcessInfo.processInfo.arguments
-            if let idx = args.firstIndex(of: "--bench-seal-dir"),
-               idx + 1 < args.count {
-                didTriggerAutoBench = true
-                let dirPath = args[idx + 1]
-                let dirURL = URL(fileURLWithPath: dirPath, isDirectory: true)
-                _ = try? CaptureSessionRecorder.sealManifestAndPackZip(in: dirURL)
-            } else if let idx = args.firstIndex(of: "--auto-bench-capture"),
-               idx + 1 < args.count,
-               let seconds = Double(args[idx + 1]),
-               seconds > 0,
-               recorder.phase == .setup {
-                didTriggerAutoBench = true
-                recorder.requestPermissionsAndStart()
-                DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
-                    if recorder.phase == .recording {
-                        recorder.stopAndSealCapture()
+            handleLaunchArgumentsIfNeeded()
+        }
+    }
+
+    @ViewBuilder
+    private var capturesRootView: some View {
+        if recorder.savedCaptureRecords.isEmpty {
+            ContentUnavailableView {
+                Label("No Captures Yet", systemImage: "map")
+            } description: {
+                Text("Lay your four markers in the yard, then walk it with your iPhone.")
+            } actions: {
+                Button("How to Lay Markers") {
+                    showOnboardingSheet = true
+                }
+                .buttonStyle(.glass)
+            }
+        } else {
+            List {
+                ForEach(recorder.savedCaptureRecords) { record in
+                    NavigationLink(value: record.id) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(record.title)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
+                            Text(record.dateText)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                            HStack(spacing: 6) {
+                                Image(systemName: record.detailSummary.verdictSymbol)
+                                    .foregroundStyle(record.detailSummary.isVerdictPassing ? .green : .orange)
+                                Text(record.detailSummary.verdictTitle)
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        .accessibilityElement(children: .combine)
                     }
+                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                        Button(role: .destructive) {
+                            recorder.savedCaptureRecords.removeAll { $0.id == record.id }
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        Button {
+                            renamingRecordID = record.id
+                            renamingTitleInput = record.title
+                        } label: {
+                            Label("Rename", systemImage: "pencil")
+                        }
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+            .alert(
+                "Rename Capture",
+                isPresented: Binding(
+                    get: { renamingRecordID != nil },
+                    set: { if !$0 { renamingRecordID = nil } }
+                )
+            ) {
+                TextField("Back yard", text: $renamingTitleInput)
+                Button("Save") {
+                    if let targetID = renamingRecordID,
+                       let idx = recorder.savedCaptureRecords.firstIndex(where: { $0.id == targetID }) {
+                        let trimmed = renamingTitleInput.trimmingCharacters(in: .whitespacesAndNewlines)
+                        if !trimmed.isEmpty {
+                            recorder.savedCaptureRecords[idx].title = trimmed
+                        }
+                    }
+                    renamingRecordID = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    renamingRecordID = nil
                 }
             }
         }
     }
 
-    private var setupView: some View {
-        ScrollView {
-            VStack(spacing: 18) {
-                Text("Before You Start")
-                    .font(.largeTitle.bold())
-                    .foregroundStyle(.white)
+    private func handleLaunchArgumentsIfNeeded() {
+        guard !didTriggerLaunchArgs else { return }
+        let args = ProcessInfo.processInfo.arguments
+        if let idx = args.firstIndex(of: "--bench-seal-dir"), idx + 1 < args.count {
+            didTriggerLaunchArgs = true
+            let dirURL = URL(fileURLWithPath: args[idx + 1], isDirectory: true)
+            _ = try? CaptureSessionRecorder.sealManifestAndPackZip(in: dirURL)
+            return
+        }
+        if let idx = args.firstIndex(of: "--auto-bench-capture"),
+           idx + 1 < args.count,
+           let seconds = Double(args[idx + 1]),
+           seconds > 0,
+           recorder.phase == .setup {
+            didTriggerLaunchArgs = true
+            showWalkFullScreenCover = true
+            recorder.requestPermissionsAndStart()
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) {
+                if recorder.phase == .recording {
+                    recorder.stopAndSealCapture()
+                }
+            }
+            return
+        }
+        if let screenArg = args.first(where: { $0.hasPrefix("--ui-test-screen=") }) {
+            didTriggerLaunchArgs = true
+            let target = String(screenArg.dropFirst("--ui-test-screen=".count))
+            seedSampleCaptureRecordForPreview()
+            switch target {
+            case "onboarding":
+                showOnboardingSheet = true
+            case "preflight":
+                showBeforeYouStartSheet = true
+            case "settings":
+                showSettingsSheet = true
+            case "walk":
+                showWalkFullScreenCover = true
+            case "review":
+                showWalkFullScreenCover = true
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                    _ = recorder.evaluateWalkReview()
+                    showReviewWalkSheet = true
+                }
+            case "detail":
+                if let firstID = recorder.savedCaptureRecords.first?.id {
+                    navigationPath = [firstID]
+                }
+            default:
+                break
+            }
+        }
+    }
 
-                if !CaptureSessionRecorder.isLiDARSupported {
-                    HStack {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.yellow)
-                        Text("This iPhone Can't Measure Yards — LiDAR sensor required on iPhone Pro / Pro Max")
-                            .font(.footnote)
-                            .foregroundStyle(.yellow)
+    private func seedSampleCaptureRecordForPreview() {
+        guard recorder.savedCaptureRecords.isEmpty else { return }
+        var sampleCells: Set<GroundGridCell> = []
+        for ix in -6...6 {
+            for iz in -5...5 where abs(ix) + abs(iz) <= 9 {
+                sampleCells.insert(GroundGridCell(ix: ix, iz: iz))
+            }
+        }
+        let summary = CaptureDetailSummary.build(
+            provisionalGrade: "A",
+            status: "stopped",
+            distanceTolerance10mM: 0.028,
+            lockedMarkerIDs: [0, 1, 2, 3],
+            isLoopClosed: true,
+            isLookUpDone: true,
+            wasLookUpSkipped: false,
+            primaryTapeMeters: 6.00
+        )
+        recorder.savedCaptureRecords = [
+            SavedCaptureRecord(
+                id: "20261101T170000Z_yardstick",
+                title: "Back yard",
+                dateText: "Sun, Nov 1 · 8 min",
+                durationSeconds: 480,
+                savedFrameCount: 2865,
+                coveredGroundCells: sampleCells,
+                coveredGroundAreaM2: Double(sampleCells.count) * 0.0625,
+                detailSummary: summary,
+                archiveZipURL: nil
+            ),
+        ]
+    }
+}
+
+// MARK: - 1. First-Run Onboarding Sheet (`DESIGN-SPEC-NATIVE.md` §2a, §2c)
+
+private struct WelcomeOnboardingSheetView: View {
+    @Binding var isPresented: Bool
+    @State private var stepIndex: Int = 0
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                switch stepIndex {
+                case 0:
+                    welcomeStep
+                case 1:
+                    getMarkersStep
+                default:
+                    layMarkersStep
+                }
+            }
+            .navigationTitle(stepTitle)
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                if stepIndex > 0 {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button("Back") {
+                            stepIndex = max(0, stepIndex - 1)
+                        }
                     }
-                    .padding(10)
-                    .background(Color.white.opacity(0.08))
-                    .clipShape(.rect(cornerRadius: 8))
+                } else {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Button("Skip") {
+                            isPresented = false
+                        }
+                    }
+                }
+            }
+        }
+        .interactiveDismissDisabled(stepIndex == 0)
+    }
+
+    private var stepTitle: String {
+        switch stepIndex {
+        case 0: return "Measure Your Yard"
+        case 1: return "Get Your Markers"
+        default: return "Lay Your Markers"
+        }
+    }
+
+    private var welcomeStep: some View {
+        List {
+            Section {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Print four markers")
+                            .font(.headline)
+                        Text("Plain paper is fine.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "printer.fill")
+                        .font(.title2)
+                }
+                .padding(.vertical, 4)
+
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Lay them in the yard")
+                            .font(.headline)
+                        Text("One by the door, three near the corners.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "square.grid.2x2.fill")
+                        .font(.title2)
+                }
+                .padding(.vertical, 4)
+
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Walk the yard")
+                            .font(.headline)
+                        Text("Start and finish at marker 0.")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "figure.walk")
+                        .font(.title2)
+                }
+                .padding(.vertical, 4)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .safeAreaInset(edge: .bottom) {
+            Button {
+                stepIndex = 1
+            } label: {
+                Text("Continue")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
+            .padding(20)
+        }
+    }
+
+    private var getMarkersStep: some View {
+        List {
+            Section {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 12) {
+                        ForEach(0..<4, id: \.self) { id in
+                            Image(systemName: "\(id).square.fill")
+                                .font(.largeTitle)
+                                .symbolRenderingMode(.hierarchical)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                    Text("Print at Actual Size, not \"Fit to Page\".")
+                        .font(.body)
+                        .foregroundStyle(.primary)
+                }
+                .padding(.vertical, 6)
+            }
+        }
+        .listStyle(.insetGrouped)
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 10) {
+                Button {
+                    stepIndex = 2
+                } label: {
+                    Text("I Already Have Markers")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
+            }
+            .padding(20)
+        }
+    }
+
+    private var layMarkersStep: some View {
+        List {
+            Section {
+                Label("Marker 0 is your start. Put it by the back door.", systemImage: "0.circle.fill")
+                Label("Put 1, 2 and 3 near the corners and along the fence.", systemImage: "square.dashed")
+                Label("Lay them flat, out of shade.", systemImage: "sun.max.fill")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .safeAreaInset(edge: .bottom) {
+            Button {
+                isPresented = false
+            } label: {
+                Text("Done")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.glassProminent)
+            .controlSize(.large)
+            .padding(20)
+        }
+    }
+}
+
+// MARK: - 2. Before You Start Pre-Flight Sheet (`YS-76`, `YS-77`, `YS-80` #3 & #4, `YS-81`)
+
+private struct BeforeYouStartSheetView: View {
+    @ObservedObject var recorder: CaptureSessionRecorder
+    @Binding var isPresented: Bool
+    let onStartWalk: () -> Void
+
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
+    @State private var preWalkTapeInput: String = ""
+    @State private var customPrintSizeCMInput: String = "18.0"
+    @State private var showPrintCustomSizeField: Bool = false
+
+    private var isSimulatorPreviewAllowed: Bool {
+        ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--ui-test-screen=") }
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if !CaptureSessionRecorder.isLiDARSupported && !isSimulatorPreviewAllowed {
+                    ContentUnavailableView(
+                        "This iPhone Can't Measure Yards",
+                        systemImage: "camera.metering.unknown",
+                        description: Text("Yardstick requires an iPhone Pro or Pro Max with a LiDAR Scanner.")
+                    )
+                } else {
+                    preFlightForm
+                }
+            }
+            .navigationTitle("Before You Start")
+            .navigationBarTitleDisplayMode(.large)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        isPresented = false
+                    }
+                }
+            }
+            .safeAreaInset(edge: .bottom) {
+                let canStart = (CaptureSessionRecorder.isLiDARSupported || isSimulatorPreviewAllowed)
+                    && recorder.preFlightReport.canStartWalk
+                Button {
+                    onStartWalk()
+                } label: {
+                    Text("Start Walk")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
+                .disabled(!canStart)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+                .accessibilityShowsLargeContentViewer()
+            }
+        }
+        .onAppear {
+            if let existingTape = recorder.preWalkTapeMeters0To1, existingTape > 0 {
+                preWalkTapeInput = String(format: "%.2f", existingTape)
+            }
+            recorder.startPreFlightCameraProbeIfAuthorized()
+            _ = recorder.evaluatePreFlightChecklist()
+        }
+    }
+
+    private var preFlightForm: some View {
+        Form {
+            Section {
+                ForEach(recorder.preFlightReport.visibleRows, id: \.id) { row in
+                    if row.id != "print_check" && row.id != "tape_measurement" {
+                        preFlightStatusRow(row)
+                    }
+                }
+            }
+
+            Section {
+                let currentSizeMM = Int((recorder.markerSizesMM[0] ?? 180.0).rounded())
+                Picker("Markers", selection: Binding(
+                    get: { currentSizeMM == 250 ? 250 : 180 },
+                    set: { newMM in
+                        recorder.setAllMarkersPrintedSizeMM(Double(newMM))
+                    }
+                )) {
+                    Text("18 cm (standard)").tag(180)
+                    Text("25 cm").tag(250)
                 }
 
-                // YS-76: Pre-flight readiness rows (Daylight, Storage >= 10 GB, Battery, Heat, Lens Smudge, Print Card, Tape)
-                VStack(alignment: .leading, spacing: 10) {
-                    ForEach(recorder.preFlightReport.visibleRows, id: \.id) { row in
-                        HStack(alignment: .top, spacing: 10) {
-                            Image(systemName: preFlightSymbol(for: row.state))
-                                .foregroundStyle(preFlightColor(for: row.state))
-                                .font(.body.bold())
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(row.title)
-                                    .font(.subheadline.bold())
-                                    .foregroundStyle(.white)
-                                Text(row.detail)
-                                    .font(.caption)
-                                    .foregroundStyle(.gray)
-                            }
-                            Spacer()
-                            if row.id == "lens", row.actionTitle != nil {
-                                Button("Check Again") {
-                                    _ = recorder.resetLensSmudgeProbeAndCheckAgain()
-                                }
-                                .font(.caption.bold())
-                                .buttonStyle(.borderedProminent)
-                            } else if row.id == "print_check" && !recorder.isPrintSizeConfirmed {
-                                HStack(spacing: 6) {
-                                    Button("Yes") {
-                                        recorder.isPrintSizeConfirmed = true
-                                    }
-                                    .font(.caption.bold())
-                                    .buttonStyle(.borderedProminent)
-                                    Button("No, It Measures…") {
-                                        showPrintCustomSizeField.toggle()
-                                    }
-                                    .font(.caption)
-                                    .buttonStyle(.bordered)
-                                }
-                            } else if row.id == "storage" && row.state == .block {
-                                if let settingsURL = URL(string: UIApplication.openSettingsURLString) {
-                                    Link("Open Settings", destination: settingsURL)
-                                        .font(.caption.bold())
-                                }
-                            }
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Image(systemName: recorder.isPrintSizeConfirmed ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle(recorder.isPrintSizeConfirmed ? .green : .secondary)
+                        Text("Check your print")
+                            .font(.body)
+                        Spacer()
+                        if differentiateWithoutColor {
+                            Text(recorder.isPrintSizeConfirmed ? "Passed" : "Check")
+                                .font(.footnote.weight(.semibold))
+                                .foregroundStyle(.secondary)
                         }
-                        .padding(.vertical, 4)
+                    }
+                    Text(recorder.preFlightReport.printCheckRow.detail)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    if !recorder.isPrintSizeConfirmed {
+                        HStack(spacing: 10) {
+                            Button("Yes") {
+                                recorder.isPrintSizeConfirmed = true
+                            }
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
+
+                            Button("No, It Measures…") {
+                                showPrintCustomSizeField.toggle()
+                            }
+                            .buttonStyle(.glass)
+                            .controlSize(.small)
+                        }
                     }
 
                     if showPrintCustomSizeField {
                         HStack(spacing: 8) {
                             TextField("18.0", text: $customPrintSizeCMInput)
                                 .keyboardType(.decimalPad)
-                                .textFieldStyle(.roundedBorder)
                             Text("cm")
-                                .font(.caption)
-                                .foregroundStyle(.gray)
-                            Button("Save Size") {
+                                .foregroundStyle(.secondary)
+                            Button("Save") {
                                 if let cm = Double(customPrintSizeCMInput), cm >= 8.0 && cm <= 40.0 {
                                     recorder.setAllMarkersPrintedSizeMM(cm * 10.0)
                                     recorder.isPrintSizeConfirmed = true
                                     showPrintCustomSizeField = false
                                 }
                             }
-                            .font(.caption.bold())
-                            .buttonStyle(.borderedProminent)
+                            .buttonStyle(.glassProminent)
+                            .controlSize(.small)
                         }
                     }
                 }
-                .padding()
-                .background(Color.white.opacity(0.06))
-                .clipShape(.rect(cornerRadius: 12))
+                .padding(.vertical, 4)
 
-                // YS-77: Centre-to-centre Marker 0 -> Marker 1 pre-walk tape measurement (nothing typed during the walk)
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Tape measurement (Marker 0 to Marker 1 centre-to-centre)")
-                        .font(.subheadline.bold())
-                        .foregroundStyle(.white)
-                    HStack(spacing: 10) {
-                        TextField("e.g. 4.21", text: $preWalkTapeInput)
+                LabeledContent {
+                    HStack(spacing: 6) {
+                        TextField("4.21", text: $preWalkTapeInput)
                             .keyboardType(.decimalPad)
-                            .padding(8)
-                            .background(Color.white.opacity(0.10))
-                            .clipShape(.rect(cornerRadius: 8))
+                            .multilineTextAlignment(.trailing)
+                            .frame(maxWidth: 90)
                             .onChange(of: preWalkTapeInput) { _, newValue in
                                 if let val = Double(newValue), val > 0 {
                                     recorder.setPreWalkTapeMeters0To1(val)
@@ -220,101 +668,59 @@ public struct ContentView: View {
                                 }
                             }
                         Text("m")
-                            .font(.body.bold())
-                            .foregroundStyle(.gray)
-                    }
-                }
-                .padding()
-                .background(Color.white.opacity(0.06))
-                .clipShape(.rect(cornerRadius: 12))
-
-                // YS-80 #3 & YS-75: Uniform marker size setting (sets every marker ID) and Voice Coach toggle
-                VStack(alignment: .leading, spacing: 12) {
-                    HStack {
-                        Text("Marker Size")
-                            .font(.subheadline.bold())
-                            .foregroundStyle(.white)
-                        Spacer()
-                        let currentSizeMM = Int((recorder.markerSizesMM[0] ?? 180.0).rounded())
-                        Picker("Marker Size", selection: Binding(
-                            get: { currentSizeMM == 250 ? 250 : 180 },
-                            set: { newMM in
-                                recorder.setAllMarkersPrintedSizeMM(Double(newMM))
-                            }
-                        )) {
-                            Text("18 cm (standard)").tag(180)
-                            Text("25 cm").tag(250)
-                        }
-                        .pickerStyle(.segmented)
-                        .frame(maxWidth: 220)
-                    }
-
-                    Toggle("Voice Coach", isOn: $recorder.isVoiceCoachEnabled)
-                        .font(.subheadline.bold())
-                        .foregroundStyle(.white)
-                }
-                .padding()
-                .background(Color.white.opacity(0.06))
-                .clipShape(.rect(cornerRadius: 12))
-
-                Text("Stops you: too dark, no space, too hot.")
-                    .font(.caption)
-                    .foregroundStyle(.gray)
-
-                let canStart = CaptureSessionRecorder.isLiDARSupported && recorder.preFlightReport.canStartWalk
-                Button {
-                    recorder.requestPermissionsAndStart()
-                } label: {
-                    Text(CaptureSessionRecorder.isLiDARSupported ? "Start Walk" : "This iPhone Can't Measure Yards")
-                        .font(.headline)
-                        .foregroundStyle(.black)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(canStart ? Color.green : Color.gray)
-                        .clipShape(.rect(cornerRadius: 12))
-                }
-                .disabled(!canStart)
-
-                Button {
-                    showAboutSheet = true
-                } label: {
-                    Label("About & Open-Source Licences", systemImage: "info.circle")
-                        .font(.footnote)
-                        .foregroundStyle(.gray)
-                }
-            }
-            .padding(24)
-        }
-        .onAppear {
-            recorder.startPreFlightCameraProbeIfAuthorized()
-            _ = recorder.evaluatePreFlightChecklist()
-        }
-        .sheet(isPresented: $showAboutSheet) {
-            NavigationStack {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        Text("Yardstick")
-                            .font(.title2.bold())
-                        Text("Contract: yardstick-capture/1 · Apache License 2.0")
-                            .font(.subheadline)
                             .foregroundStyle(.secondary)
-                        Divider()
-                        Text("Open-Source Notices")
-                            .font(.headline)
-                        Text(ArUcoDetector.openCVApacheAttributionNotice)
+                    }
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Image(systemName: (recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? "checkmark.circle.fill" : "circle")
+                                .foregroundStyle((recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? .green : .secondary)
+                            Text("Tape measurement")
+                        }
+                        Text("Measure from the centre of marker 0 to the centre of marker 1.")
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                     }
-                    .padding()
                 }
-                .navigationTitle("About")
-                .toolbar {
-                    ToolbarItem(placement: .confirmationAction) {
-                        Button("Done") { showAboutSheet = false }
-                    }
-                }
+            } footer: {
+                Text("Stops you: too dark, no space, too hot.")
             }
         }
+    }
+
+    @ViewBuilder
+    private func preFlightStatusRow(_ row: PreFlightCheckRow) -> some View {
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: preFlightSymbol(for: row.state))
+                .foregroundStyle(preFlightColor(for: row.state))
+                .symbolRenderingMode(.hierarchical)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.title)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                Text(row.detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            if differentiateWithoutColor {
+                Text(preFlightStateWord(for: row.state))
+                    .font(.footnote.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+            if row.id == "lens", row.actionTitle != nil {
+                Button("Check Again") {
+                    _ = recorder.resetLensSmudgeProbeAndCheckAgain()
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.small)
+            } else if row.id == "storage" && row.state == .block,
+                      let settingsURL = URL(string: UIApplication.openSettingsURLString) {
+                Link("Open Settings", destination: settingsURL)
+                    .font(.footnote.weight(.semibold))
+            }
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private func preFlightSymbol(for state: PreFlightCheckState) -> String {
@@ -329,21 +735,45 @@ public struct ContentView: View {
     private func preFlightColor(for state: PreFlightCheckState) -> Color {
         switch state {
         case .pass: return .green
-        case .warn: return .yellow
+        case .warn: return .orange
         case .block: return .red
-        case .hidden: return .gray
+        case .hidden: return .secondary
         }
     }
 
-    private var recordingHUDView: some View {
+    private func preFlightStateWord(for state: PreFlightCheckState) -> String {
+        switch state {
+        case .pass: return "Passed"
+        case .warn: return "Check"
+        case .block: return "Fix"
+        case .hidden: return ""
+        }
+    }
+}
+
+// MARK: - 3. Live Walk Full-Screen Cover (`YS-72`, `YS-74`, `YS-80`, `YS-81`)
+
+private struct WalkFullScreenCoverView: View {
+    @ObservedObject var recorder: CaptureSessionRecorder
+    @Binding var showReviewWalkSheet: Bool
+    let onDismissAfterSave: (SavedCaptureRecord.ID?) -> Void
+
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
+    @Namespace private var bottomGlassNamespace
+    @State private var showEndEarlyConfirmation = false
+
+    var body: some View {
         ZStack {
-            // Live ARKit Camera Preview via RealityKit ARView (YS-40, YS-83)
+            // Live ARKit Camera Preview via RealityKit ARView (`YS-83`, `YS-81`: camera feed is hidden from VoiceOver)
             #if canImport(ARKit) && canImport(RealityKit)
             ARCameraPreviewView(session: recorder.arSession)
                 .ignoresSafeArea()
+                .accessibilityHidden(true)
             #endif
 
-            // 3-Segment Marker Lock Ring drawn on the marker in the camera view (YS-74)
+            // ② 3-Segment Marker Lock Ring drawn on the marker in the camera view (`YS-74`, `YS-85`)
             if let ringState = recorder.activeRingState {
                 GeometryReader { proxy in
                     let normCenter = MarkerRingOverlayView.normalizedCenter(
@@ -353,7 +783,7 @@ public struct ContentView: View {
                     )
                     MarkerRingOverlayView(
                         ringState: ringState,
-                        animationsStatic: recorder.thermalSchedule.animationsStatic
+                        animationsStatic: recorder.thermalSchedule.animationsStatic || reduceMotion
                     )
                     .position(
                         x: normCenter.x * proxy.size.width,
@@ -364,302 +794,747 @@ public struct ContentView: View {
                 .allowsHitTesting(false)
             }
 
-            // Center Crosshair for 5x5 LiDAR depth patch tape checks (YS-40)
-            VStack {
-                Spacer()
-                ZStack {
-                    Circle()
-                        .stroke(Color.green.opacity(0.85), lineWidth: 2)
-                        .frame(width: 36, height: 36)
-                    Rectangle()
-                        .fill(Color.green)
-                        .frame(width: 14, height: 2)
-                    Rectangle()
-                        .fill(Color.green)
-                        .frame(width: 2, height: 14)
-                }
-                if let d = recorder.crosshairDepthMeters {
-                    Text(String(format: "%.2f m", d))
-                        .font(.caption.monospacedDigit().bold())
-                        .padding(4)
-                        .background(Color.black.opacity(0.6))
-                        .clipShape(.rect(cornerRadius: 4))
-                }
-                Spacer()
+            // ④ In-view Marker Beacons (`0.40 m` above each seen marker) & ⑤ Off-screen Edge Arrows (`DESIGN-SPEC-NATIVE.md` §3a ④ & ⑤)
+            if !recorder.beaconProjections.isEmpty {
+                MarkerBeaconsAndEdgeArrowsOverlayView(projections: recorder.beaconProjections)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
 
-            VStack {
-                // Top telemetry & guidance bar (YS-05, YS-12, YS-14, YS-84)
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(recorder.statusBanner)
-                        .font(.subheadline.bold())
-                        .foregroundStyle(.white)
-
-                    if let warning = recorder.lowDiskSpaceWarning {
-                        HStack(spacing: 6) {
-                            Image(systemName: "externaldrive.badge.exclamationmark")
-                            Text(warning)
-                                .font(.caption.bold())
-                        }
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.yellow)
-                        .clipShape(.rect(cornerRadius: 6))
-                    }
-
-                    if let sizeWarn = recorder.liveMarkerSizeWarning {
-                        HStack(spacing: 6) {
-                            Image(systemName: "ruler")
-                            Text(sizeWarn)
-                                .font(.caption.bold())
-                        }
-                        .foregroundStyle(.black)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(Color.orange)
-                        .clipShape(.rect(cornerRadius: 6))
-                    }
-
-                    HStack(spacing: 12) {
-                        Label("Frames: \(recorder.savedFrameCount)", systemImage: "video.fill")
-                        Label("Markers: \(recorder.lockedMarkerIDs.count)/4", systemImage: "qrcode.viewfinder")
-                        Label(String(format: "Ground: %.1f m²", recorder.coveredGroundAreaM2), systemImage: "square.grid.3x3.fill")
-                        Label("Tapes: \(recorder.tapeCheckCount)", systemImage: "ruler.fill")
-                    }
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.green)
-
-                    if recorder.guidedWalkPhase == .houseWallLookUp {
-                        HStack(spacing: 12) {
-                            ProgressView(value: recorder.lookUpProgressFraction, total: 1.0)
-                                .tint(.green)
-                            Button("Skip") {
-                                recorder.skipLookUpStep()
-                            }
-                            .font(.caption.bold())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 4)
-                            .background(Color.white.opacity(0.2))
-                            .clipShape(.rect(cornerRadius: 6))
-                        }
-                    }
-
-                    HStack(spacing: 16) {
-                        Text(String(format: "Pitch: %.1f° (target -30°)", recorder.pitchDeg))
-                        Text(String(format: "Roll: %.1f°", recorder.rollDeg))
-                        Text("Track: \(recorder.trackingStateText)")
-                    }
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.gray)
+            // ③ Trailing-edge Tilt Gauge (`DESIGN-SPEC-NATIVE.md` §3a ③: hidden during a hold, silent, accessibilityHidden)
+            if recorder.activeRingState == nil && recorder.guidedWalkPhase != .houseWallLookUp {
+                HStack {
+                    Spacer()
+                    TiltGaugeOverlayView(pitchDeg: recorder.pitchDeg)
+                        .padding(.trailing, 14)
                 }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color.black.opacity(0.75))
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+            }
 
-                if !recorder.coveredGroundCells.isEmpty {
-                    HStack {
-                        Spacer()
+            // Top controls: ⑦ ✕ End walk (top-leading) + ① Instruction capsule (top-centre on regular Liquid Glass)
+            VStack(spacing: 12) {
+                HStack {
+                    Button {
+                        showEndEarlyConfirmation = true
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.headline.weight(.semibold))
+                            .frame(minWidth: 44, minHeight: 44)
+                    }
+                    .buttonStyle(.glass)
+                    .buttonBorderShape(.circle)
+                    .accessibilityLabel("End walk")
+                    .accessibilityShowsLargeContentViewer()
+
+                    Spacer()
+
+                    if !recorder.coveredGroundCells.isEmpty {
                         GroundCoverageMiniMapView(cells: recorder.coveredGroundCells)
-                            .frame(width: 96, height: 96)
-                            .padding(8)
+                            .frame(width: 76, height: 76)
                     }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+
+                // ① Single-line instruction capsule on regular Liquid Glass with outdoor sun dimming layer (`YS-80`, `YS-81`)
+                let dimOpacity = (colorSchemeContrast == .increased) ? 0.55 : 0.35
+                Text(recorder.statusBanner)
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(dynamicTypeSize.isAccessibilitySize ? 3 : 2)
+                    .contentTransition(.opacity)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(dimOpacity))
+                    )
+                    .glassEffect(.regular, in: Capsule())
+                    .padding(.horizontal, 20)
+                    .accessibilitySortPriority(100)
+                    .accessibilityAddTraits(.updatesFrequently)
+
+                // Developer-only live diagnostics overlay (`Settings ▸ Developer ▸ Live Diagnostics`, off by default per `YS-80` §3c)
+                if recorder.showDeveloperDiagnosticsOverlay {
+                    DeveloperDiagnosticsOverlayView(recorder: recorder)
+                        .padding(.horizontal, 16)
                 }
 
                 Spacer()
-
-                if showTapeBKeypad {
-                    tapeKeypadOverlay
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            bottomControlGroup
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+        }
+        .preferredColorScheme(.dark)
+        .modifier(HideStatusBarToolbarModifier())
+        .persistentSystemOverlays(.hidden)
+        .interactiveDismissDisabled()
+        // YS-81: VoiceOver Magic Tap (two-finger double tap) starts and stops a voice note
+        .accessibilityAction(.magicTap) {
+            recorder.setRecordingVoiceNote(!recorder.isRecordingVoiceNote)
+        }
+        .confirmationDialog(
+            "End walk early?",
+            isPresented: $showEndEarlyConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("End Walk", role: .destructive) {
+                recorder.markEndEarlyChosen()
+                _ = recorder.evaluateWalkReview()
+                showReviewWalkSheet = true
+            }
+            Button("Keep Walking", role: .cancel) {}
+        } message: {
+            Text("You haven't returned to marker 0, so this walk probably won't be accepted.")
+        }
+        .sheet(isPresented: $showReviewWalkSheet) {
+            ReviewWalkSheetView(
+                recorder: recorder,
+                isPresented: $showReviewWalkSheet,
+                onCompletedSave: {
+                    let latestID = recorder.savedCaptureRecords.first?.id
+                    onDismissAfterSave(latestID)
                 }
+            )
+            .presentationDetents([.medium, .large])
+            .presentationDragIndicator(.visible)
+            .interactiveDismissDisabled()
+            .presentationBackgroundInteraction(.disabled)
+        }
+    }
 
-                // Bottom 5-button operator bar: Marker, Tape A, Tape B, Note, Done (YS-07)
-                HStack(spacing: 10) {
-                    hudButton(title: "Marker", icon: "qrcode", color: .blue) {
-                        recorder.logEvent(kind: "marker", detail: "Operator marker sighting")
-                    }
-                    hudButton(title: "Tape A", icon: "a.circle.fill", color: .orange) {
-                        recorder.captureTapeEndpointA()
-                    }
-                    hudButton(title: "Tape B", icon: "b.circle.fill", color: .orange) {
-                        // Lock Endpoint B 3D point immediately at tap time BEFORE opening keypad (YS-40)
-                        if recorder.captureTapeEndpointB() {
-                            showTapeBKeypad = true
+    @ViewBuilder
+    private var bottomControlGroup: some View {
+        GlassEffectContainer(spacing: 14) {
+            if dynamicTypeSize.isAccessibilitySize {
+                // YS-81 / DESIGN-SPEC-NATIVE.md §6 line 541: At AX sizes, stack Note & Finish above the marker capsule
+                VStack(spacing: 10) {
+                    HStack(spacing: 14) {
+                        leadingActionControl
+                        if recorder.isFinishAvailable {
+                            finishButton
                         }
                     }
-                    hudButton(
-                        title: recorder.isRecordingVoiceNote ? "Note On" : "Note",
-                        icon: recorder.isRecordingVoiceNote ? "mic.badge.xmark" : "mic.fill",
-                        color: .purple
-                    ) {
-                        let nextState = !recorder.isRecordingVoiceNote
-                        recorder.setRecordingVoiceNote(nextState)
-                        if nextState {
-                            recorder.logEvent(kind: "note", detail: "Spoken note anchor")
-                        }
-                    }
-                    hudButton(
-                        title: recorder.isFinishAvailable ? "Finish" : "Done",
-                        icon: "checkmark.seal.fill",
-                        color: recorder.isFinishAvailable ? .green : .gray
-                    ) {
-                        recorder.stopAndSealCapture()
+                    MarkerProgressCapsuleView(
+                        lockedMarkerIDs: recorder.lockedMarkerIDs,
+                        seenMarkerIDs: recorder.detectedMarkerIDs,
+                        phase: recorder.guidedWalkPhase,
+                        isFinishAvailable: recorder.isFinishAvailable,
+                        isAccessibilitySize: true,
+                        reduceMotion: reduceMotion || recorder.thermalSchedule.animationsStatic
+                    )
+                    .glassEffectID("markerProgress", in: bottomGlassNamespace)
+                }
+            } else {
+                HStack(spacing: 14) {
+                    leadingActionControl
+                    Spacer(minLength: 4)
+                    MarkerProgressCapsuleView(
+                        lockedMarkerIDs: recorder.lockedMarkerIDs,
+                        seenMarkerIDs: recorder.detectedMarkerIDs,
+                        phase: recorder.guidedWalkPhase,
+                        isFinishAvailable: recorder.isFinishAvailable,
+                        isAccessibilitySize: false,
+                        reduceMotion: reduceMotion || recorder.thermalSchedule.animationsStatic
+                    )
+                    .glassEffectID("markerProgress", in: bottomGlassNamespace)
+                    Spacer(minLength: 4)
+                    // ⑥c Finish does NOT exist until YS-71 + closing hold at Marker 0 pass (`YS-72`)
+                    if recorder.isFinishAvailable {
+                        finishButton
                     }
                 }
-                .padding(12)
-                .background(Color.black.opacity(0.85))
-                .disabled(recorder.phase == .sealing)
-            }
-
-            if recorder.phase == .sealing {
-                sealingProgressOverlay
             }
         }
+        .disabled(recorder.phase == .sealing)
     }
 
-    private var sealingProgressOverlay: some View {
-        VStack(spacing: 16) {
-            Text(recorder.sealingStatusText)
-                .font(.title3.bold())
-                .foregroundStyle(.white)
-
-            ProgressView(value: recorder.sealingProgress, total: 1.0)
-                .tint(.green)
-                .frame(maxWidth: 260)
-
-            Text(String(format: "%d%% — Keep screen open", Int((recorder.sealingProgress * 100.0).rounded())))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.gray)
-        }
-        .padding(24)
-        .background(Color.black.opacity(0.92))
-        .clipShape(.rect(cornerRadius: 16))
-        .padding(24)
-    }
-
-    private var tapeKeypadOverlay: some View {
-        VStack(spacing: 12) {
-            Text("Enter Tape-Measure Distance (meters)")
-                .font(.headline)
-            Picker("Role", selection: $tapeRoleInput) {
-                Text("Primary").tag("primary")
-                Text("Held-Out").tag("held_out")
+    @ViewBuilder
+    private var leadingActionControl: some View {
+        if recorder.guidedWalkPhase == .houseWallLookUp {
+            // DESIGN-SPEC-NATIVE.md §3b: A Skip button replaces Note during the look-up step
+            Button("Skip") {
+                recorder.skipLookUpStep()
             }
-            .pickerStyle(.segmented)
-
-            TextField("5.00", text: $tapeMetersInput)
-                .keyboardType(.decimalPad)
-                .font(.title2.monospacedDigit())
-                .multilineTextAlignment(.center)
-                .padding(8)
-                .background(Color.white.opacity(0.12))
-                .clipShape(.rect(cornerRadius: 8))
-
-            HStack(spacing: 12) {
-                Button("Cancel") {
-                    showTapeBKeypad = false
-                }
-                .foregroundStyle(.red)
-                Spacer()
-                Button("Commit Tape B") {
-                    if let val = Double(tapeMetersInput), val > 0 {
-                        recorder.commitTapeEndpointB(tapeMeters: val, role: tapeRoleInput)
-                    }
-                    showTapeBKeypad = false
-                }
-                .font(.headline)
-                .foregroundStyle(.green)
-            }
-        }
-        .padding(16)
-        .background(Color.black.opacity(0.92))
-        .clipShape(.rect(cornerRadius: 12))
-        .padding()
-    }
-
-    private var summaryView: some View {
-        VStack(spacing: 18) {
-            Text("Capture Summary")
-                .font(.largeTitle.bold())
-
-            Text("Provisional Grade: \(recorder.provisionalGrade)")
-                .font(.title.bold())
-                .foregroundStyle(recorder.provisionalGrade == "A" || recorder.provisionalGrade == "B" ? .green : .yellow)
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Capture ID: \(recorder.captureID)")
-                Text("Saved Depth Frames: \(recorder.savedFrameCount)")
-                Text(String(format: "Ground Coverage: %.1f m² (%d cells)", recorder.coveredGroundAreaM2, recorder.coveredGroundCellCount))
-                if !recorder.coveredGroundCells.isEmpty {
-                    GroundCoverageMiniMapView(cells: recorder.coveredGroundCells)
-                        .frame(height: 120)
-                }
-                Text("Tape Checks Logged: \(recorder.tapeCheckCount)")
-                ForEach(recorder.tapeCheckSummaries, id: \.self) { summary in
-                    Text("  • \(summary)")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.white)
-                }
-                if let gap = recorder.loopClosureGapMeters {
-                    Text(String(format: "Marker 0 Loop-Closure Gap: %.1f cm", gap * 100.0))
-                } else {
-                    Text("Marker 0 Loop-Closure Gap: not revisited")
-                }
-                ForEach(recorder.provisionalReasons, id: \.self) { reason in
-                    Text("• \(reason)")
-                        .font(.caption.monospaced())
-                        .foregroundStyle(.gray)
-                }
-            }
-            .font(.subheadline)
-            .padding()
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white.opacity(0.08))
-            .clipShape(.rect(cornerRadius: 12))
-
-            if let zipURL = recorder.archiveZipURL {
-                ShareLink(item: zipURL) {
-                    Label("Export Capture Archive (.zip)", systemImage: "square.and.arrow.up")
-                        .font(.headline)
-                        .foregroundStyle(.black)
-                        .frame(maxWidth: .infinity)
-                        .padding()
-                        .background(Color.green)
-                        .clipShape(.rect(cornerRadius: 12))
-                }
-            }
-
+            .buttonStyle(.glass)
+            .controlSize(.extraLarge)
+            .glassEffectID("leadingAction", in: bottomGlassNamespace)
+            .accessibilityShowsLargeContentViewer()
+        } else {
+            // ⑥a Note button: circular glass button with `mic.fill` -> `waveform` variable-color effect while recording
             Button {
-                recorder.requestPermissionsAndStart()
+                recorder.setRecordingVoiceNote(!recorder.isRecordingVoiceNote)
             } label: {
-                Text("New Capture")
-                    .font(.headline)
-                    .foregroundStyle(.black)
-                    .frame(maxWidth: .infinity)
-                    .padding()
-                    .background(Color.white)
-                    .clipShape(.rect(cornerRadius: 12))
+                Image(systemName: recorder.isRecordingVoiceNote ? "waveform" : "mic.fill")
+                    .font(.title3.weight(.semibold))
+                    .symbolEffect(
+                        .variableColor.iterative,
+                        isActive: recorder.isRecordingVoiceNote && !reduceMotion && !recorder.thermalSchedule.animationsStatic
+                    )
+                    .frame(minWidth: 48, minHeight: 48)
             }
+            .buttonStyle(.glass)
+            .buttonBorderShape(.circle)
+            .controlSize(.extraLarge)
+            .glassEffectID("leadingAction", in: bottomGlassNamespace)
+            .accessibilityLabel(recorder.isRecordingVoiceNote ? "Stop note" : "Add voice note")
+            .accessibilityInputLabels(["Stop note", "Note", "Voice note"])
+            .accessibilityShowsLargeContentViewer()
         }
-        .padding(24)
     }
 
-    private func hudButton(title: String, icon: String, color: Color, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            VStack(spacing: 4) {
-                Image(systemName: icon)
-                    .font(.title3)
-                Text(title)
-                    .font(.caption2.bold())
-            }
-            .foregroundStyle(.white)
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 10)
-            .background(color.opacity(0.8))
-            .clipShape(.rect(cornerRadius: 8))
+    private var finishButton: some View {
+        Button {
+            _ = recorder.evaluateWalkReview()
+            showReviewWalkSheet = true
+        } label: {
+            Label("Finish", systemImage: "checkmark")
+                .font(.headline)
+        }
+        .buttonStyle(.glassProminent)
+        .controlSize(.extraLarge)
+        .glassEffectID("finishButton", in: bottomGlassNamespace)
+        .accessibilityLabel("Finish")
+        .accessibilityInputLabels(["Finish", "Finish walk"])
+        .accessibilityShowsLargeContentViewer()
+    }
+}
+
+// MARK: - 4. Marker Progress Capsule & Tilt Gauge (`DESIGN-SPEC-NATIVE.md` §3a ③, ⑥b, §5, §6)
+
+private struct HideStatusBarToolbarModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 27.0, *) {
+            content.toolbarVisibility(.hidden, for: .statusBar)
+        } else {
+            content
         }
     }
 }
+
+private struct MarkerProgressCapsuleView: View {
+    let lockedMarkerIDs: Set<Int>
+    let seenMarkerIDs: Set<Int>
+    let phase: GuidedWalkPhase
+    let isFinishAvailable: Bool
+    let isAccessibilitySize: Bool
+    let reduceMotion: Bool
+
+    var body: some View {
+        Group {
+            if isAccessibilitySize {
+                Text(MarkerProgressAccessibility.accessibilitySizeText(
+                    lockedMarkerIDs: lockedMarkerIDs,
+                    isFinishAvailable: isFinishAvailable
+                ))
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            } else if isFinishAvailable {
+                HStack(spacing: 6) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("All markers")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.primary)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            } else {
+                HStack(spacing: 10) {
+                    ForEach(0..<4, id: \.self) { mid in
+                        markerSymbolView(for: mid)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            }
+        }
+        .glassEffect(.regular, in: Capsule())
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Markers")
+        .accessibilityValue(
+            MarkerProgressAccessibility.voiceOverValue(
+                lockedMarkerIDs: lockedMarkerIDs,
+                isFinishAvailable: isFinishAvailable
+            )
+        )
+    }
+
+    @ViewBuilder
+    private func markerSymbolView(for mid: Int) -> some View {
+        let isDone = lockedMarkerIDs.contains(mid)
+        let isSeen = seenMarkerIDs.contains(mid)
+        let isWaitingForReturn = (mid == 0 && phase == .closingMarker0 && !isFinishAvailable)
+        let symbolName = (isDone || isWaitingForReturn) ? "\(mid).circle.fill" : "\(mid).circle"
+
+        HStack(spacing: 2) {
+            Image(systemName: symbolName)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle((isDone || isSeen || isWaitingForReturn) ? .primary : .secondary)
+                .contentTransition(.symbolEffect(.replace))
+                .symbolEffect(.breathe, isActive: isWaitingForReturn && !reduceMotion)
+            if isWaitingForReturn && reduceMotion {
+                // DESIGN-SPEC-NATIVE.md §5 line 512: under Reduce Motion, show static arrow.uturn.backward badge
+                Image(systemName: "arrow.uturn.backward")
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.primary)
+            }
+        }
+    }
+}
+
+private struct TiltGaugeOverlayView: View {
+    let pitchDeg: Double
+
+    var body: some View {
+        Canvas { context, size in
+            let w = size.width
+            let h = size.height
+            // Target band: -30° ± 12° (-42° ... -18°) mapped onto [-70° ... +20°]
+            func yForPitch(_ deg: Double) -> CGFloat {
+                let clamped = min(20.0, max(-70.0, deg))
+                let norm = (20.0 - clamped) / 90.0
+                return CGFloat(norm) * h
+            }
+            let topBandY = yForPitch(-18.0)
+            let botBandY = yForPitch(-42.0)
+            let bandRect = CGRect(x: 0, y: topBandY, width: w, height: max(4, botBandY - topBandY))
+            context.fill(Path(roundedRect: bandRect, cornerRadius: w * 0.5), with: .color(.green.opacity(0.45)))
+
+            let dotY = yForPitch(pitchDeg)
+            let inBand = (pitchDeg >= -42.0 && pitchDeg <= -18.0)
+            let dotRect = CGRect(x: 0, y: dotY - w * 0.5, width: w, height: w)
+            context.fill(Path(ellipseIn: dotRect), with: .color(inBand ? .white : .orange))
+        }
+        .frame(width: 6, height: 120)
+        .background(.regularMaterial)
+        .clipShape(Capsule())
+    }
+}
+
+private struct MarkerBeaconsAndEdgeArrowsOverlayView: View {
+    let projections: [MarkerBeaconProjection]
+
+    var body: some View {
+        GeometryReader { proxy in
+            ForEach(projections) { proj in
+                if proj.isOnScreen {
+                    // ④ In-view marker beacon (`0.40 m` above seen marker): `n.circle` when waiting, `n.circle.fill` when done
+                    Image(systemName: proj.isDone ? "\(proj.markerID).circle.fill" : "\(proj.markerID).circle")
+                        .font(.title2.weight(.semibold))
+                        .foregroundStyle(proj.isDone ? .green : .white)
+                        .padding(6)
+                        .background(.ultraThinMaterial, in: Circle())
+                        .position(
+                            x: proj.normalizedPortraitXY.x * proxy.size.width,
+                            y: proj.normalizedPortraitXY.y * proxy.size.height
+                        )
+                } else if let chevron = proj.edgeChevronSymbol {
+                    // ⑤ Off-screen edge arrow: `chevron.left` / `chevron.right` + marker digit pinned to nearest screen edge
+                    HStack(spacing: 4) {
+                        if chevron == "chevron.left" {
+                            Image(systemName: chevron)
+                                .font(.caption.weight(.bold))
+                            Text("\(proj.markerID)")
+                                .font(.subheadline.monospacedDigit().weight(.bold))
+                        } else {
+                            Text("\(proj.markerID)")
+                                .font(.subheadline.monospacedDigit().weight(.bold))
+                            Image(systemName: chevron)
+                                .font(.caption.weight(.bold))
+                        }
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(.regularMaterial, in: Capsule())
+                    .position(
+                        x: proj.normalizedPortraitXY.x * proxy.size.width,
+                        y: proj.normalizedPortraitXY.y * proxy.size.height
+                    )
+                }
+            }
+        }
+    }
+}
+
+// MARK: - 5. Live Review Walk Sheet (`YS-72`, `YS-80`, `YS-81`, `YS-84`, `DESIGN-SPEC-NATIVE.md` §3e, §4e)
+
+private struct ReviewWalkSheetView: View {
+    @ObservedObject var recorder: CaptureSessionRecorder
+    @Binding var isPresented: Bool
+    let onCompletedSave: () -> Void
+
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var showSaveAnywayConfirmation = false
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if recorder.phase == .sealing {
+                    savingWalkProgressView
+                } else {
+                    reviewContentView
+                }
+            }
+            .navigationTitle(recorder.phase == .sealing ? "Saving your walk" : "Review Walk")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+        .onAppear {
+            _ = recorder.evaluateWalkReview()
+        }
+        .confirmationDialog(
+            "Save anyway?",
+            isPresented: $showSaveAnywayConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Save Anyway", role: .destructive) {
+                recorder.stopAndSealCapture()
+            }
+            Button("Head Back", role: .cancel) {
+                recorder.performWalkReviewAction(.returnToMarker0)
+                isPresented = false
+            }
+        } message: {
+            Text("This walk probably won't be accepted.")
+        }
+    }
+
+    private var savingWalkProgressView: some View {
+        VStack(spacing: 18) {
+            Spacer()
+            ProgressView(value: recorder.sealingProgress, total: 1.0) {
+                Text("Saving your walk")
+                    .font(.headline)
+            } currentValueLabel: {
+                Text("\(Int((recorder.sealingProgress * 100.0).rounded()))%")
+                    .font(.subheadline.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            .progressViewStyle(.linear)
+            .padding(.horizontal, 32)
+            Spacer()
+        }
+        .padding(24)
+    }
+
+    private var reviewContentView: some View {
+        let report = recorder.latestWalkReviewReport
+        return ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                // Content-layer yard map on `.regularMaterial` (NOT Liquid Glass per P2)
+                GroundCoverageMiniMapView(
+                    cells: recorder.coveredGroundCells,
+                    accessibilitySummary: report.mapAccessibilitySummary
+                )
+                .frame(height: 150)
+
+                // Verdict headline + symbol
+                HStack(spacing: 10) {
+                    Image(systemName: report.symbolName)
+                        .font(.title3.weight(.semibold))
+                        .foregroundStyle(verdictColor(for: report.verdictKind))
+                        .symbolEffect(.wiggle, value: report.verdictKind == .almostThere && !reduceMotion)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(report.headline)
+                            .font(.title3.weight(.semibold))
+                            .foregroundStyle(.primary)
+                        Text(report.subheadline)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+
+                // <= 3 review items, worst first (`YS-72`, `DESIGN-SPEC-NATIVE.md` §4e)
+                if !report.items.isEmpty {
+                    VStack(spacing: 10) {
+                        ForEach(report.items) { item in
+                            HStack(spacing: 12) {
+                                Image(systemName: item.symbolName)
+                                    .foregroundStyle(item.isWarning ? .orange : .secondary)
+                                Text(item.sentence)
+                                    .font(.subheadline)
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                if differentiateWithoutColor {
+                                    Text(item.differentiateWithoutColorBadge)
+                                        .font(.footnote.weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                }
+                                if let btnTitle = item.buttonTitle, let action = item.action {
+                                    Button(btnTitle) {
+                                        recorder.performWalkReviewAction(action)
+                                        isPresented = false
+                                    }
+                                    .buttonStyle(.glassProminent)
+                                    .controlSize(.small)
+                                }
+                            }
+                            .padding(12)
+                            .background(.regularMaterial, in: ConcentricRectangle())
+                            .accessibilityElement(children: .combine)
+                        }
+                    }
+                }
+            }
+            .padding(20)
+        }
+        .safeAreaInset(edge: .bottom) {
+            VStack(spacing: 10) {
+                Button {
+                    if report.requiresSaveAnywayConfirmation {
+                        showSaveAnywayConfirmation = true
+                    } else {
+                        recorder.stopAndSealCapture()
+                    }
+                } label: {
+                    Text("Save Capture")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
+
+                Button {
+                    isPresented = false
+                } label: {
+                    Text("Keep Walking")
+                        .font(.subheadline.weight(.semibold))
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glass)
+                .controlSize(.regular)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+    }
+
+    private func verdictColor(for kind: WalkReviewVerdictKind) -> Color {
+        switch kind {
+        case .looksGood: return .green
+        case .almostThere: return .orange
+        case .probablyWontBeAccepted: return .red
+        }
+    }
+}
+
+// MARK: - 6. Capture Detail View (`YS-80`, `YS-81`, `DESIGN-SPEC-NATIVE.md` §3f)
+
+public struct CaptureDetailView: View {
+    public let record: SavedCaptureRecord
+    @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
+    @State private var showTechnicalDetails = false
+
+    public init(record: SavedCaptureRecord) {
+        self.record = record
+    }
+
+    public var body: some View {
+        List {
+            Section {
+                GroundCoverageMiniMapView(
+                    cells: record.coveredGroundCells,
+                    accessibilitySummary: "Map of your walk. \(record.detailSummary.markersValue)."
+                )
+                .frame(height: 160)
+                .listRowInsets(EdgeInsets())
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Image(systemName: record.detailSummary.verdictSymbol)
+                            .foregroundStyle(record.detailSummary.isVerdictPassing ? .green : .orange)
+                        Text(record.detailSummary.verdictTitle)
+                            .font(.title3.weight(.semibold))
+                    }
+                    Text(record.detailSummary.accuracySentence)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.vertical, 4)
+                .accessibilityElement(children: .combine)
+            }
+
+            Section("Captured") {
+                detailRow(
+                    title: "Markers",
+                    value: record.detailSummary.markersValue,
+                    passed: record.detailSummary.markersPassed
+                )
+                detailRow(
+                    title: "Back at the start",
+                    value: record.detailSummary.backAtStartValue,
+                    passed: record.detailSummary.backAtStartPassed
+                )
+                detailRow(
+                    title: "Looked up",
+                    value: record.detailSummary.lookedUpValue,
+                    passed: record.detailSummary.lookedUpPassed
+                )
+                detailRow(
+                    title: "Tape measurement",
+                    value: record.detailSummary.tapeMeasurementValue,
+                    passed: record.detailSummary.tapeMeasurementPassed
+                )
+            }
+
+            Section {
+                DisclosureGroup("Details", isExpanded: $showTechnicalDetails) {
+                    LabeledContent("Grade", value: record.detailSummary.gradeLetter)
+                    LabeledContent("Duration", value: "\(record.durationSeconds) s")
+                    LabeledContent("Frames", value: "\(record.savedFrameCount)")
+                    LabeledContent("Coverage", value: String(format: "%.1f m²", record.coveredGroundAreaM2))
+                    LabeledContent("Format", value: "yardstick-capture/1")
+                }
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle(record.title)
+        .toolbar {
+            if let zipURL = record.archiveZipURL {
+                ToolbarItem(placement: .topBarTrailing) {
+                    ShareLink(item: zipURL) {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    .accessibilityLabel("Share Capture")
+                }
+            }
+        }
+        .safeAreaInset(edge: .bottom) {
+            if let zipURL = record.archiveZipURL {
+                ShareLink(item: zipURL) {
+                    Label("Share Capture", systemImage: "square.and.arrow.up")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 12)
+            }
+        }
+    }
+
+    private func detailRow(title: String, value: String, passed: Bool) -> some View {
+        LabeledContent(title) {
+            HStack(spacing: 6) {
+                Text(value)
+                    .foregroundStyle(passed ? .primary : .secondary)
+                if differentiateWithoutColor {
+                    Text(passed ? "Passed" : "Check")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .accessibilityElement(children: .combine)
+    }
+}
+
+// MARK: - 7. Settings Sheet & Developer Live Diagnostics (`YS-70`, `YS-75`, `YS-80`, `DESIGN-SPEC-NATIVE.md` §3c, §3g)
+
+private struct SettingsSheetView: View {
+    @ObservedObject var recorder: CaptureSessionRecorder
+    @Binding var isPresented: Bool
+    let onOpenOnboarding: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Markers") {
+                    let currentSizeMM = Int((recorder.markerSizesMM[0] ?? 180.0).rounded())
+                    Picker("Marker Size", selection: Binding(
+                        get: { currentSizeMM == 250 ? 250 : 180 },
+                        set: { newMM in
+                            recorder.setAllMarkersPrintedSizeMM(Double(newMM))
+                        }
+                    )) {
+                        Text("18 cm (standard)").tag(180)
+                        Text("25 cm").tag(250)
+                    }
+                    .pickerStyle(.menu)
+
+                    Button("How to Lay Markers") {
+                        onOpenOnboarding()
+                    }
+                }
+
+                Section {
+                    Toggle("Voice Coach", isOn: $recorder.isVoiceCoachEnabled)
+                    Toggle("Haptics", isOn: $recorder.isHapticsEnabled)
+                } header: {
+                    Text("Coaching")
+                } footer: {
+                    Text("Speaks each step aloud.")
+                }
+
+                Section("About") {
+                    LabeledContent("Version", value: "1.0")
+                    LabeledContent("Capture format", value: "yardstick-capture/1")
+                    NavigationLink("Open-Source Licences") {
+                        ScrollView {
+                            Text(ArUcoDetector.openCVApacheAttributionNotice)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                                .padding()
+                        }
+                        .navigationTitle("Licences")
+                    }
+                }
+
+                Section("Developer") {
+                    Toggle("Live Diagnostics", isOn: $recorder.showDeveloperDiagnosticsOverlay)
+                }
+            }
+            .navigationTitle("Settings")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        isPresented = false
+                    }
+                }
+            }
+        }
+    }
+}
+
+private struct DeveloperDiagnosticsOverlayView: View {
+    @ObservedObject var recorder: CaptureSessionRecorder
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 12) {
+                Text("Frames: \(recorder.savedFrameCount)")
+                Text("Drops: \(recorder.droppedFrameCount)")
+                Text("Markers: \(recorder.lockedMarkerIDs.count)/4")
+                Text(String(format: "Area: %.1f m²", recorder.coveredGroundAreaM2))
+            }
+            HStack(spacing: 12) {
+                Text(String(format: "Pitch: %.1f°", recorder.pitchDeg))
+                Text(String(format: "Roll: %.1f°", recorder.rollDeg))
+                Text("Track: \(recorder.trackingStateText)")
+                Text(String(format: "Blur: %.2f px", recorder.latestPredictedBlurPx))
+            }
+        }
+        .font(.footnote.monospacedDigit())
+        .foregroundStyle(.primary)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.thinMaterial, in: ConcentricRectangle())
+        .accessibilityHidden(true)
+    }
+}
+
+// MARK: - 8. 3-Segment Marker Lock Ring & Top-Down Ground Coverage Map (`YS-74`, `YS-78`, `YS-81`, `YS-85`)
 
 /// 3-segment Marker Lock Ring drawn on the marker in the camera view (`YS-74`, `YS-85`).
 ///
@@ -736,12 +1611,14 @@ public struct MarkerRingOverlayView: View {
     }
 }
 
-/// Top-down `0.25 m` ground coverage grid view (`YS-78`).
+/// Top-down `0.25 m` ground coverage grid view on `.regularMaterial` (`YS-78`, `YS-81`).
 public struct GroundCoverageMiniMapView: View {
     public let cells: Set<GroundGridCell>
+    public let accessibilitySummary: String?
 
-    public init(cells: Set<GroundGridCell>) {
+    public init(cells: Set<GroundGridCell>, accessibilitySummary: String? = nil) {
         self.cells = cells
+        self.accessibilitySummary = accessibilitySummary
     }
 
     public var body: some View {
@@ -776,7 +1653,9 @@ public struct GroundCoverageMiniMapView: View {
             }
         }
         .background(.regularMaterial)
-        .clipShape(.rect(cornerRadius: 10))
-        .accessibilityHidden(true)
+        .clipShape(ConcentricRectangle())
+        .accessibilityElement(children: .ignore)
+        .accessibilityHidden(accessibilitySummary == nil)
+        .accessibilityLabel(accessibilitySummary ?? "Ground coverage map")
     }
 }

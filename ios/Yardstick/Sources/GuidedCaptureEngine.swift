@@ -719,6 +719,21 @@ public struct GuidedCaptureEngine: Sendable {
         )
     }
 
+    /// Known 3D world positions of seen or locked markers (`0...3`) for screen-space beacons and edge arrows (`DESIGN-SPEC-NATIVE.md` §3a ④, ⑤).
+    public var knownMarkerPositionsWorld: [Int: SIMD3<Double>] {
+        var out: [Int: SIMD3<Double>] = [:]
+        if openingMarker0Hold.isLocked || openingMarker0Hold.confirmedSegments > 0 || simd_length(openingMarker0Hold.latestPositionWorld) > 1e-4 {
+            out[0] = openingMarker0Hold.latestPositionWorld
+        }
+        for mid in 1...3 {
+            if let h = marker1To3Holds[mid],
+               (h.isLocked || h.confirmedSegments > 0 || simd_length(h.latestPositionWorld) > 1e-4) {
+                out[mid] = h.latestPositionWorld
+            }
+        }
+        return out
+    }
+
     /// True only when `YS-71` confirms the loop is closed AND Marker 0's closing hold is locked
     /// after Markers 1–3 (or End Early) and after any `"Fix now"` (`YS-72`, `YS-74`).
     public func isFinishAvailable(unifiedLoopClosed: Bool) -> Bool {
@@ -771,7 +786,12 @@ public struct GuidedCaptureEngine: Sendable {
 
     /// Require a fresh closing hold at Marker 0 after any `"Fix now"` action from Walk Review (`YS-72`, `YS-74`).
     /// If `targetMarkerID` is in `1...3`, also unlocks that marker first so the operator re-locks it before returning to Marker 0.
-    public mutating func beginFixNowRequiringReturnToMarker0(targetMarkerID: Int? = nil, at timestampS: Double) {
+    /// If `reopenLookUp` is true (`"Do It Now"` for a skipped look-up step), re-enters `.houseWallLookUp` and then requires a return hold at Marker 0.
+    public mutating func beginFixNowRequiringReturnToMarker0(
+        targetMarkerID: Int? = nil,
+        reopenLookUp: Bool = false,
+        at timestampS: Double
+    ) {
         fixNowRequiresReturnToMarker0 = true
         isClosingMarker0Locked = false
         closingMarker0Hold = MarkerHoldProgress(markerID: 0, isClosingHold: true)
@@ -786,6 +806,16 @@ public struct GuidedCaptureEngine: Sendable {
                 at: timestampS,
                 forceImmediate: true
             )
+        } else if reopenLookUp {
+            lookUpTracker = HouseWallLookUpTracker()
+            phase = .houseWallLookUp
+            commitInstruction(
+                key: "lookup_step",
+                text: "Look up at the roof edge and the trees",
+                isCorrection: false,
+                at: timestampS,
+                forceImmediate: true
+            )
         } else {
             phase = .closingMarker0
             commitInstruction(
@@ -796,6 +826,68 @@ public struct GuidedCaptureEngine: Sendable {
                 forceImmediate: true
             )
         }
+    }
+
+    /// Record an app interruption (`YS-80` correction #2: `"Walk interrupted. Saved up to this point."`, never `"Walk paused"`).
+    public mutating func markWalkInterrupted(at timestampS: Double) {
+        commitInstruction(
+            key: "walk_interrupted",
+            text: "Walk interrupted. Saved up to this point.",
+            isCorrection: false,
+            at: timestampS,
+            forceImmediate: true
+        )
+    }
+
+    /// Evaluate the live Walk Review sheet (`YS-72`, `YS-80` #1, `DESIGN-SPEC-NATIVE.md` §3e, §4e).
+    public func evaluateWalkReview(
+        unifiedLoopClosed: Bool,
+        coveredGroundCellCount: Int = 60,
+        minExpectedCoverageCells: Int = 36,
+        coveredGroundCells: Set<GroundGridCell> = [],
+        missingCoverageNearMarkerID: Int? = nil,
+        sizeMismatchMarkerID: Int? = nil,
+        didGetDark: Bool = false
+    ) -> WalkReviewReport {
+        let resolvedMissingNearMarkerID: Int? = {
+            if let explicit = missingCoverageNearMarkerID {
+                return explicit
+            }
+            guard coveredGroundCellCount < minExpectedCoverageCells,
+                  !coveredGroundCells.isEmpty
+            else {
+                return nil
+            }
+            var refGrid = GroundCoverageGrid(cellSizeM: 0.25)
+            if let m0Pos = knownMarkerPositionsWorld[0] {
+                refGrid.anchorMarker0Frame(originWorld: m0Pos, xAxisWorld: SIMD3<Double>(1.0, 0.0, 0.0))
+            }
+            for mid in 1...3 {
+                guard let posW = knownMarkerPositionsWorld[mid] else { continue }
+                let mCell = refGrid.cell(forWorldPoint: posW)
+                let nearbyCount = coveredGroundCells.filter {
+                    abs($0.ix - mCell.ix) <= 4 && abs($0.iz - mCell.iz) <= 4
+                }.count
+                if nearbyCount < 4 {
+                    return mid
+                }
+            }
+            return nil
+        }()
+        return WalkReviewEvaluator.evaluate(
+            lockedMarkerIDs: lockedMarkerIDs,
+            isClosingMarker0Locked: isClosingMarker0Locked,
+            unifiedLoopClosed: unifiedLoopClosed,
+            fixNowRequiresReturnToMarker0: fixNowRequiresReturnToMarker0,
+            endEarlyChosen: endEarlyChosen,
+            lookUpDone: lookUpTracker.isDone,
+            lookUpSkipped: lookUpTracker.isSkipped,
+            coveredGroundCellCount: coveredGroundCellCount,
+            minExpectedCoverageCells: minExpectedCoverageCells,
+            missingCoverageNearMarkerID: resolvedMissingNearMarkerID,
+            sizeMismatchMarkerID: sizeMismatchMarkerID,
+            didGetDark: didGetDark
+        )
     }
 
     public mutating func skipLookUpStep(at timestampS: Double) {
@@ -1979,5 +2071,508 @@ public struct PreWalkTapeCheckEntry: Sendable, Equatable {
             "measured_m": measuredM,
             "residual_m": residualM,
         ]
+    }
+}
+
+// MARK: - YS-72 & YS-80: Live Walk Review & Plain-Language Capture Detail
+
+/// Action triggered by a verb button on the live `Review Walk` sheet (`YS-72`, `DESIGN-SPEC-NATIVE.md` §3e, §4e).
+public enum WalkReviewAction: Sendable, Equatable {
+    case returnToMarker0
+    case captureMissingMarker(Int)
+    case performLookUp
+    case fillCoverageGap(nearMarkerID: Int?)
+    case checkMarkerPrintSize(Int)
+}
+
+/// Single review row on the live `Review Walk` sheet (`<= 3` shown, worst first, `YS-72`, `DESIGN-SPEC-NATIVE.md` §4e).
+public struct WalkReviewItem: Sendable, Equatable, Identifiable {
+    public let id: String
+    public let symbolName: String
+    public let isWarning: Bool
+    public let sentence: String
+    public let buttonTitle: String?
+    public let action: WalkReviewAction?
+    /// State word appended on the trailing side when `Differentiate Without Color` is active (`YS-81`, `DESIGN-SPEC-NATIVE.md` §6).
+    public var differentiateWithoutColorBadge: String {
+        isWarning ? "Fix" : "Check"
+    }
+
+    public init(
+        id: String,
+        symbolName: String,
+        isWarning: Bool,
+        sentence: String,
+        buttonTitle: String?,
+        action: WalkReviewAction?
+    ) {
+        self.id = id
+        self.symbolName = symbolName
+        self.isWarning = isWarning
+        self.sentence = sentence
+        self.buttonTitle = buttonTitle
+        self.action = action
+    }
+}
+
+/// Overall verdict state for the live `Review Walk` sheet (`DESIGN-SPEC-NATIVE.md` §4e).
+public enum WalkReviewVerdictKind: String, Sendable, Equatable {
+    case looksGood = "looks_good"
+    case almostThere = "almost_there"
+    case probablyWontBeAccepted = "probably_wont_be_accepted"
+}
+
+/// Complete report for the live `Review Walk` sheet (`YS-72`, `YS-80`, `YS-81`).
+public struct WalkReviewReport: Sendable, Equatable {
+    public let verdictKind: WalkReviewVerdictKind
+    public let headline: String
+    public let subheadline: String
+    public let symbolName: String
+    /// At most 3 items, ordered worst first (`YS-72`, `DESIGN-SPEC-NATIVE.md` §4e).
+    public let items: [WalkReviewItem]
+    /// True when saving requires the `"Save anyway? This walk probably won't be accepted."` confirmation dialog (`DESIGN-SPEC-NATIVE.md` §3e).
+    public let requiresSaveAnywayConfirmation: Bool
+    /// VoiceOver summary label for the top-down yard map (`YS-81`, `DESIGN-SPEC-NATIVE.md` §6).
+    public let mapAccessibilitySummary: String
+}
+
+/// Pure, deterministic evaluator for the live `Review Walk` sheet (`YS-72`, `YS-80` correction #1).
+public enum WalkReviewEvaluator {
+    public static let maxDisplayedItems: Int = 3
+
+    public static func evaluate(
+        lockedMarkerIDs: Set<Int>,
+        isClosingMarker0Locked: Bool,
+        unifiedLoopClosed: Bool,
+        fixNowRequiresReturnToMarker0: Bool,
+        endEarlyChosen: Bool,
+        lookUpDone: Bool,
+        lookUpSkipped: Bool,
+        coveredGroundCellCount: Int,
+        minExpectedCoverageCells: Int = 36,
+        missingCoverageNearMarkerID: Int? = nil,
+        sizeMismatchMarkerID: Int? = nil,
+        didGetDark: Bool = false
+    ) -> WalkReviewReport {
+        var candidates: [WalkReviewItem] = []
+
+        // 1. Not back at marker 0 (highest severity)
+        let loopComplete = unifiedLoopClosed && isClosingMarker0Locked && !fixNowRequiresReturnToMarker0 && lockedMarkerIDs.contains(0)
+        if !loopComplete {
+            candidates.append(
+                WalkReviewItem(
+                    id: "not_back_at_marker_0",
+                    symbolName: "exclamationmark.triangle.fill",
+                    isWarning: true,
+                    sentence: "You didn't finish at marker 0.",
+                    buttonTitle: "Head Back",
+                    action: .returnToMarker0
+                )
+            )
+        }
+
+        // 2. Marker n missing (`1...3`)
+        for mid in 1...3 where !lockedMarkerIDs.contains(mid) {
+            candidates.append(
+                WalkReviewItem(
+                    id: "missing_marker_\(mid)",
+                    symbolName: "exclamationmark.triangle.fill",
+                    isWarning: true,
+                    sentence: "Marker \(mid) wasn't captured.",
+                    buttonTitle: "Capture It",
+                    action: .captureMissingMarker(mid)
+                )
+            )
+        }
+
+        // 3. Look-up skipped or incomplete
+        if lookUpSkipped || !lookUpDone {
+            candidates.append(
+                WalkReviewItem(
+                    id: "lookup_skipped",
+                    symbolName: "info.circle.fill",
+                    isWarning: false,
+                    sentence: "You didn't look up at the roof and trees.",
+                    buttonTitle: "Do It Now",
+                    action: .performLookUp
+                )
+            )
+        }
+
+        // 4. Coverage hole (`YS-80` correction #1: knows ONLY markers and coverage — "near marker N" or "in the middle of the yard", NEVER "by the shed")
+        let hasCoverageGap = (coveredGroundCellCount < minExpectedCoverageCells) || (missingCoverageNearMarkerID != nil)
+        if hasCoverageGap {
+            let gapSentence: String
+            if let nearID = missingCoverageNearMarkerID {
+                gapSentence = "Some ground near marker \(nearID) was missed."
+            } else {
+                gapSentence = "Some ground in the middle of the yard was missed."
+            }
+            candidates.append(
+                WalkReviewItem(
+                    id: "coverage_hole",
+                    symbolName: "info.circle.fill",
+                    isWarning: false,
+                    sentence: gapSentence,
+                    buttonTitle: "Show Me",
+                    action: .fillCoverageGap(nearMarkerID: missingCoverageNearMarkerID)
+                )
+            )
+        }
+
+        // 5. Marker size off (`> 3%` after 3 sightings)
+        if let mismatchID = sizeMismatchMarkerID {
+            candidates.append(
+                WalkReviewItem(
+                    id: "marker_size_off_\(mismatchID)",
+                    symbolName: "info.circle.fill",
+                    isWarning: false,
+                    sentence: "Marker \(mismatchID) looks smaller than printed. Measure its black square?",
+                    buttonTitle: "Measure",
+                    action: .checkMarkerPrintSize(mismatchID)
+                )
+            )
+        }
+
+        // 6. Dark
+        if didGetDark {
+            candidates.append(
+                WalkReviewItem(
+                    id: "dark",
+                    symbolName: "moon.fill",
+                    isWarning: false,
+                    sentence: "It got dark. Some photos may be soft.",
+                    buttonTitle: nil,
+                    action: nil
+                )
+            )
+        }
+
+        // 7. Ended early
+        if endEarlyChosen {
+            candidates.append(
+                WalkReviewItem(
+                    id: "ended_early",
+                    symbolName: "info.circle.fill",
+                    isWarning: false,
+                    sentence: "You ended this walk early.",
+                    buttonTitle: nil,
+                    action: nil
+                )
+            )
+        }
+
+        let topItems = Array(candidates.prefix(Self.maxDisplayedItems))
+        let verdictKind: WalkReviewVerdictKind
+        let headline: String
+        let subheadline: String
+        let symbolName: String
+
+        if !loopComplete {
+            verdictKind = .probablyWontBeAccepted
+            headline = "This walk probably won't be accepted"
+            subheadline = topItems.count <= 1 ? "Fix one thing, then save." : "Return to marker 0 before saving."
+            symbolName = "xmark.octagon.fill"
+        } else if !topItems.isEmpty {
+            verdictKind = .almostThere
+            headline = "Almost there"
+            subheadline = topItems.count == 1 ? "Fix one thing, then save." : "Fix these items, then save."
+            symbolName = "exclamationmark.triangle.fill"
+        } else {
+            verdictKind = .looksGood
+            headline = "Looks good"
+            subheadline = "Ready to save your walk."
+            symbolName = "checkmark.seal.fill"
+        }
+
+        let capturedCount = [0, 1, 2, 3].filter { lockedMarkerIDs.contains($0) }.count
+        let markersSummary = capturedCount == 4
+            ? "All four markers captured."
+            : "\(capturedCount) of 4 markers captured."
+        let gapSummary: String
+        if let nearID = missingCoverageNearMarkerID {
+            gapSummary = " One gap near marker \(nearID)."
+        } else if hasCoverageGap {
+            gapSummary = " One gap in the middle of the yard."
+        } else {
+            gapSummary = " Ground coverage complete."
+        }
+
+        return WalkReviewReport(
+            verdictKind: verdictKind,
+            headline: headline,
+            subheadline: subheadline,
+            symbolName: symbolName,
+            items: topItems,
+            requiresSaveAnywayConfirmation: !loopComplete,
+            mapAccessibilitySummary: "Map of your walk. \(markersSummary)\(gapSummary)"
+        )
+    }
+}
+
+/// Plain-language post-save **Capture detail** model (`YS-80`, `DESIGN-SPEC-NATIVE.md` §3f, §4b).
+/// Replaces raw technical strings (`"Provisional Grade: C"`, `"Marker 0 Loop-Closure Gap"`, etc.) on the primary screen
+/// while keeping technical details inside the `DETAILS` disclosure group.
+public struct CaptureDetailSummary: Sendable, Equatable {
+    public let verdictTitle: String
+    public let verdictSymbol: String
+    public let isVerdictPassing: Bool
+    public let accuracySentence: String
+    public let markersValue: String
+    public let markersPassed: Bool
+    public let backAtStartValue: String
+    public let backAtStartPassed: Bool
+    public let lookedUpValue: String
+    public let lookedUpPassed: Bool
+    public let tapeMeasurementValue: String
+    public let tapeMeasurementPassed: Bool
+    public let gradeLetter: String
+
+    public static func build(
+        provisionalGrade: String,
+        status: String,
+        distanceTolerance10mM: Double,
+        lockedMarkerIDs: Set<Int>,
+        isLoopClosed: Bool,
+        isLookUpDone: Bool,
+        wasLookUpSkipped: Bool,
+        primaryTapeMeters: Double?
+    ) -> CaptureDetailSummary {
+        let verTitle: String
+        let verSymbol: String
+        let verPassing: Bool
+        if status == "interrupted" || status == "failed" || provisionalGrade == "fail" {
+            verTitle = "Needs another walk"
+            verSymbol = "xmark.octagon.fill"
+            verPassing = false
+        } else if provisionalGrade == "A" || provisionalGrade == "B" {
+            verTitle = "Ready to share"
+            verSymbol = "checkmark.seal.fill"
+            verPassing = true
+        } else {
+            verTitle = "Usable, with limits"
+            verSymbol = "exclamationmark.triangle.fill"
+            verPassing = false
+        }
+
+        let tolCM = max(1, Int((distanceTolerance10mM * 100.0).rounded()))
+        let accSentence = "Accurate to about \(tolCM) cm."
+
+        let locked4Count = [0, 1, 2, 3].filter { lockedMarkerIDs.contains($0) }.count
+        let mVal = locked4Count == 4 ? "All 4 ✓" : "\(locked4Count) of 4 ⚠︎"
+        let backVal = isLoopClosed ? "Yes ✓" : "No ⚠︎"
+        let lookVal: String
+        let lookPass: Bool
+        if isLookUpDone && !wasLookUpSkipped {
+            lookVal = "Yes ✓"
+            lookPass = true
+        } else {
+            lookVal = "Skipped ⚠︎"
+            lookPass = false
+        }
+
+        let tapeVal: String
+        let tapePass: Bool
+        if let tm = primaryTapeMeters, tm > 0 {
+            tapeVal = String(format: "%.2f m · ✓", tm)
+            tapePass = true
+        } else {
+            tapeVal = "Not added"
+            tapePass = false
+        }
+
+        return CaptureDetailSummary(
+            verdictTitle: verTitle,
+            verdictSymbol: verSymbol,
+            isVerdictPassing: verPassing,
+            accuracySentence: accSentence,
+            markersValue: mVal,
+            markersPassed: locked4Count == 4,
+            backAtStartValue: backVal,
+            backAtStartPassed: isLoopClosed,
+            lookedUpValue: lookVal,
+            lookedUpPassed: lookPass,
+            tapeMeasurementValue: tapeVal,
+            tapeMeasurementPassed: tapePass,
+            gradeLetter: provisionalGrade
+        )
+    }
+}
+
+// MARK: - YS-81: Accessibility & Outdoor Contrast Helpers
+
+/// Formats VoiceOver labels and Dynamic Type strings for the marker progress capsule (`YS-81`, `DESIGN-SPEC-NATIVE.md` §6).
+public enum MarkerProgressAccessibility {
+    /// VoiceOver value string (`DESIGN-SPEC-NATIVE.md` §6 line 552: `"0 and 2 done. 1 and 3 to go."`).
+    public static func voiceOverValue(lockedMarkerIDs: Set<Int>, isFinishAvailable: Bool) -> String {
+        if isFinishAvailable {
+            return "All 4 markers done, back at the start."
+        }
+        let allIDs = [0, 1, 2, 3]
+        let done = allIDs.filter { lockedMarkerIDs.contains($0) }
+        let remaining = allIDs.filter { !lockedMarkerIDs.contains($0) }
+
+        func joinDigits(_ ids: [Int]) -> String {
+            switch ids.count {
+            case 0: return "None"
+            case 1: return "\(ids[0])"
+            case 2: return "\(ids[0]) and \(ids[1])"
+            default:
+                let head = ids.dropLast().map(String.init).joined(separator: ", ")
+                return "\(head) and \(ids.last!)"
+            }
+        }
+
+        if done.isEmpty {
+            return "None done. 0, 1, 2 and 3 to go."
+        }
+        if remaining.isEmpty {
+            return "0, 1, 2 and 3 done. Head back to marker 0."
+        }
+        return "\(joinDigits(done)) done. \(joinDigits(remaining)) to go."
+    }
+
+    /// Compact text shown inside the marker capsule at accessibility Dynamic Type sizes (`isAccessibilitySize == true`, `DESIGN-SPEC-NATIVE.md` §6 line 540).
+    public static func accessibilitySizeText(lockedMarkerIDs: Set<Int>, isFinishAvailable: Bool) -> String {
+        if isFinishAvailable {
+            return "All markers"
+        }
+        let count = [0, 1, 2, 3].filter { lockedMarkerIDs.contains($0) }.count
+        return "\(count) of 4 markers"
+    }
+}
+
+/// Computes WCAG 2.1 relative luminance and outdoor contrast ratios for the capture HUD (`YS-81`, `DESIGN-SPEC-NATIVE.md` §3d, §6).
+public enum OutdoorContrastAuditor {
+    /// Convert an sRGB channel (`0.0 ... 1.0`) to linear light.
+    public static func linearChannel(_ srgb: Double) -> Double {
+        let c = min(1.0, max(0.0, srgb))
+        return c <= 0.04045 ? (c / 12.92) : pow((c + 0.055) / 1.055, 2.4)
+    }
+
+    /// WCAG 2.1 relative luminance `L = 0.2126 R + 0.7152 G + 0.0722 B`.
+    public static func relativeLuminance(r: Double, g: Double, b: Double) -> Double {
+        0.2126 * linearChannel(r) + 0.7152 * linearChannel(g) + 0.0722 * linearChannel(b)
+    }
+
+    /// WCAG 2.1 contrast ratio `(L_lighter + 0.05) / (L_darker + 0.05)`.
+    public static func contrastRatio(
+        foregroundRGB: SIMD3<Double>,
+        backgroundRGB: SIMD3<Double>
+    ) -> Double {
+        let l1 = relativeLuminance(r: foregroundRGB.x, g: foregroundRGB.y, b: foregroundRGB.z)
+        let l2 = relativeLuminance(r: backgroundRGB.x, g: backgroundRGB.y, b: backgroundRGB.z)
+        let lighter = max(l1, l2)
+        let darker = min(l1, l2)
+        return (lighter + 0.05) / (darker + 0.05)
+    }
+
+    /// Composite a regular glass + dark dimming layer (`dimOpacity`, default `0.35` in standard contrast and `0.55` in Increase Contrast)
+    /// over a live camera backdrop (`backdropRGB`) and return the resulting effective RGB background.
+    ///
+    /// Regular Liquid Glass (`DESIGN-SPEC-NATIVE.md` P3, §3d) attenuates background luminance by ~35% before the 35% dark dimming layer.
+    public static func effectiveGlassBackgroundRGB(
+        backdropRGB: SIMD3<Double>,
+        regularGlassAttenuation: Double = 0.35,
+        dimmingOpacity: Double = 0.35
+    ) -> SIMD3<Double> {
+        let afterGlass = backdropRGB * (1.0 - regularGlassAttenuation)
+        return afterGlass * (1.0 - dimmingOpacity)
+    }
+
+    /// Verify contrast ratios for white `.primary` text (`>= 4.5:1`) and filled glyphs (`>= 3.0:1`) across bright midday sky, sunlit grass, and shade (`YS-81`).
+    public static func auditCaptureHUDContrast(increasedContrast: Bool = false) -> (
+        brightSkyTextRatio: Double,
+        sunlitGrassTextRatio: Double,
+        shadeTextRatio: Double,
+        passesWCAGAA: Bool
+    ) {
+        let white = SIMD3<Double>(1.0, 1.0, 1.0)
+        let dim = increasedContrast ? 0.55 : 0.35
+        let skyBg = effectiveGlassBackgroundRGB(backdropRGB: SIMD3<Double>(1.0, 1.0, 1.0), dimmingOpacity: dim)
+        let grassBg = effectiveGlassBackgroundRGB(backdropRGB: SIMD3<Double>(0.55, 0.76, 0.29), dimmingOpacity: dim)
+        let shadeBg = effectiveGlassBackgroundRGB(backdropRGB: SIMD3<Double>(0.10, 0.12, 0.10), dimmingOpacity: dim)
+
+        let skyRatio = contrastRatio(foregroundRGB: white, backgroundRGB: skyBg)
+        let grassRatio = contrastRatio(foregroundRGB: white, backgroundRGB: grassBg)
+        let shadeRatio = contrastRatio(foregroundRGB: white, backgroundRGB: shadeBg)
+        let passes = skyRatio >= 4.5 && grassRatio >= 4.5 && shadeRatio >= 4.5
+        return (skyRatio, grassRatio, shadeRatio, passes)
+    }
+}
+
+/// Screen-space projection for marker beacons (`DESIGN-SPEC-NATIVE.md` §3a ④: `0.40 m` above each seen marker)
+/// and off-screen edge arrows (`DESIGN-SPEC-NATIVE.md` §3a ⑤: chevron + digit pinned to nearest screen edge).
+public struct MarkerBeaconProjection: Sendable, Equatable, Identifiable {
+    public let markerID: Int
+    public let isDone: Bool
+    public let isOnScreen: Bool
+    /// Normalized portrait coordinates `(x, y)` in `[0.08, 0.92]`
+    public let normalizedPortraitXY: SIMD2<Double>
+    /// Edge arrow symbol when `isOnScreen == false` (`"chevron.left"`, `"chevron.right"`, `"chevron.up"`, `"chevron.down"`).
+    public let edgeChevronSymbol: String?
+
+    public var id: Int { markerID }
+}
+
+public enum MarkerScreenProjector {
+    public static let beaconHeightOffsetM: Double = 0.40
+
+    public static func project(
+        markerID: Int,
+        markerWorldPos: SIMD3<Double>,
+        isDone: Bool,
+        cameraToWorld: simd_double4x4,
+        fx: Double = 1440.0,
+        fy: Double = 1440.0,
+        cx: Double = 960.0,
+        cy: Double = 720.0,
+        rgbWidth: Double = 1920.0,
+        rgbHeight: Double = 1440.0
+    ) -> MarkerBeaconProjection {
+        let beaconWorld = SIMD4<Double>(
+            markerWorldPos.x,
+            markerWorldPos.y + beaconHeightOffsetM,
+            markerWorldPos.z,
+            1.0
+        )
+        let worldToCam = cameraToWorld.inverse
+        let pCam = worldToCam * beaconWorld
+        // ARKit camera coordinates: +X right (sensor), +Y up (sensor), -Z forward
+        let depthZ = -pCam.z
+        let safeW = max(1.0, rgbWidth)
+        let safeH = max(1.0, rgbHeight)
+
+        if depthZ > 0.20 {
+            let u = fx * (pCam.x / depthZ) + cx
+            let v = cy - fy * (pCam.y / depthZ)
+            // Rotate landscape-right sensor (u, v) 90° CW into portrait HUD (x, y)
+            let px = 1.0 - (v / safeH)
+            let py = u / safeW
+            if px >= 0.08 && px <= 0.92 && py >= 0.14 && py <= 0.84 {
+                return MarkerBeaconProjection(
+                    markerID: markerID,
+                    isDone: isDone,
+                    isOnScreen: true,
+                    normalizedPortraitXY: SIMD2<Double>(px, py),
+                    edgeChevronSymbol: nil
+                )
+            }
+        }
+
+        // Off-screen: pin to nearest horizontal screen edge in portrait HUD coordinates
+        // In portrait orientation, camera sensor +Y corresponds to portrait left (-X_portrait), -Y to portrait right (+X_portrait)
+        let horizOffset = -pCam.y
+        let isRightEdge = horizOffset >= 0
+        let edgeX = isRightEdge ? 0.92 : 0.08
+        let edgeY = 0.50
+        let chevron = isRightEdge ? "chevron.right" : "chevron.left"
+        return MarkerBeaconProjection(
+            markerID: markerID,
+            isDone: isDone,
+            isOnScreen: false,
+            normalizedPortraitXY: SIMD2<Double>(edgeX, edgeY),
+            edgeChevronSymbol: chevron
+        )
     }
 }

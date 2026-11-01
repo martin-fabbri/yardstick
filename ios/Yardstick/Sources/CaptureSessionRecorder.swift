@@ -516,6 +516,41 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     }
 }
 
+/// Summary record of a completed capture session displayed in the root `Captures` list (`YS-80`, `DESIGN-SPEC-NATIVE.md` §2a, §2c, §3f).
+public struct SavedCaptureRecord: Sendable, Identifiable, Equatable {
+    public let id: String
+    public var title: String
+    public let dateText: String
+    public let durationSeconds: Int
+    public let savedFrameCount: Int
+    public let coveredGroundCells: Set<GroundGridCell>
+    public let coveredGroundAreaM2: Double
+    public let detailSummary: CaptureDetailSummary
+    public let archiveZipURL: URL?
+
+    public init(
+        id: String,
+        title: String = "Back yard",
+        dateText: String,
+        durationSeconds: Int,
+        savedFrameCount: Int,
+        coveredGroundCells: Set<GroundGridCell>,
+        coveredGroundAreaM2: Double,
+        detailSummary: CaptureDetailSummary,
+        archiveZipURL: URL?
+    ) {
+        self.id = id
+        self.title = title
+        self.dateText = dateText
+        self.durationSeconds = durationSeconds
+        self.savedFrameCount = savedFrameCount
+        self.coveredGroundCells = coveredGroundCells
+        self.coveredGroundAreaM2 = coveredGroundAreaM2
+        self.detailSummary = detailSummary
+        self.archiveZipURL = archiveZipURL
+    }
+}
+
 /// Crash-safe, zero-`ARFrame`-retention LiDAR capture session recorder (`YS-00`–`YS-14`, `YS-21`, `YS-22`, `YS-30`–`YS-33`, `YS-40`–`YS-44`, `YS-68`, `YS-84`).
 @MainActor
 public final class CaptureSessionRecorder: NSObject, ObservableObject {
@@ -554,11 +589,19 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var latestTurnRateRadS: Double = 0.0
     @Published public private(set) var latestPredictedBlurPx: Double = 0.0
     @Published public private(set) var liveMarkerSizeWarning: String? = nil
+    @Published public private(set) var lastSizeMismatchMarkerID: Int? = nil
+    @Published public private(set) var beaconProjections: [MarkerBeaconProjection] = []
     @Published public private(set) var isLoopClosed: Bool = false
     @Published public private(set) var guidedWalkPhase: GuidedWalkPhase = .openingMarker0
     @Published public private(set) var activeRingState: MarkerRingVisualState? = nil
     @Published public private(set) var lockedMarkerIDs: Set<Int> = []
-    @Published public private(set) var isFinishAvailable: Bool = false
+    @Published public private(set) var isFinishAvailable: Bool = false {
+        didSet {
+            if !oldValue && isFinishAvailable {
+                UIAccessibility.post(notification: .announcement, argument: "Finish button available")
+            }
+        }
+    }
     @Published public private(set) var coveredGroundCellCount: Int = 0
     @Published public private(set) var coveredGroundAreaM2: Double = 0.0
     @Published public private(set) var coveredGroundCells: Set<GroundGridCell> = []
@@ -581,6 +624,23 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             }
         }
     }
+    /// Haptics toggle (`DESIGN-SPEC-NATIVE.md` §3g, §5: `"Make haptics optional"`).
+    @Published public var isHapticsEnabled: Bool = true
+    /// Developer live diagnostics overlay toggle (`YS-80`, `DESIGN-SPEC-NATIVE.md` §3c, §3g: off by default, never on the regular capture screen).
+    @Published public var showDeveloperDiagnosticsOverlay: Bool = false
+    /// Completed capture records shown in the root `Captures` list (`YS-80`, `DESIGN-SPEC-NATIVE.md` §2a, §2c).
+    @Published public var savedCaptureRecords: [SavedCaptureRecord] = []
+    /// Live Walk Review report (`YS-72`, `DESIGN-SPEC-NATIVE.md` §3e, §4e).
+    @Published public private(set) var latestWalkReviewReport: WalkReviewReport = WalkReviewEvaluator.evaluate(
+        lockedMarkerIDs: [],
+        isClosingMarker0Locked: false,
+        unifiedLoopClosed: false,
+        fixNowRequiresReturnToMarker0: false,
+        endEarlyChosen: false,
+        lookUpDone: false,
+        lookUpSkipped: false,
+        coveredGroundCellCount: 0
+    )
     /// Injectable VoiceOver status provider (`YS-75`: routes coach lines through VoiceOver announcements instead of a second voice).
     public var isVoiceOverRunningProvider: () -> Bool = { UIAccessibility.isVoiceOverRunning }
     @Published public private(set) var spokenCoachHistory: [VoiceCoachOutputRoute] = []
@@ -925,9 +985,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     }
 
     /// Dispatch a `GuidedHapticEvent` through native `UIKit` feedback generators while respecting
-    /// voice-note recording suppression (`YS-74`, `DESIGN-SPEC-NATIVE.md` §5).
+    /// voice-note recording suppression and the `isHapticsEnabled` setting (`YS-74`, `DESIGN-SPEC-NATIVE.md` §3g, §5).
     public func dispatchHapticIfNeeded(_ event: GuidedHapticEvent?) {
-        guard let event, !guidedEngine.isRecordingVoiceNote else { return }
+        guard let event, isHapticsEnabled, !guidedEngine.isRecordingVoiceNote else { return }
         latestHapticEvent = event
         hapticDispatchCount += 1
         dispatchedHaptics.append(event)
@@ -1072,6 +1132,8 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         latestTurnRateRadS = 0.0
         latestPredictedBlurPx = 0.0
         liveMarkerSizeWarning = nil
+        lastSizeMismatchMarkerID = nil
+        beaconProjections = []
         isLoopClosed = false
         guidedEngine = GuidedCaptureEngine(preWalkTapeMeters0To1: preWalkTapeMeters0To1)
         guidedEngine.isVoiceCoachEnabled = isVoiceCoachEnabled
@@ -1313,19 +1375,27 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
     }
 
-    /// Begin a `"Fix now"` action (`YS-71`, `YS-72`, `YS-74`), unlocking `targetMarkerID` (if in `1...3`),
-    /// clearing `loopClosedEventTimeS` in `PhoneLoopRuleState`, and requiring a fresh closing hold on Marker 0.
-    public func beginFixNow(targetMarkerID: Int? = nil) {
+    /// Begin a `"Fix now"` action (`YS-71`, `YS-72`, `YS-74`), unlocking `targetMarkerID` (if in `1...3`)
+    /// or re-opening the look-up step (`reopenLookUp == true`), clearing `loopClosedEventTimeS` in `PhoneLoopRuleState`,
+    /// and requiring a fresh closing hold on Marker 0.
+    public func beginFixNow(targetMarkerID: Int? = nil, reopenLookUp: Bool = false) {
         let t = latestTimestampS
         let sIdx = max(0, latestSavedIndex)
         phoneLoopState.clearLoopClosedForFixNow()
-        guidedEngine.beginFixNowRequiringReturnToMarker0(targetMarkerID: targetMarkerID, at: t)
+        guidedEngine.beginFixNowRequiringReturnToMarker0(
+            targetMarkerID: targetMarkerID,
+            reopenLookUp: reopenLookUp,
+            at: t
+        )
         let didSpeak = dispatchVoiceCoachIfNeeded(guidedEngine.lastSpokenPhraseThisStep)
         guidedWalkPhase = guidedEngine.phase
         lockedMarkerIDs = guidedEngine.lockedMarkerIDs
+        isLookUpDone = guidedEngine.lookUpTracker.isDone
+        lookUpProgressFraction = guidedEngine.lookUpTracker.progressFraction
         isLoopClosed = phoneLoopState.unifiedLoopClosed
         isFinishAvailable = guidedEngine.isFinishAvailable(unifiedLoopClosed: phoneLoopState.unifiedLoopClosed)
         statusBanner = guidedEngine.activeInstruction
+        _ = evaluateWalkReview()
 
         guard phase == .recording, let engine = writerEngine else { return }
         let phaseStr = guidedEngine.phase.rawValue
@@ -1513,8 +1583,99 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// Evaluate the live Walk Review sheet (`YS-72`, `YS-80` #1) without stopping or pausing recording.
+    @discardableResult
+    public func evaluateWalkReview() -> WalkReviewReport {
+        let sizeMismatchID: Int? = (liveMarkerSizeWarning != nil) ? (lastSizeMismatchMarkerID ?? 0) : nil
+        let didGetDark = latestExposureDurationS > 0.025 || latestISO > 800.0
+        let report = guidedEngine.evaluateWalkReview(
+            unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
+            coveredGroundCellCount: coveredGroundCellCount,
+            minExpectedCoverageCells: 36,
+            coveredGroundCells: coveredGroundCells,
+            missingCoverageNearMarkerID: nil,
+            sizeMismatchMarkerID: sizeMismatchID,
+            didGetDark: didGetDark
+        )
+        latestWalkReviewReport = report
+        return report
+    }
+
+    /// Execute a verb action from the live Walk Review sheet (`YS-72`, `DESIGN-SPEC-NATIVE.md` §3e, §4e),
+    /// returning to the same walk and requiring a fresh closing hold at Marker 0 before saving.
+    public func performWalkReviewAction(_ action: WalkReviewAction) {
+        switch action {
+        case .returnToMarker0, .fillCoverageGap:
+            beginFixNow(targetMarkerID: nil, reopenLookUp: false)
+        case .captureMissingMarker(let mid):
+            beginFixNow(targetMarkerID: mid, reopenLookUp: false)
+        case .performLookUp:
+            beginFixNow(targetMarkerID: nil, reopenLookUp: true)
+        case .checkMarkerPrintSize:
+            beginFixNow(targetMarkerID: lastSizeMismatchMarkerID ?? 0, reopenLookUp: false)
+        }
+    }
+
+    /// Plain-language Capture Detail summary for the current session (`YS-80`, `DESIGN-SPEC-NATIVE.md` §3f).
+    public var currentCaptureDetailSummary: CaptureDetailSummary {
+        let statusStr: String = {
+            if phase == .failed { return "failed" }
+            if provisionalReasons.contains(where: { $0.hasPrefix("recording_interrupted") }) { return "interrupted" }
+            return "stopped"
+        }()
+        let primaryTapeM: Double? = {
+            if let pre = preWalkTapeMeters0To1, pre > 0 { return pre }
+            for item in tapeChecks where (item["role"] as? String) == "primary" {
+                if let tm = item["tape_m"] as? Double { return tm }
+            }
+            return nil
+        }()
+        return CaptureDetailSummary.build(
+            provisionalGrade: provisionalGrade,
+            status: statusStr,
+            distanceTolerance10mM: provisionalDistanceTolerance10m,
+            lockedMarkerIDs: lockedMarkerIDs,
+            isLoopClosed: isLoopClosed,
+            isLookUpDone: isLookUpDone,
+            wasLookUpSkipped: guidedEngine.lookUpTracker.isSkipped,
+            primaryTapeMeters: primaryTapeM
+        )
+    }
+
+    private func appendCompletedCaptureRecord(status: String, zipURL: URL?) {
+        let t0 = t0MonotonicS ?? latestTimestampS
+        let durS = max(1, Int((max(t0, latestTimestampS) - t0).rounded()))
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "EEE, MMM d"
+        let mins = max(1, (durS + 30) / 60)
+        let dateLine = "\(dateFormatter.string(from: Date())) · \(mins) min"
+        let record = SavedCaptureRecord(
+            id: captureID.isEmpty ? UUID().uuidString : captureID,
+            title: "Back yard",
+            dateText: dateLine,
+            durationSeconds: durS,
+            savedFrameCount: savedFrameCount,
+            coveredGroundCells: coveredGroundCells,
+            coveredGroundAreaM2: coveredGroundAreaM2,
+            detailSummary: currentCaptureDetailSummary,
+            archiveZipURL: zipURL
+        )
+        savedCaptureRecords.insert(record, at: 0)
+    }
+
+    /// Reset recorder state back to `.setup` for starting a new walk from the root `Captures` screen (`YS-80`).
+    public func resetToSetupForNewCapture() {
+        phase = .setup
+        statusBanner = "Stand over marker 0 and point at it"
+        lowDiskSpaceWarning = nil
+        liveMarkerSizeWarning = nil
+        lastSizeMismatchMarkerID = nil
+        beaconProjections = []
+        _ = evaluatePreFlightChecklist()
+    }
+
     /// Handle backgrounding or session interruption by finishing streams, writing `status: "interrupted"`,
-    /// and sealing `manifest.json` + `.zip` inside a UIKit background task (`YS-08`, `YS-84`, Blocker 1).
+    /// and sealing `manifest.json` + `.zip` inside a UIKit background task (`YS-08`, `YS-80` #2, `YS-84`, Blocker 1).
     public func handleInterruption(stopReason: String) {
         guard phase == .recording, let dir = captureDirURL, let engine = writerEngine else { return }
         phase = .sealing
@@ -1527,9 +1688,11 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         #endif
         locationManager.stopUpdatingHeading()
         locationManager.stopUpdatingLocation()
+        guidedEngine.markWalkInterrupted(at: latestTimestampS)
         provisionalGrade = "fail"
         provisionalReasons = ["recording_interrupted: \(stopReason)"]
-        statusBanner = "Capture interrupted (\(stopReason)) — sealing partial recording…"
+        // YS-80 correction #2: an interruption reads "Walk interrupted. Saved up to this point.", never "Walk paused"
+        statusBanner = "Walk interrupted. Saved up to this point."
 
         beginSealingBackgroundTask(name: "YardstickSealInterrupted")
         let snapData = makeSessionJSONData(status: "interrupted", stopReason: stopReason, failedStream: nil)
@@ -1553,7 +1716,8 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                     self.sealingProgress = 1.0
                     self.archiveZipURL = zipURL
                     self.phase = .completed
-                    self.statusBanner = "Capture interrupted (\(stopReason)) — partial archive sealed"
+                    self.statusBanner = "Walk interrupted. Saved up to this point."
+                    self.appendCompletedCaptureRecord(status: "interrupted", zipURL: zipURL)
                     UIApplication.shared.isIdleTimerDisabled = false
                     self.endSealingBackgroundTask()
                 }
@@ -1571,7 +1735,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         phase = .sealing
         sealingProgress = 0.0
         sealingStatusText = "Saving your walk"
-        statusBanner = "Saving your walk — sealing manifest.json and building capture archive…"
+        statusBanner = "Saving your walk"
 
         #if canImport(ARKit)
         arSession.pause()
@@ -1604,7 +1768,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
                         self.sealingProgress = 1.0
                         self.archiveZipURL = zipURL
                         self.phase = .completed
-                        self.statusBanner = "Capture sealed — Grade \(self.provisionalGrade)"
+                        self.dispatchHapticIfNeeded(.markerLocked(markerID: 0))
+                        self.statusBanner = self.currentCaptureDetailSummary.verdictTitle
+                        self.appendCompletedCaptureRecord(status: "stopped", zipURL: zipURL)
                         UIApplication.shared.isIdleTimerDisabled = false
                         self.endSealingBackgroundTask()
                     }
@@ -2630,6 +2796,35 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
             self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
             self.thermalSchedule = stepOut.thermalSchedule
+            var newBeacons: [MarkerBeaconProjection] = []
+            for mid in self.guidedEngine.knownMarkerPositionsWorld.keys.sorted() {
+                guard self.activeRingState?.markerID != mid,
+                      let posW = self.guidedEngine.knownMarkerPositionsWorld[mid]
+                else { continue }
+                let isDone = self.guidedEngine.lockedMarkerIDs.contains(mid)
+                let proj = MarkerScreenProjector.project(
+                    markerID: mid,
+                    markerWorldPos: posW,
+                    isDone: isDone,
+                    cameraToWorld: cMat,
+                    fx: fx,
+                    fy: fy,
+                    cx: cx,
+                    cy: cy,
+                    rgbWidth: Double(deliveredW),
+                    rgbHeight: Double(deliveredH)
+                )
+                let isNextNeededTarget: Bool = {
+                    if self.guidedEngine.phase == .closingMarker0 && !self.guidedEngine.isClosingMarker0Locked {
+                        return mid == 0
+                    }
+                    return !isDone
+                }()
+                if proj.isOnScreen || isNextNeededTarget {
+                    newBeacons.append(proj)
+                }
+            }
+            self.beaconProjections = newBeacons
             self.dispatchHapticIfNeeded(stepOut.haptic)
             let didSpeakFrame = self.dispatchVoiceCoachIfNeeded(self.guidedEngine.lastSpokenPhraseThisStep)
             self.statusBanner = stepOut.instruction
@@ -3105,6 +3300,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                                 printedSizeMM: m.sizeMMPrinted
                                             )
                                             if sizeCheck.flagged, let medMM = sizeCheck.medianMM {
+                                                self.lastSizeMismatchMarkerID = m.markerID
                                                 self.liveMarkerSizeWarning = String(
                                                     format: "Marker %d size %.1f mm differs from %.0f mm setting (> 3%%)",
                                                     m.markerID, medMM, m.sizeMMPrinted
