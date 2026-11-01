@@ -731,11 +731,23 @@ public struct GuidedCaptureEngine: Sendable {
     }
 
     public mutating func setRecordingVoiceNote(_ active: Bool, at timestampS: Double) {
+        let wasActive = isRecordingVoiceNote
         isRecordingVoiceNote = active
         if active {
             commitInstruction(
                 key: "note_recording",
                 text: "Listening… tap to stop",
+                isCorrection: false,
+                at: timestampS,
+                forceImmediate: true
+            )
+        } else if wasActive {
+            justLockedKey = "note_added"
+            justLockedText = "Note added"
+            justLockedBannerUntilS = timestampS + Self.minInstructionDwellS
+            commitInstruction(
+                key: "note_added",
+                text: "Note added",
                 isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
@@ -1344,6 +1356,19 @@ public struct GuidedCaptureEngine: Sendable {
 
 // MARK: - YS-75: Fixed Voice Coach Phrase Catalog
 
+/// Route through which a `YS-75` voice coach line is delivered (`DESIGN-SPEC-NATIVE.md` §4c).
+public enum VoiceCoachOutputRoute: Sendable, Equatable {
+    case speechSynthesizer(String)
+    case voiceOverAnnouncement(String)
+
+    public var phrase: String {
+        switch self {
+        case .speechSynthesizer(let p), .voiceOverAnnouncement(let p):
+            return p
+        }
+    }
+}
+
 /// Maps deterministic `GuidedCaptureEngine` instruction keys to the exact fixed spoken phrases
 /// from `DESIGN-SPEC-NATIVE.md` §4c (`YS-75`).
 ///
@@ -1352,6 +1377,23 @@ public struct GuidedCaptureEngine: Sendable {
 /// - The voice says `"marker zero"`, `"marker one"`, `"marker two"`, `"marker three"`, while the glass shows `"marker 0"`.
 /// - Silent while a voice note is recording (`note_recording`, `note_added`).
 public enum GuidedVoiceCatalog: Sendable {
+    /// Resolve the output route (`AVSpeechSynthesizer` vs `VoiceOver` announcement) for a spoken coach phrase (`YS-75`).
+    public static func resolveOutputRoute(
+        phrase: String?,
+        isVoiceCoachEnabled: Bool,
+        isRecordingVoiceNote: Bool,
+        isVoiceOverRunning: Bool
+    ) -> VoiceCoachOutputRoute? {
+        guard let phrase,
+              !phrase.isEmpty,
+              isVoiceCoachEnabled,
+              !isRecordingVoiceNote
+        else {
+            return nil
+        }
+        return isVoiceOverRunning ? .voiceOverAnnouncement(phrase) : .speechSynthesizer(phrase)
+    }
+
     public static func markerNumberWord(_ id: Int) -> String {
         switch id {
         case 0: return "zero"

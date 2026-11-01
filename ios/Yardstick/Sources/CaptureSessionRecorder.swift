@@ -516,19 +516,6 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     }
 }
 
-/// Route through which a `YS-75` voice coach line was delivered.
-public enum VoiceCoachOutputRoute: Sendable, Equatable {
-    case speechSynthesizer(String)
-    case voiceOverAnnouncement(String)
-
-    public var phrase: String {
-        switch self {
-        case .speechSynthesizer(let p), .voiceOverAnnouncement(let p):
-            return p
-        }
-    }
-}
-
 /// Crash-safe, zero-`ARFrame`-retention LiDAR capture session recorder (`YS-00`–`YS-14`, `YS-21`, `YS-22`, `YS-30`–`YS-33`, `YS-40`–`YS-44`, `YS-68`, `YS-84`).
 @MainActor
 public final class CaptureSessionRecorder: NSObject, ObservableObject {
@@ -742,6 +729,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var pendingTapeBSavedIndex: Int = 0
     private var pendingTapeBTimeS: Double = 0.0
     private var provisionalDistanceTolerance10m: Double = 0.05
+    private var lastPreFlightProbeTimeS: Double = -10.0
     private var activeBackgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     private func beginSealingBackgroundTask(name: String) {
@@ -796,25 +784,26 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     /// routing through VoiceOver announcements when VoiceOver is running, and staying silent while a voice note records.
     @discardableResult
     public func dispatchVoiceCoachIfNeeded(_ spokenPhrase: String?) -> Bool {
-        guard let phrase = spokenPhrase,
-              !phrase.isEmpty,
-              isVoiceCoachEnabled,
-              !guidedEngine.isRecordingVoiceNote
-        else {
+        guard let route = GuidedVoiceCatalog.resolveOutputRoute(
+            phrase: spokenPhrase,
+            isVoiceCoachEnabled: isVoiceCoachEnabled,
+            isRecordingVoiceNote: guidedEngine.isRecordingVoiceNote,
+            isVoiceOverRunning: isVoiceOverRunningProvider()
+        ) else {
             return false
         }
-        if isVoiceOverRunningProvider() {
-            spokenCoachHistory.append(.voiceOverAnnouncement(phrase))
+        spokenCoachHistory.append(route)
+        switch route {
+        case .voiceOverAnnouncement(let phrase):
             UIAccessibility.post(notification: .announcement, argument: phrase)
-            return true
+        case .speechSynthesizer(let phrase):
+            let utterance = AVSpeechUtterance(string: phrase)
+            utterance.prefersAssistiveTechnologySettings = true
+            if speechSynthesizer.isSpeaking {
+                speechSynthesizer.stopSpeaking(at: .immediate)
+            }
+            speechSynthesizer.speak(utterance)
         }
-        spokenCoachHistory.append(.speechSynthesizer(phrase))
-        let utterance = AVSpeechUtterance(string: phrase)
-        utterance.prefersAssistiveTechnologySettings = true
-        if speechSynthesizer.isSpeaking {
-            speechSynthesizer.stopSpeaking(at: .immediate)
-        }
-        speechSynthesizer.speak(utterance)
         return true
     }
 
@@ -836,7 +825,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         let therm = overrideThermalLevel ?? injectedThermalLevelForTesting ?? CaptureThermalLevel.fromSystem(ProcessInfo.processInfo.thermalState)
         let expS = overrideExposureDurationS ?? (latestExposureDurationS > 0 ? latestExposureDurationS : 0.004)
         let isoV = overrideISO ?? (latestISO > 0 ? latestISO : 100.0)
-        let locAuth = overrideLocationAuthorized ?? (locationAuthStatus == "authorizedWhenInUse" || locationAuthStatus == "authorizedAlways")
+        let locAuth = overrideLocationAuthorized
+            ?? (locationAuthStatus == "ok" || locationAuthStatus == "accuracy_exceeded"
+                || locationAuthStatus == "authorizedWhenInUse" || locationAuthStatus == "authorizedAlways")
         let lensProbe = overrideLensProbe ?? latestLensSmudgeProbe
         let printedMM = markerSizesMM[0] ?? 180.0
 
@@ -854,6 +845,27 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         )
         preFlightReport = report
         return report
+    }
+
+    /// Clear any previous lens smudge warning (`YS-76`) and force an immediate fresh pre-flight probe (`Check Again`).
+    @discardableResult
+    public func resetLensSmudgeProbeAndCheckAgain() -> PreFlightChecklistReport {
+        latestLensSmudgeProbe = nil
+        lastPreFlightProbeTimeS = -10.0
+        return evaluatePreFlightChecklist()
+    }
+
+    /// Start a lightweight pre-flight camera probe on the setup screen (`YS-76`) if camera access is already authorized,
+    /// without prompting prematurely before `Start Walk`.
+    public func startPreFlightCameraProbeIfAuthorized() {
+        #if canImport(ARKit) && !targetEnvironment(simulator)
+        guard phase == .setup, Self.isLiDARSupported else { return }
+        if AVCaptureDevice.authorizationStatus(for: .video) == .authorized {
+            let config = ARWorldTrackingConfiguration()
+            config.worldAlignment = .gravity
+            arSession.run(config, options: [])
+        }
+        #endif
     }
 
     /// Update the live lens smudge probe (`YS-76`) from a camera luma frame.
@@ -1194,12 +1206,57 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         if active && speechSynthesizer.isSpeaking {
             speechSynthesizer.stopSpeaking(at: .immediate)
         }
+        if active && !guidedEngine.isRecordingVoiceNote {
+            dispatchHapticIfNeeded(.sessionStart)
+        }
         let t = latestTimestampS
+        let sIdx = max(0, latestSavedIndex)
         guidedEngine.setRecordingVoiceNote(active, at: t)
         isRecordingVoiceNote = guidedEngine.isRecordingVoiceNote
         statusBanner = guidedEngine.activeInstruction
+        if !active {
+            dispatchHapticIfNeeded(.sessionStop)
+        }
         if active {
             logEvent(kind: "note", detail: "Spoken note anchor")
+        }
+        guard phase == .recording, let engine = writerEngine else { return }
+        let evName = active ? "note_started" : "note_stopped"
+        let phaseStr = guidedEngine.phase.rawValue
+        let instr = guidedEngine.activeInstruction
+        let pDeg = pitchDeg
+        let rDeg = rollDeg
+        let trk = trackingStateText
+        let expS = latestExposureDurationS
+        let isoV = latestISO
+        let trS = latestTurnRateRadS
+        let blurP = latestPredictedBlurPx
+        let thermS = thermalSchedule.thermalLevel.rawValue
+        let covC = coveredGroundCellCount
+        writerQueue.async { [weak self] in
+            do {
+                try engine.appendMonotonicGuidanceRow(
+                    timestampS: t,
+                    savedIndex: sIdx,
+                    event: evName,
+                    phase: phaseStr,
+                    instruction: instr,
+                    spoken: false,
+                    pitchDeg: pDeg,
+                    rollDeg: rDeg,
+                    trackingState: trk,
+                    exposureDurationS: expS,
+                    iso: isoV,
+                    turnRateRadS: trS,
+                    predictedBlurPx: blurP,
+                    thermalState: thermS,
+                    coverageCells: covC
+                )
+            } catch {
+                Task { @MainActor in
+                    self?.handleStreamFailure(stream: "guidance", message: error.localizedDescription)
+                }
+            }
         }
     }
 
@@ -2428,7 +2485,57 @@ extension CaptureSessionRecorder: ARSessionDelegate {
         let finalFrameValidDepthCount = frameValidDepthSampleCount
 
         Task { @MainActor [weak self] in
-            guard let self, self.phase == .recording, let dir = self.captureDirURL, let engine = self.writerEngine else { return }
+            guard let self else { return }
+            if self.phase == .setup {
+                if timestampS - self.lastPreFlightProbeTimeS >= 0.50 {
+                    let prevT = self.lastDeliveredFrameTimestampS
+                    let prevTransform = (prevT != nil) ? self.latestCameraTransform : nil
+                    let dt = prevT.map { max(1e-4, timestampS - $0) } ?? (1.0 / 30.0)
+                    self.lastDeliveredFrameTimestampS = timestampS
+                    self.lastPreFlightProbeTimeS = timestampS
+                    self.latestCameraTransform = cMat
+                    self.latestExposureDurationS = exposureDurationS
+                    self.latestISO = isoVal
+
+                    let fx = Double(intrinsics.columns.0.x)
+                    let fy = Double(intrinsics.columns.1.y)
+                    let meanFocalPx = 0.5 * (fx + fy)
+                    let turnRateRadS = ExposureAndStillnessGate.computeTurnRateRadS(
+                        previousTransform: prevTransform,
+                        currentTransform: cMat,
+                        dt: dt
+                    )
+                    let predictedBlurPx = ExposureAndStillnessGate.computePredictedBlurPx(
+                        focalLengthPx: meanFocalPx,
+                        turnRateRadS: turnRateRadS,
+                        exposureDurationS: exposureDurationS
+                    )
+                    let camVelMps: Double = {
+                        guard let prevM = prevTransform else { return 0.0 }
+                        let prevPos = SIMD3<Double>(prevM.columns.3.x, prevM.columns.3.y, prevM.columns.3.z)
+                        let curPos = SIMD3<Double>(cMat.columns.3.x, cMat.columns.3.y, cMat.columns.3.z)
+                        return simd_length(curPos - prevPos) / dt
+                    }()
+                    self.latestTurnRateRadS = turnRateRadS
+                    self.latestPredictedBlurPx = predictedBlurPx
+
+                    if let sendableRGB = copiedRGBBufferOpt,
+                       let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
+                        _ = self.updateLensSmudgeProbe(
+                            lumaBytes: luma,
+                            width: deliveredW,
+                            height: deliveredH,
+                            turnRateRadS: turnRateRadS,
+                            predictedBlurPx: predictedBlurPx,
+                            cameraVelocityMps: camVelMps
+                        )
+                    } else {
+                        _ = self.evaluatePreFlightChecklist()
+                    }
+                }
+                return
+            }
+            guard self.phase == .recording, let dir = self.captureDirURL, let engine = self.writerEngine else { return }
 
             // Record actual delivered buffer dimensions (`YS-03`, Blocker 5)
             self.actualWidth = deliveredW
@@ -3135,6 +3242,7 @@ extension CaptureSessionRecorder: CLLocationManagerDelegate {
             default:
                 self.locationAuthStatus = "unavailable"
             }
+            _ = self.evaluatePreFlightChecklist()
         }
     }
 

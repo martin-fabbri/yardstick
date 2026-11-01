@@ -958,6 +958,8 @@ final class CaptureReplayTests: XCTestCase {
         )
         XCTAssertNil(engine.lastSpokenPhraseThisStep, "YS-75: Voice coach must remain completely silent while a note records")
         engine.setRecordingVoiceNote(false, at: 4.1)
+        XCTAssertEqual(engine.activeInstruction, "Note added", "YS-75: Stopping a voice note must show 'Note added' on glass")
+        XCTAssertNil(engine.lastSpokenPhraseThisStep, "YS-75: 'Note added' must remain silent on the voice coach")
 
         // 6. Verify fixed phrase catalog for marker words and once-per-walk warnings
         XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "locked_marker_2"), "Got marker two.")
@@ -967,6 +969,34 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertNil(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "hold_paused_moving", holdPausedDurationS: 1.2))
         XCTAssertEqual(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "hold_paused_moving", holdPausedDurationS: 2.1), "Hold steady.")
         XCTAssertNil(GuidedVoiceCatalog.spokenPhrase(forInstructionKey: "storage_low", alreadySpokenOnceKeys: ["storage_low"]))
+
+        // 7. Verify VoiceOver announcement vs AVSpeechSynthesizer routing (YS-75)
+        XCTAssertEqual(
+            GuidedVoiceCatalog.resolveOutputRoute(
+                phrase: "Got marker one.",
+                isVoiceCoachEnabled: true,
+                isRecordingVoiceNote: false,
+                isVoiceOverRunning: true
+            ),
+            .voiceOverAnnouncement("Got marker one.")
+        )
+        XCTAssertEqual(
+            GuidedVoiceCatalog.resolveOutputRoute(
+                phrase: "Got marker two.",
+                isVoiceCoachEnabled: true,
+                isRecordingVoiceNote: false,
+                isVoiceOverRunning: false
+            ),
+            .speechSynthesizer("Got marker two.")
+        )
+        XCTAssertNil(
+            GuidedVoiceCatalog.resolveOutputRoute(
+                phrase: "Got marker two.",
+                isVoiceCoachEnabled: true,
+                isRecordingVoiceNote: true,
+                isVoiceOverRunning: false
+            )
+        )
     }
 
     /// `YS-76`: Always-on unit test verifying Pre-Flight Checklist and Stable-Frame Lens Smudge Detector:
@@ -1141,6 +1171,23 @@ final class CaptureReplayTests: XCTestCase {
             "point_a_world_m", "point_b_world_m", "tape_m", "measured_m", "residual_m",
         ]
         XCTAssertEqual(Set(dict.keys), requiredKeys, "YS-77: Dictionary keys must match contract/session.schema.json:406-480")
+
+        // When YARDSTICK_REPLAY_ROOT is set, also verify full Walk 5 replay with 180 mm marker size
+        if let rootURL = Self.replayRootURL {
+            let walk5URL = rootURL.appendingPathComponent("walk-5", isDirectory: true)
+            if FileManager.default.fileExists(atPath: walk5URL.appendingPathComponent("frames.csv").path),
+               let res = try? CaptureReplayHarness.replayCaptureDirectory(
+                   at: walk5URL,
+                   mode: .liveDetectorOnStills,
+                   overridePrintedSizeMM: 180.0,
+                   preWalkTapeMeters0To1: 7.456
+               ),
+               let walk5Tape = res.guidedEngine.generatedMarker0To1TapeCheck {
+                XCTAssertEqual(walk5Tape.id, 0)
+                XCTAssertEqual(walk5Tape.role, "primary")
+                XCTAssertLessThanOrEqual(walk5Tape.residualM, 0.030, "YS-77: Walk 5 Marker 0->1 centre-to-centre residual must be <= 3.0 cm")
+            }
+        }
     }
 
     // MARK: - Full Walk 1–5 Local Suite (`YARDSTICK_REPLAY_ROOT`)

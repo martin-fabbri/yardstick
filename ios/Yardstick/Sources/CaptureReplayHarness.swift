@@ -597,7 +597,9 @@ public enum CaptureReplayHarness {
     public static func replayCaptureDirectory(
         at dirURL: URL,
         mode: CaptureReplayDetectionMode = .liveDetectorOnStills,
-        defaultPrintedSizeMM: Double = 180.0
+        defaultPrintedSizeMM: Double = 180.0,
+        overridePrintedSizeMM: Double? = nil,
+        preWalkTapeMeters0To1: Double? = nil
     ) throws -> CaptureReplayResult {
         let tStart = CFAbsoluteTimeGetCurrent()
         let sessionID = dirURL.lastPathComponent
@@ -660,7 +662,7 @@ public enum CaptureReplayHarness {
                   let c2u = Double(cols[16]), let c2v = Double(cols[17]),
                   let c3u = Double(cols[18]), let c3v = Double(cols[19])
             else { continue }
-            printedSizeByMarker[mid] = sPrinted
+            printedSizeByMarker[mid] = overridePrintedSizeMM ?? sPrinted
             let posW = SIMD3<Double>(x, y, z)
             let camPosW: SIMD3<Double> = {
                 guard let p = posesByIdx[idx] else { return .zero }
@@ -878,7 +880,10 @@ public enum CaptureReplayHarness {
         phoneLoopState.lastOperatorTapTimeS = filteredTaps.max()
 
         let hasGuidanceStream = FileManager.default.fileExists(atPath: guidanceURL.path)
-        var guidedEngine = GuidedCaptureEngine(requireLookUpStep: hasGuidanceStream)
+        var guidedEngine = GuidedCaptureEngine(
+            requireLookUpStep: hasGuidanceStream,
+            preWalkTapeMeters0To1: preWalkTapeMeters0To1
+        )
         var replayedSightings: [ReplayMarkerSighting] = []
         var prevFrameT: Double? = nil
 
@@ -920,6 +925,15 @@ public enum CaptureReplayHarness {
                 turnRateRadS: tr,
                 exposureDurationS: expS
             )
+            let steadyDets = dets.filter { s in
+                let rngXZ = hypot(camPosW.x - s.positionWorld.x, camPosW.z - s.positionWorld.z)
+                return ExposureAndStillnessGate.evaluateMarkerSighting(
+                    predictedBlurPx: predBlur,
+                    turnRateRadS: tr,
+                    rangeMeters3D: s.rangeMeters,
+                    horizontalRangeMeters: rngXZ
+                ).passes
+            }
             _ = guidedEngine.step(
                 timestampS: frame.timestampS,
                 savedIndex: sIdx,
@@ -930,7 +944,7 @@ public enum CaptureReplayHarness {
                 turnRateRadS: tr,
                 predictedBlurPx: predBlur,
                 cameraPositionWorld: camPosW,
-                confirmedSightings: dets,
+                confirmedSightings: steadyDets,
                 rawSightings: dets,
                 unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
                 hasValidDepthForLookUp: true,

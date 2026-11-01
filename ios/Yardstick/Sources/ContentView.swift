@@ -150,7 +150,7 @@ public struct ContentView: View {
                             Spacer()
                             if row.id == "lens", row.actionTitle != nil {
                                 Button("Check Again") {
-                                    _ = recorder.evaluatePreFlightChecklist(overrideLensProbe: nil)
+                                    _ = recorder.resetLensSmudgeProbeAndCheckAgain()
                                 }
                                 .font(.caption.bold())
                                 .buttonStyle(.borderedProminent)
@@ -286,6 +286,7 @@ public struct ContentView: View {
             .padding(24)
         }
         .onAppear {
+            recorder.startPreFlightCameraProbeIfAuthorized()
             _ = recorder.evaluatePreFlightChecklist()
         }
         .sheet(isPresented: $showAboutSheet) {
