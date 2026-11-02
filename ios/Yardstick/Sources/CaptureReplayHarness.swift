@@ -158,8 +158,18 @@ public struct PhoneLoopRuleState: Sendable {
     public var limitedTrackingShare: Double {
         trackedFrameCount > 0 ? Double(limitedTrackingFrameCount) / Double(trackedFrameCount) : 0.0
     }
-    /// Sum of the pose jumps found so far (YS-32).
-    public var poseJumpSumM: Double { detectedPoseJumps.reduce(0.0) { $0 + $1.jumpM } }
+    /// Sum of the pose jumps that count (YS-32): between Marker 0's first sighting and the return hold
+    /// (`loop_closed`), as the toolkit's `counted_pose_jump_sum`. Jumps during the look-up (now after the return
+    /// hold) cannot move the markers and are not counted.
+    public var poseJumpSumM: Double {
+        let lo = allSightings.filter { $0.sighting.markerID == 0 }.map(\.timestampS).min()
+        let hi = loopClosedEventTimeS
+        return detectedPoseJumps.reduce(0.0) { acc, j in
+            if let lo, j.timestampS < lo - 1e-6 { return acc }
+            if let hi, j.timestampS > hi + 1e-6 { return acc }
+            return acc + j.jumpM
+        }
+    }
 
     public init() {}
 
@@ -452,7 +462,11 @@ public struct PhoneLoopRuleState: Sendable {
         let pLast = Self.medianPosition3D(validClosingRows.map(\.sighting.positionWorld))
         let rawGap = simd_length(pLast - pFirst)
         // YS-32 / YS-88: the gap is never smaller than the sum of pose jumps, exactly as the toolkit computes it.
-        let jumpSum = poseJumpSumM ?? currentPoseJumpSumM()
+        let jumpSum: Double = {
+            if let given = poseJumpSumM { return given }
+            _ = currentPoseJumpSumM()
+            return self.poseJumpSumM
+        }()
         let effGap = max(rawGap, jumpSum)
 
         unifiedLoopClosed = true

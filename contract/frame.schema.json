@@ -109,6 +109,18 @@
     "pose_convention": {
       "const": "yard_right_handed_z_up"
     },
+    "pose_jump_window_t_s": {
+      "description": "YS-32: only pose jumps with t_s in [first Marker 0 sighting, loop_closed] count toward the loop gap; null = open end. Absent = every jump counts.",
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      },
+      "maxItems": 2,
+      "minItems": 2,
+      "type": "array"
+    },
     "pose_jumps": {
       "items": {
         "additionalProperties": false,

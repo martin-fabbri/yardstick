@@ -487,6 +487,20 @@ def detect_pose_jumps(
     return jumps
 
 
+def counted_pose_jump_sum(pose_jumps: list[dict[str, Any]], window_t_s: list[float | None] | None) -> float:
+    """Sum of pose jumps inside [first Marker 0 sighting, loop_closed] (YS-32); no window = every jump counts."""
+    lo, hi = (window_t_s or [None, None])[:2]
+    total = 0.0
+    for j in pose_jumps:
+        t = float(j["t_s"])
+        if lo is not None and t < lo - 1e-6:
+            continue
+        if hi is not None and t > hi + 1e-6:
+            continue
+        total += float(j["jump_m"])
+    return total
+
+
 def build_yard_frame(
     ground_normal_world: np.ndarray,
     ground_d_world: float,
@@ -507,7 +521,14 @@ def build_yard_frame(
     """Construct world_to_yard_transform (4x4) and frame residuals (YS-31, YS-32, YS-51, YS-67)."""
     eff_p95 = ground_residual_p95_m if ground_residual_p95_m is not None else (ground_residual_m * 1.96)
     z_yard = ground_normal_world / np.linalg.norm(ground_normal_world)
-    jump_sum = sum(float(j["jump_m"]) for j in pose_jumps)
+    # YS-32 window: only jumps between Marker 0's first sighting and the return hold (loop_closed) can move the
+    # marker layout or the closing pass; jumps before or after (e.g. the look-up step, which now follows the return
+    # hold) are listed but not counted.
+    jump_window_start_t_s: float | None = (
+        float(passes_by_marker[0][0][0]["t"]) if passes_by_marker.get(0) and passes_by_marker[0][0] else None
+    )
+    jump_window_t_s = [jump_window_start_t_s, loop_closed_t_s]
+    jump_sum = counted_pose_jump_sum(pose_jumps, jump_window_t_s)
 
     latest_other_marker_t_s: float | None = None
     for mid, m_passes in passes_by_marker.items():
@@ -658,6 +679,7 @@ def build_yard_frame(
             "ground_plane_residual_p95_m": round(eff_p95, 6),
             "loop_closure_gaps": loop_closure_gaps,
             "pose_jumps": pose_jumps,
+            "pose_jump_window_t_s": jump_window_t_s,
         }
 
     # Fallback: first camera pose projected to ground plane (YS-31 floor)
@@ -693,6 +715,7 @@ def build_yard_frame(
         "ground_plane_residual_p95_m": round(eff_p95, 6),
         "loop_closure_gaps": loop_closure_gaps,
         "pose_jumps": pose_jumps,
+        "pose_jump_window_t_s": jump_window_t_s,
     }
 
 

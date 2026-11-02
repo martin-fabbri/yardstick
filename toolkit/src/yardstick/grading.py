@@ -123,7 +123,9 @@ def compute_grade_and_tolerances(
     has_m0_loop_closure = raw_m0_gap is not None
 
     pose_jumps = frame_info.get("pose_jumps", [])
-    jump_sum = sum(float(j["jump_m"]) for j in pose_jumps)
+    from yardstick.geometry import counted_pose_jump_sum
+
+    jump_sum = counted_pose_jump_sum(pose_jumps, frame_info.get("pose_jump_window_t_s"))
     m0_gap: float | None = raw_m0_gap
     if m0_gap is not None:
         m0_gap = max(m0_gap, jump_sum)
