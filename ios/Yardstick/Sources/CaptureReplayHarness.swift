@@ -149,6 +149,17 @@ public struct PhoneLoopRuleState: Sendable {
     public var walkEndTimeS: Double? = nil
     public var lastOperatorTapTimeS: Double? = nil
     public var loopClosedEventTimeS: Double? = nil
+    /// Camera path length over saved frames, as the toolkit's `walk_length_m` (YS-41; rotation-invariant, so world = yard).
+    public private(set) var walkLengthM: Double = 0.0
+    private var lastSavedCameraPosition: SIMD3<Double>? = nil
+    /// Saved frames and those whose tracking was not "normal", for the toolkit's `limited_tracking_share` (YS-41, YS-42).
+    public private(set) var trackedFrameCount: Int = 0
+    public private(set) var limitedTrackingFrameCount: Int = 0
+    public var limitedTrackingShare: Double {
+        trackedFrameCount > 0 ? Double(limitedTrackingFrameCount) / Double(trackedFrameCount) : 0.0
+    }
+    /// Sum of the pose jumps found so far (YS-32).
+    public var poseJumpSumM: Double { detectedPoseJumps.reduce(0.0) { $0 + $1.jumpM } }
 
     public init() {}
 
@@ -156,9 +167,18 @@ public struct PhoneLoopRuleState: Sendable {
     public mutating func updateCameraExcursion(
         cameraPositionWorld camPosW: SIMD3<Double>,
         savedIndex: Int? = nil,
-        timestampS: Double? = nil
+        timestampS: Double? = nil,
+        trackingNormal: Bool? = nil
     ) {
         if let sIdx = savedIndex {
+            if cameraPositionsByIndex[sIdx] == nil {
+                if let prev = lastSavedCameraPosition { walkLengthM += simd_length(camPosW - prev) }
+                lastSavedCameraPosition = camPosW
+                if let normal = trackingNormal {
+                    trackedFrameCount += 1
+                    if !normal { limitedTrackingFrameCount += 1 }
+                }
+            }
             cameraPositionsByIndex[sIdx] = camPosW
             if let t = timestampS { cameraTimestampsByIndex[sIdx] = t }
         }

@@ -1,0 +1,227 @@
+[
+ {
+  "name": "walk6_real",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    2.947672
+   ]
+  ],
+  "scale_eff": 0.004845,
+  "gap": 0.007393,
+  "jumps": [],
+  "walk": 40.0154,
+  "limited": 0.001868,
+  "expected_grade": "C",
+  "expected_distance_m": 0.174427,
+  "expected_caps": []
+ },
+ {
+  "name": "walk7_real",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    2.865254
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.014244,
+  "jumps": [
+   0.10814,
+   0.093554
+  ],
+  "walk": 41.0163,
+  "limited": 0.002588,
+  "expected_grade": "fail",
+  "expected_distance_m": 0.449153,
+  "expected_caps": []
+ },
+ {
+  "name": "clean_A",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "A",
+  "expected_distance_m": 0.031672,
+  "expected_caps": []
+ },
+ {
+  "name": "limited_tracking_caps_B",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.2,
+  "expected_grade": "B",
+  "expected_distance_m": 0.042088,
+  "expected_caps": [
+   "limited_tracking_over_10pct"
+  ]
+ },
+ {
+  "name": "no_loop_jumps_only",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": null,
+  "jumps": [
+   0.05
+  ],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "C",
+  "expected_distance_m": 0.045028,
+  "expected_caps": [
+   "no_loop_closure"
+  ]
+ },
+ {
+  "name": "no_tape",
+  "tapes": [],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "C",
+  "expected_distance_m": 0.031672,
+  "expected_caps": [
+   "no_tape_check"
+  ]
+ },
+ {
+  "name": "held_out_one_fails",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ],
+   [
+    "held_out",
+    4.0,
+    4.3
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "C",
+  "expected_distance_m": 0.031672,
+  "expected_caps": [
+   "held_out_tape_failed_1"
+  ]
+ },
+ {
+  "name": "held_out_two_fail",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ],
+   [
+    "held_out",
+    4.0,
+    4.3
+   ],
+   [
+    "held_out",
+    5.0,
+    4.6
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "fail",
+  "expected_distance_m": 0.031672,
+  "expected_caps": [
+   "held_out_tape_failed_2plus"
+  ]
+ },
+ {
+  "name": "scale_error_drives_B",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ]
+  ],
+  "scale_eff": 0.004,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "B",
+  "expected_distance_m": 0.084556,
+  "expected_caps": []
+ },
+ {
+  "name": "short_walk_floor_10m",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.04,
+  "jumps": [],
+  "walk": 4.0,
+  "limited": 0.0,
+  "expected_grade": "B",
+  "expected_distance_m": 0.084303,
+  "expected_caps": []
+ },
+ {
+  "name": "tilted_marker0_caps_C",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "normal_ok": false,
+  "expected_grade": "C",
+  "expected_distance_m": 0.031672,
+  "expected_caps": [
+   "marker_0_tilted"
+  ]
+ }
+]

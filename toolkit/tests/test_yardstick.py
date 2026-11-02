@@ -1121,3 +1121,28 @@ def test_ys69_subpixel_refinement_window5_and_quad_rejection_gates() -> None:
 
 
 
+
+
+def test_grade_parity_vectors() -> None:
+    """YS-44 / YS-111: shared grade vectors; the phone's `GradeModelTests` asserts the same expectations."""
+    from yardstick.grading import compute_grade_and_tolerances
+
+    vectors = json.loads((Path(__file__).parent / "fixtures" / "grade_parity_vectors.json").read_text())
+    names = {v["name"] for v in vectors}
+    assert {"walk6_real", "walk7_real"} <= names
+    for v in vectors:
+        tcs = [
+            {"id": k, "role": r, "tape_m": t, "point_a_world_m": [0, 0, 0], "point_b_world_m": [m, 0, 0]}
+            for k, (r, t, m) in enumerate(v["tapes"])
+        ]
+        fi = {
+            "method": "marker",
+            "marker_0_normal_ok": v.get("normal_ok", True),
+            "loop_closure_gaps": [{"marker_id": 0, "gap_m": v["gap"]}] if v["gap"] is not None else [],
+            "pose_jumps": [{"jump_m": j, "t_s": 0.0, "saved_index_from": 0, "saved_index_to": 1} for j in v["jumps"]],
+        }
+        ms = {"scale_error_ratio": v["scale_eff"], "scale_error_se": 0.0, "scale_error_eff": v["scale_eff"], "sightings_used": 1}
+        g = compute_grade_and_tolerances("ok", fi, ms, tcs, np.eye(4), v["walk"], v["limited"])
+        assert g["grade"] == v["expected_grade"], v["name"]
+        assert g["tolerances_95pct"]["distance_m"] == pytest.approx(v["expected_distance_m"], abs=1e-6), v["name"]
+        assert g["caps_applied"] == v["expected_caps"], v["name"]
