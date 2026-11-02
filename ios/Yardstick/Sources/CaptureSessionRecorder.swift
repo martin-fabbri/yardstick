@@ -1919,6 +1919,10 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         locationManager.stopUpdatingLocation()
 
         beginSealingBackgroundTask(name: "YardstickSealDone")
+        // YS-88: the sealed gap includes every pose jump of the whole walk, exactly as the toolkit computes it.
+        phoneLoopState.finalizeLoopGapForSeal()
+        isLoopClosed = phoneLoopState.unifiedLoopClosed
+        loopClosureGapMeters = phoneLoopState.unifiedLoopClosureGapMeters
         updateProvisionalGrade()
         let snapData = makeSessionJSONData(status: "stopped", stopReason: "user_done", failedStream: nil)
 
