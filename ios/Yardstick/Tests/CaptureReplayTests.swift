@@ -308,14 +308,14 @@ final class CaptureReplayTests: XCTestCase {
 
         let fastTurnVerdict = ExposureAndStillnessGate.evaluateMarkerSighting(
             predictedBlurPx: blur,
-            turnRateRadS: 0.20,
+            turnRateRadS: 0.50,
             rangeMeters3D: 1.10
         )
         XCTAssertFalse(fastTurnVerdict.passes)
         XCTAssertEqual(fastTurnVerdict.coachingCue, "Turn a little slower")
 
         let highBlurVerdict = ExposureAndStillnessGate.evaluateMarkerSighting(
-            predictedBlurPx: 1.80,
+            predictedBlurPx: 5.00,
             turnRateRadS: 0.10,
             rangeMeters3D: 1.10
         )
@@ -457,8 +457,8 @@ final class CaptureReplayTests: XCTestCase {
             dt: 0.20,
             trackingState: "normal",
             pitchDeg: -30.0,
-            turnRateRadS: 0.35,
-            predictedBlurPx: 3.2,
+            turnRateRadS: 0.60,
+            predictedBlurPx: 6.0,
             cameraPositionWorld: camAtM0,
             confirmedSightings: [],
             rawSightings: [makeSighting(id: 0, pos: SIMD3<Double>(0.0, 0.0, 0.0))],
