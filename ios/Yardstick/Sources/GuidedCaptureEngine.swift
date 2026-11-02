@@ -738,7 +738,10 @@ public struct GuidedCaptureEngine: Sendable {
     /// after Markers 1–3 (or End Early) and after any `"Fix now"` (`YS-72`, `YS-74`).
     public func isFinishAvailable(unifiedLoopClosed: Bool) -> Bool {
         let markersReady = endEarlyChosen || (lockedMarkerIDs.contains(1) && lockedMarkerIDs.contains(2) && lockedMarkerIDs.contains(3))
-        return unifiedLoopClosed
+        // A completed return hold on Marker 0 always offers Finish, even when the loop check fails
+        // (device walk 8, 2026-11-01: 0.82 m drift left the walker with no Finish and no way to retry).
+        // The grade still records the walk as not closed.
+        return (unifiedLoopClosed || isClosingMarker0Locked)
             && lockedMarkerIDs.contains(0)
             && markersReady
             && isClosingMarker0Locked
@@ -1298,6 +1301,9 @@ public struct GuidedCaptureEngine: Sendable {
             case .closingMarker0:
                 return ("return_marker_0", "Head back to marker 0", true)
             case .readyToFinish:
+                if !unifiedLoopClosed {
+                    return ("finish_loop_not_closed", "Back at marker 0, but the walk drifted. Tap Finish to save.", true)
+                }
                 return ("all_done_finish", "All done. Tap Finish.", true)
             }
         }()
@@ -1310,6 +1316,7 @@ public struct GuidedCaptureEngine: Sendable {
                 || candKey == "storage_low"
                 || candKey == "thermal_serious"
                 || candKey == "all_done_finish"
+                || candKey == "finish_loop_not_closed"
                 || candKey.hasPrefix("locked_marker_")
                 || phaseChangedThisStep
                 || didLockMarkerThisStep
@@ -1552,6 +1559,8 @@ public enum GuidedVoiceCatalog: Sendable {
             return "That's all of them. Head back to marker zero."
         case "all_done_finish":
             return "You're back at the start. All done."
+        case "finish_loop_not_closed":
+            return "You're back at the start, but the walk drifted. Tap Finish to save."
         case "storage_low":
             return "Almost out of space. Finish soon."
         case "thermal_serious":
