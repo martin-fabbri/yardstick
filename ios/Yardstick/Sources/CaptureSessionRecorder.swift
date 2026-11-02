@@ -686,7 +686,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     /// Injectable thermal level for deterministic testing of `YS-85` serious-thermal adaptation.
     public var injectedThermalLevelForTesting: CaptureThermalLevel? = nil
 
-    private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM"
+    private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM.v2"
 
     /// Per-marker printed size configuration (`180.0` mm default for all markers `0–5` per `YS-80` #3), persisted in `UserDefaults`.
     @Published public var markerSizesMM: [Int: Double] = CaptureSessionRecorder.loadPersistedMarkerSizes()

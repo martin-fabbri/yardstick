@@ -591,16 +591,6 @@ private struct BeforeYouStartSheetView: View {
             }
 
             Section {
-                let currentSizeMM = Int((recorder.markerSizesMM[0] ?? 180.0).rounded())
-                Picker("Markers", selection: Binding(
-                    get: { currentSizeMM == 250 ? 250 : 180 },
-                    set: { newMM in
-                        recorder.setAllMarkersPrintedSizeMM(Double(newMM))
-                    }
-                )) {
-                    Text("18 cm (standard)").tag(180)
-                    Text("25 cm").tag(250)
-                }
 
                 VStack(alignment: .leading, spacing: 8) {
                     HStack {
@@ -1465,17 +1455,7 @@ private struct SettingsSheetView: View {
         NavigationStack {
             Form {
                 Section("Markers") {
-                    let currentSizeMM = Int((recorder.markerSizesMM[0] ?? 180.0).rounded())
-                    Picker("Marker Size", selection: Binding(
-                        get: { currentSizeMM == 250 ? 250 : 180 },
-                        set: { newMM in
-                            recorder.setAllMarkersPrintedSizeMM(Double(newMM))
-                        }
-                    )) {
-                        Text("18 cm (standard)").tag(180)
-                        Text("25 cm").tag(250)
-                    }
-                    .pickerStyle(.menu)
+                    LabeledContent("Marker Size", value: String(format: "%.1f cm", (recorder.markerSizesMM[0] ?? 180.0) / 10.0))
 
                     Button("How to Lay Markers") {
                         onOpenOnboarding()
