@@ -679,8 +679,33 @@ def validate_standard_capture(capture_dir: Path) -> dict[str, Any]:
         except Exception as exc:
             add_finding("standard_schema_error", "error", f"standard/{fname} failed schema validation: {exc}")
 
+    # Optional standard/visit.json (present when capture was guided by a lotfit.visit-plan/1)
+    visit_fp = std_dir / "visit.json"
+    if visit_fp.exists():
+        try:
+            visit_data = json.loads(visit_fp.read_text(encoding="utf-8"))
+            loaded_json["visit.json"] = visit_data
+            forbidden_visit = _check_no_forbidden_keys(visit_data, "visit.json")
+            if forbidden_visit:
+                add_finding(
+                    "forbidden_interpretation_field",
+                    "error",
+                    f"Forbidden interpretation fields in visit.json: {forbidden_visit} (YS-53)",
+                )
+            jsonschema.validate(instance=visit_data, schema=_load_schema("visit.schema.json"))
+            if rec_dir is not None and (rec_dir / "visit_plan.json").exists():
+                expected_plan_sha = sha256_file(rec_dir / "visit_plan.json")
+                if visit_data.get("plan_sha256") != expected_plan_sha:
+                    add_finding(
+                        "visit_plan_hash_mismatch",
+                        "error",
+                        f"visit.json plan_sha256 {visit_data.get('plan_sha256')} != visit_plan.json sha256 {expected_plan_sha}",
+                    )
+        except Exception as exc:
+            add_finding("standard_schema_error", "error", f"standard/visit.json failed schema validation: {exc}")
+
     # Check YS-53 forbidden files in standard/
-    allowed_top_files = set(schema_map.keys()) | {"cloud.ply", "audio.wav"}
+    allowed_top_files = set(schema_map.keys()) | {"visit.json", "cloud.ply", "audio.wav"}
     actual_std_files: set[str] = set()
     for p in sorted(std_dir.rglob("*")):
         if p.is_file():

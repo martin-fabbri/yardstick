@@ -37,7 +37,7 @@ from yardstick.synth import (
     seal_manifest,
     unpack_capture_zip,
 )
-from yardstick.validator import validate_recording, validate_standard_capture
+from yardstick.validator import sha256_file, validate_recording, validate_standard_capture
 
 
 @pytest.fixture(scope="module")
@@ -1147,3 +1147,112 @@ def test_grade_parity_vectors() -> None:
         assert g["grade"] == v["expected_grade"], v["name"]
         assert g["tolerances_95pct"]["distance_m"] == pytest.approx(v["expected_distance_m"], abs=1e-6), v["name"]
         assert g["caps_applied"] == v["expected_caps"], v["name"]
+
+
+def test_ys92_visit_json_validates_and_rejects_interpretation_keys(
+    base_synth_dir: Path, tmp_path: Path
+) -> None:
+    """YS-92 / Phase 2: validate_standard_capture accepts standard/visit.json against visit.schema.json and enforces YS-53."""
+    cap = _clone_capture(base_synth_dir, tmp_path / "cap_with_visit")
+    convert_recording_to_standard(cap)
+    std_dir = cap / "standard"
+
+    visit_plan_bytes = b'{"schema":"lotfit.visit-plan/1","plan_id":"vplan-eug-1704104303300-v1"}'
+    visit_plan_path = cap / "visit_plan.json"
+    visit_plan_path.write_bytes(visit_plan_bytes)
+    plan_sha256 = sha256_file(visit_plan_path)
+
+    valid_visit_echo = {
+        "contract": "yardstick-capture/1",
+        "plan_id": "019a4500-0000-7000-8000-000000000301",
+        "plan_sha256": plan_sha256,
+        "records": [
+            {
+                "layer": "parcel",
+                "status": "available",
+                "source": {
+                    "issuer": "Lane County",
+                    "service_url": "https://lcgispubags.lanecountyor.gov/arcgis/rest/services/Health/AddressParcel/MapServer/1",
+                    "query": "MAPTAXLOT='1704104303300'",
+                    "document": "Lane County tax lot map (AddressParcel), map tax lot 1704104303300",
+                },
+                "record_date": "2026-11-01",
+                "stated_accuracy": None,
+                "assumed_accuracy": {
+                    "value": 3.0,
+                    "unit": "ft",
+                    "by": "CC (Claude Code)",
+                    "why": "the issuer states no positional accuracy; 3.0 ft assumed for urban GIS tax lots",
+                },
+            }
+        ],
+        "markers_placed": [
+            {
+                "id": 0,
+                "role": "origin_anchor_a",
+                "sighted": True,
+                "sightings_count": 18,
+                "as_planned": "yes",
+                "measured_yard_xyz_m": [0.0, 0.0, 0.0],
+            },
+            {
+                "id": 1,
+                "role": "anchor_b",
+                "sighted": True,
+                "sightings_count": 14,
+                "as_planned": "yes",
+                "measured_yard_xyz_m": [16.53, 0.0, 0.0],
+            },
+        ],
+        "must_capture": [
+            {
+                "id": "cap-corner-a",
+                "kind": "anchor_corner",
+                "status": "done",
+                "t_s": 100.0,
+                "saved_index": 0,
+                "keyframe_file": "keyframes/000000.jpg",
+            }
+        ],
+        "live_warnings": [],
+    }
+
+    def _seal_standard_visit(visit_obj: dict) -> None:
+        visit_fp = std_dir / "visit.json"
+        visit_fp.write_text(json.dumps(visit_obj, indent=2), encoding="utf-8")
+        cap_fp = std_dir / "capture.json"
+        cap_data = json.loads(cap_fp.read_text(encoding="utf-8"))
+        files_list = [f for f in cap_data["files"] if f["path"] != "visit.json"]
+        files_list.append(
+            {
+                "path": "visit.json",
+                "sha256": sha256_file(visit_fp),
+                "size_bytes": visit_fp.stat().st_size,
+            }
+        )
+        cap_data["files"] = sorted(files_list, key=lambda x: x["path"])
+        cap_fp.write_text(json.dumps(cap_data, indent=2), encoding="utf-8")
+
+    # 1. Valid standard/visit.json passes
+    _seal_standard_visit(valid_visit_echo)
+    rep_ok = validate_standard_capture(cap)
+    assert rep_ok["status"] == "clean", f"Expected clean standard validation with visit.json, got {rep_ok['findings']}"
+
+    # 2. YS-53 forbidden interpretation key inside standard/visit.json is rejected
+    bad_ys53 = dict(valid_visit_echo)
+    bad_ys53["verdict"] = "fits"
+    _seal_standard_visit(bad_ys53)
+    rep_ys53 = validate_standard_capture(cap)
+    assert rep_ys53["status"] == "invalid"
+    codes_ys53 = {f["code"] for f in rep_ys53["findings"]}
+    assert "forbidden_interpretation_field" in codes_ys53
+
+    # 3. Malformed standard/visit.json (wrong plan_sha256) is rejected
+    bad_hash = dict(valid_visit_echo)
+    bad_hash["plan_sha256"] = "0" * 64
+    _seal_standard_visit(bad_hash)
+    rep_hash = validate_standard_capture(cap)
+    assert rep_hash["status"] == "invalid"
+    codes_hash = {f["code"] for f in rep_hash["findings"]}
+    assert "visit_plan_hash_mismatch" in codes_hash
+

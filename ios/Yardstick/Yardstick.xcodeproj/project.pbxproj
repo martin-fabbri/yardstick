@@ -28,6 +28,9 @@
 		B100000A0000000000000001 /* GradeModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000140000000000000001 /* GradeModel.swift */; };
 		B100000B0000000000000001 /* GradeModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000150000000000000001 /* GradeModelTests.swift */; };
 		B10000070000000000000001 /* GuidedCaptureEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000110000000000000001 /* GuidedCaptureEngine.swift */; };
+		A100000B0000000000000001 /* VisitPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000160000000000000001 /* VisitPlan.swift */; };
+		B100000C0000000000000001 /* VisitPlan.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000160000000000000001 /* VisitPlan.swift */; };
+		B100000D0000000000000001 /* VisitPlanDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000170000000000000001 /* VisitPlanDecodingTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -48,6 +51,8 @@
 		A20000140000000000000001 /* GradeModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GradeModel.swift; sourceTree = "<group>"; };
 		A20000150000000000000001 /* GradeModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GradeModelTests.swift; sourceTree = "<group>"; };
 		A20000110000000000000001 /* GuidedCaptureEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuidedCaptureEngine.swift; sourceTree = "<group>"; };
+		A20000160000000000000001 /* VisitPlan.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisitPlan.swift; sourceTree = "<group>"; };
+		A20000170000000000000001 /* VisitPlanDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VisitPlanDecodingTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -91,6 +96,7 @@
 				A20000120000000000000001 /* PoseJumpDetector.swift */,
 				A20000140000000000000001 /* GradeModel.swift */,
 				A20000110000000000000001 /* GuidedCaptureEngine.swift */,
+				A20000160000000000000001 /* VisitPlan.swift */,
 			);
 			path = Sources;
 			sourceTree = "<group>";
@@ -102,6 +108,7 @@
 				A20000100000000000000001 /* CapturePipelineStep3Tests.swift */,
 				A20000130000000000000001 /* PoseJumpDetectorTests.swift */,
 				A20000150000000000000001 /* GradeModelTests.swift */,
+				A20000170000000000000001 /* VisitPlanDecodingTests.swift */,
 			);
 			path = Tests;
 			sourceTree = "<group>";
@@ -202,6 +209,7 @@
 				A10000090000000000000001 /* PoseJumpDetector.swift in Sources */,
 				A100000A0000000000000001 /* GradeModel.swift in Sources */,
 				A10000080000000000000001 /* GuidedCaptureEngine.swift in Sources */,
+				A100000B0000000000000001 /* VisitPlan.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -220,6 +228,8 @@
 				B100000A0000000000000001 /* GradeModel.swift in Sources */,
 				B100000B0000000000000001 /* GradeModelTests.swift in Sources */,
 				B10000070000000000000001 /* GuidedCaptureEngine.swift in Sources */,
+				B100000C0000000000000001 /* VisitPlan.swift in Sources */,
+				B100000D0000000000000001 /* VisitPlanDecodingTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

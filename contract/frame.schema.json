@@ -53,6 +53,46 @@
         "null"
       ]
     },
+    "markers_yard": {
+      "description": "Optional fused 3D coordinates and normals of detected ArUco markers in the Yard Frame (metres).",
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "marker_id": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "normal_xyz": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
+          },
+          "sightings_count": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "xyz_m": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
+          }
+        },
+        "required": [
+          "marker_id",
+          "xyz_m",
+          "normal_xyz",
+          "sightings_count"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
     "method": {
       "enum": [
         "marker",
