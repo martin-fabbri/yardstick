@@ -783,10 +783,12 @@ public struct GuidedCaptureEngine: Sendable {
         // A completed return hold on Marker 0 always offers Finish, even when the loop check fails
         // (device walk 8, 2026-11-01: 0.82 m drift left the walker with no Finish and no way to retry).
         // The grade still records the walk as not closed.
+        let lookUpReady = !requireLookUpStep || endEarlyChosen || lookUpTracker.isDone
         return (unifiedLoopClosed || isClosingMarker0Locked)
             && lockedMarkerIDs.contains(0)
             && markersReady
             && isClosingMarker0Locked
+            && lookUpReady
             && !fixNowRequiresReturnToMarker0
     }
 
@@ -947,13 +949,15 @@ public struct GuidedCaptureEngine: Sendable {
             )
         } else if phase == .houseWallLookUp {
             phase = .closingMarker0
-            commitInstruction(
-                key: "return_marker_0",
-                text: "Head back to marker 0",
-                isCorrection: false,
-                at: timestampS,
-                forceImmediate: true
-            )
+            if !isClosingMarker0Locked {
+                commitInstruction(
+                    key: "return_marker_0",
+                    text: "Head back to marker 0",
+                    isCorrection: false,
+                    at: timestampS,
+                    forceImmediate: true
+                )
+            }
         }
     }
 
@@ -1140,6 +1144,11 @@ public struct GuidedCaptureEngine: Sendable {
                                 isClosingMarker0Locked = true
                                 fixNowRequiresReturnToMarker0 = false
                                 emittedHaptic = .loopClosedPathComplete
+                                if requireLookUpStep && !lookUpTracker.isDone && !endEarlyChosen {
+                                    justLockedKey = "locked_marker_0_closing"
+                                    justLockedText = "Back at marker 0. Now look up at the roof."
+                                    justLockedBannerUntilS = timestampS + Self.minInstructionDwellS
+                                }
                             } else {
                                 lockedMarkerIDs.insert(mid)
                                 emittedHaptic = .markerLocked(markerID: mid)
@@ -1232,12 +1241,13 @@ public struct GuidedCaptureEngine: Sendable {
         if phase == .markers1To3 {
             let all1To3Locked = lockedMarkerIDs.contains(1) && lockedMarkerIDs.contains(2) && lockedMarkerIDs.contains(3)
             if all1To3Locked || endEarlyChosen {
-                if requireLookUpStep && !lookUpTracker.isDone && !endEarlyChosen {
-                    phase = .houseWallLookUp
-                } else {
-                    phase = .closingMarker0
-                }
+                // Look-up comes AFTER the return hold at Marker 0 (2026-11-02, drift experiment B): drift while looking
+                // at roof and trees can no longer move the markers or spoil the loop check (walk 8: ~60 cm in 94 s).
+                phase = .closingMarker0
             }
+        }
+        if phase == .closingMarker0 && isClosingMarker0Locked && requireLookUpStep && !lookUpTracker.isDone && !endEarlyChosen {
+            phase = .houseWallLookUp
         }
         if phase == .houseWallLookUp {
             lookUpTracker.update(

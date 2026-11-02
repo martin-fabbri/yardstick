@@ -310,6 +310,7 @@ def convert_recording_to_standard(
         "north_calibration": north_cal,
         "loop_closure_gaps": yard_frame_dict["loop_closure_gaps"],
         "pose_jumps": yard_frame_dict["pose_jumps"],
+        "pose_jump_window_t_s": yard_frame_dict["pose_jump_window_t_s"],
     }
 
     # 6. Transform point cloud into Yard Frame & voxel downsample (YS-50)

@@ -566,16 +566,12 @@ final class CaptureReplayTests: XCTestCase {
             XCTAssertTrue(engine.lockedMarkerIDs.contains(mid), "YS-74: Marker \(mid) must lock after 3 confirmed stills spanning >= 1.0 s")
         }
 
-        // After Markers 1–3 are locked, phase transitions to `.houseWallLookUp` (YS-79)
-        XCTAssertEqual(engine.phase, .houseWallLookUp)
-        engine.skipLookUpStep(at: t + 0.4)  // skips the roof stage
-        XCTAssertEqual(engine.phase, .houseWallLookUp)
-        engine.skipLookUpStep(at: t + 0.5)  // skips the trees stage
+        // After Markers 1–3 are locked, the walker heads straight back to Marker 0; the look-up step now
+        // comes AFTER the return hold (2026-11-02, drift experiment B), so its drift cannot move the markers.
         XCTAssertEqual(engine.phase, .closingMarker0)
-        XCTAssertEqual(engine.activeInstruction, "Head back to marker 0")
         XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: false))
 
-        // 8. Lock Marker 0 on return -> transitions to `.readyToFinish` ("All done. Tap Finish.")
+        // 8. Lock Marker 0 on return -> look-up (roof, trees) -> `.readyToFinish` ("All done. Tap Finish.")
         var lastHaptic: GuidedHapticEvent? = nil
         for k in 0..<3 {
             t += 0.55
@@ -596,10 +592,22 @@ final class CaptureReplayTests: XCTestCase {
             lastHaptic = res.haptic
         }
         XCTAssertTrue(engine.isClosingMarker0Locked)
+        XCTAssertEqual(lastHaptic, .loopClosedPathComplete)
+        XCTAssertEqual(engine.phase, .houseWallLookUp, "Look-up follows the return hold")
+        XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: true), "No Finish until the look-up is done or skipped")
+        engine.skipLookUpStep(at: t + 0.4)  // skips the roof stage
+        XCTAssertEqual(engine.phase, .houseWallLookUp)
+        engine.skipLookUpStep(at: t + 0.5)  // skips the trees stage
         XCTAssertTrue(engine.isFinishAvailable(unifiedLoopClosed: true))
+        t += 2.0  // past the 1.5 s "Back at marker 0. Now look up at the roof." banner
+        sIdx += 16
+        _ = engine.step(
+            timestampS: t, savedIndex: sIdx, dt: 0.25, trackingState: "normal", pitchDeg: -30.0,
+            turnRateRadS: 0.03, predictedBlurPx: 0.4, cameraPositionWorld: camAtM0,
+            confirmedSightings: [], rawSightings: [], unifiedLoopClosed: true
+        )
         XCTAssertEqual(engine.phase, .readyToFinish)
         XCTAssertEqual(engine.activeInstruction, "All done. Tap Finish.")
-        XCTAssertEqual(lastHaptic, .loopClosedPathComplete)
 
         // 9. Trigger "Fix now" on Marker 2 -> unlocks Marker 2 AND requires closing Marker 0 to be locked again!
         engine.beginFixNowRequiringReturnToMarker0(targetMarkerID: 2, at: t + 1.0)
