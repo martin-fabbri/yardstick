@@ -1563,7 +1563,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     /// Capture Endpoint A of a tape-measure check using the live 5x5 center crosshair LiDAR patch (`YS-40`).
     public func captureTapeEndpointA() {
         guard let worldPt = latestCrosshairWorld else {
-            statusBanner = "Aim center crosshair at surface (0.2–4.5 m) first"
+            statusBanner = "Aim center crosshair at surface (0.2–5 m) first"
             return
         }
         pendingTapeEndpointAWorld = worldPt
@@ -1580,7 +1580,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             return false
         }
         guard let worldPt = latestCrosshairWorld else {
-            statusBanner = "Aim center crosshair at Endpoint B surface (0.2–4.5 m) first"
+            statusBanner = "Aim center crosshair at Endpoint B surface (0.2–5 m) first"
             return false
         }
         pendingTapeEndpointBWorld = worldPt
@@ -2788,7 +2788,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         if z.isFinite && z > 0.0 && z < 65.535 {
                             let mm = UInt16(clamping: Int((z * 1000.0).rounded()))
                             dArr[baseIdx + u] = mm
-                            if (v & 7 == 0) && (u & 7 == 0) && confVal >= 1 && mm >= 500 && mm <= 4500 {
+                            if (v & 7 == 0) && (u & 7 == 0) && confVal >= 1 && mm >= 500 && mm <= 5000 {
                                 frameValidDepthSampleCount += 1
                             }
                         }
@@ -2809,7 +2809,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                         let idx = v * depthW + u
                         let mm = dArr[idx]
                         let conf = cArr[idx]
-                        if conf >= 1 && mm >= 200 && mm <= 4500 {
+                        if conf >= 1 && mm >= 200 && mm <= 5000 {
                             validDepths.append(mm)
                         }
                     }

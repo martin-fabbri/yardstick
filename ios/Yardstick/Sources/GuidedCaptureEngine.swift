@@ -397,8 +397,10 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
         case trees
     }
 
-    public static let roofMinPitchDeg: Double = 10.0
-    public static let roofMaxPitchDeg: Double = 55.0
+    /// Roof: 0°..+45° (AG second opinion Q8). A one-storey eave seen from 3–6 m sits at +11°..+22°, and walkers
+    /// framing the wall keep the phone near level (walks 7/8 never passed +1°); +10° minimum was unreachable.
+    public static let roofMinPitchDeg: Double = 0.0
+    public static let roofMaxPitchDeg: Double = 45.0
     public static let treesMinPitchDeg: Double = 20.0
     public static let treesMaxPitchDeg: Double = 85.0
     public static let skyWarningPitchDeg: Double = 45.0
@@ -451,14 +453,16 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
         }
 
         isBelowTargetTilt = pitchDeg < minPitchDeg
-        if pitchDeg > Self.skyWarningPitchDeg && !hasValidDepth {
+        // "Not the sky" applies to the roof only; the tree stage looks up into canopy and sky by design.
+        if stage == .roof && pitchDeg > Self.skyWarningPitchDeg && !hasValidDepth {
             skyWarningActive = true
             return
         }
         skyWarningActive = false
 
+        // Trees: LiDAR rarely reaches canopy (> ~5 m), so the tree stage needs tracking and tilt, not depth (AG Q8).
         if trackingState == "normal",
-           hasValidDepth,
+           hasValidDepth || stage == .trees,
            pitchDeg >= minPitchDeg,
            pitchDeg <= maxPitchDeg,
            dt > 0.0 {

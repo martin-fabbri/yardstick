@@ -799,6 +799,18 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertGreaterThan(tracker.elevatedPointsAbove2mCount, 0)
         XCTAssertEqual(tracker.insufficientFeaturesLossCount, 0, "YS-79: 0 tracking losses for insufficient features")
 
+        // AG Q8: roof completes near level (+2°, walks 7/8 never passed +1°); trees complete with no depth (canopy beyond LiDAR).
+        var nearLevel = HouseWallLookUpTracker()
+        for _ in 0..<16 {
+            nearLevel.update(dt: 0.20, pitchDeg: 2.0, hasValidDepth: true, elevatedPointsAbove2m: 0, trackingState: "normal", trackingReason: "")
+        }
+        XCTAssertTrue(nearLevel.roofCompleted, "AG Q8: a near-level look at the wall and eave completes the roof stage")
+        for _ in 0..<16 {
+            nearLevel.update(dt: 0.20, pitchDeg: 55.0, hasValidDepth: false, elevatedPointsAbove2m: 0, trackingState: "normal", trackingReason: "")
+        }
+        XCTAssertFalse(nearLevel.skyWarningActive, "AG Q8: no sky warning in the tree stage")
+        XCTAssertTrue(nearLevel.isCompleted, "AG Q8: trees complete on tilt + tracking without LiDAR depth")
+
         // 3. Verify GuidedCaptureEngine one-tap Skip transitions to .closingMarker0 and formats guidance.csv row
         var engine = GuidedCaptureEngine(requireLookUpStep: true)
         engine.skipLookUpStep(at: 50.0)
