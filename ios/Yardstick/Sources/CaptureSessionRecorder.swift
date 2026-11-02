@@ -1964,46 +1964,32 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         }
     }
 
+    /// Same grade as the toolkit (YS-44, YS-111): `GradeModel` is a line-for-line port of `grading.py`.
     private func updateProvisionalGrade() {
-        let gapM = loopClosureGapMeters
-        let primaryResiduals = tapeChecks.compactMap { item -> Double? in
-            guard (item["role"] as? String) == "primary" else { return nil }
-            return item["residual_m"] as? Double
+        var inp = GradeModel.Inputs()
+        inp.hasMarker0 = detectedMarkerIDs.contains(0)
+        inp.tapeChecks = tapeChecks.compactMap { item -> GradeModel.TapeCheck? in
+            guard let tape = item["tape_m"] as? Double, let res = item["residual_m"] as? Double else { return nil }
+            let role = (item["role"] as? String) ?? "primary"
+            return GradeModel.TapeCheck(tapeM: tape, residualM: res, isHeldOut: role == "held_out")
         }
-        let maxPrimaryRes = primaryResiduals.max() ?? 0.0
-        let loopGapPerM = (gapM ?? 0.08) / 25.0
-        let rss = sqrt(0.015 * 0.015 + (loopGapPerM * 10.0) * (loopGapPerM * 10.0) + 0.005 * 0.005)
-        let distTol10m = max(maxPrimaryRes, 1.96 * rss)
-        provisionalDistanceTolerance10m = distTol10m
+        var sizes: [Int: (printedMM: Double, measuredMM: [Double])] = [:]
+        for s in phoneLoopState.allSightings where s.sighting.sizeMMMeasured > 0 {
+            let mid = s.sighting.markerID
+            var e = sizes[mid] ?? (s.sighting.sizeMMPrinted, [])
+            e.measuredMM.append(s.sighting.sizeMMMeasured)
+            sizes[mid] = e
+        }
+        inp.scaleErrorEff = GradeModel.scaleErrorEff(sizesByMarker: sizes)
+        inp.rawMarker0GapM = loopClosureGapMeters
+        inp.poseJumpSumM = phoneLoopState.poseJumpSumM
+        inp.walkLengthM = phoneLoopState.walkLengthM
+        inp.limitedTrackingShare = phoneLoopState.limitedTrackingShare
 
-        var band = 3
-        let gVal = gapM ?? 0.0
-        if distTol10m <= 0.05 && gVal <= 0.05 {
-            band = 3
-        } else if distTol10m <= 0.10 && gVal <= 0.12 {
-            band = 2
-        } else if distTol10m <= 0.20 && gVal <= 0.25 {
-            band = 1
-        } else {
-            band = 0
-        }
-
-        var reasons: [String] = [String(format: "distance_tolerance_10m_m=%.3fm", distTol10m)]
-        if !detectedMarkerIDs.contains(0) {
-            band = min(band, 1)
-            reasons.append("cap: no_marker_0 -> C")
-        }
-        if gapM == nil {
-            band = min(band, 1)
-            reasons.append("cap: no_loop_closure -> C")
-        }
-        if primaryResiduals.isEmpty {
-            band = min(band, 1)
-            reasons.append("cap: no_tape_check -> C")
-        }
-        let labels = [3: "A", 2: "B", 1: "C", 0: "fail"]
-        provisionalGrade = labels[band] ?? "C"
-        provisionalReasons = reasons
+        let result = GradeModel.grade(inp)
+        provisionalDistanceTolerance10m = result.distanceTolerance10mM
+        provisionalGrade = result.grade
+        provisionalReasons = result.reasons
     }
 
     private func makeSessionJSONDictionary(status: String, stopReason: String?, failedStream: String?) -> [String: Any] {
@@ -3059,7 +3045,8 @@ extension CaptureSessionRecorder: ARSessionDelegate {
             self.phoneLoopState.updateCameraExcursion(
                 cameraPositionWorld: camPosW,
                 savedIndex: self.savedFrameCount,
-                timestampS: timestampS
+                timestampS: timestampS,
+                trackingNormal: trackingStr == "normal"
             )
 
             // Sample North calibration pairs while at Marker 0 start (spaced >= 0.15 s) (YS-14, Q020)
