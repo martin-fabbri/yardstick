@@ -977,10 +977,7 @@ public struct GuidedCaptureEngine: Sendable {
                 return nil
 
             case .houseWallLookUp:
-                // If the user walks straight back to Marker 0 during look-up, allow transitioning to closing hold
-                if let c0 = confirmedSightings.first(where: { $0.markerID == 0 }) {
-                    return (c0, true, true)
-                }
+                // Seeing Marker 0 no longer ends the look-up step early (device walk 4: it cut the step to 4 s).
                 return nil
 
             case .closingMarker0, .readyToFinish:
@@ -1265,6 +1262,13 @@ public struct GuidedCaptureEngine: Sendable {
                 return ("hold_steady", "Hold steady", true)
             }
 
+            // Look-up step owns the screen: its instruction is never replaced by pace cues (device walk 4, 2026-11-01).
+            if phase == .houseWallLookUp {
+                if lookUpTracker.skyWarningActive {
+                    return ("lookup_sky_warning", "Point at the roof edge, not the sky", false)
+                }
+                return ("lookup_step", "Look up at the roof edge and the trees", true)
+            }
             // Corrections are silent while a hold is counting; outside a hold, check pace & tilt (`YS-73`, `YS-74`)
             if turnRateRadS > ExposureAndStillnessGate.maxTurnRateRadS {
                 return ("pace_turn_slower", "Turn a little slower", false)
@@ -1272,16 +1276,11 @@ public struct GuidedCaptureEngine: Sendable {
             if predictedBlurPx > ExposureAndStillnessGate.maxPredictedBlurPx {
                 return ("pace_hold_steady", "Hold steady", false)
             }
-            if phase == .houseWallLookUp {
-                if lookUpTracker.skyWarningActive {
-                    return ("lookup_sky_warning", "Point at the roof edge, not the sky", false)
-                }
-                return ("lookup_step", "Look up at the roof edge and the trees", true)
-            }
             if pitchTooHighDurationS >= Self.pitchOutOfBandTriggerS {
                 return ("tilt_point_ground", "Point at the ground ahead", false)
             }
-            if pitchTooLowDurationS >= Self.pitchOutOfBandTriggerS {
+            let isMarkerSearchPhase = phase == .openingMarker0 || phase == .markers1To3 || phase == .closingMarker0
+            if pitchTooLowDurationS >= Self.pitchOutOfBandTriggerS && !isMarkerSearchPhase {
                 return ("tilt_lift_phone", "Lift the phone a little", false)
             }
 

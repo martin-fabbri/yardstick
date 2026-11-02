@@ -45,6 +45,27 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     let detectionCIContext = CIContext(options: [.useSoftwareRenderer: false])
     let digestRegistry = PrecomputedDigestRegistry()
     private let stillGateLock = OSAllocatedUnfairLock(initialState: StillCaptureGate())
+
+    /// Field debug log (device walk 4, 2026-11-01): one row per live marker read and why it was or was not used.
+    /// Lives in `Documents/debug/`, outside the capture folder, so the sealed capture and its manifest are unchanged.
+    static let detectionDebugLock = OSAllocatedUnfairLock(initialState: ())
+    static func appendDetectionDebug(captureDir: URL, line: String) {
+        detectionDebugLock.withLock { _ in
+            let debugDir = captureDir.deletingLastPathComponent().appendingPathComponent("debug", isDirectory: true)
+            let url = debugDir.appendingPathComponent(captureDir.lastPathComponent + "-detections.csv")
+            let fm = FileManager.default
+            if !fm.fileExists(atPath: url.path) {
+                try? fm.createDirectory(at: debugDir, withIntermediateDirectories: true)
+                let header = "t,saved_index,event,marker_id,measured_3d,size_mm_measured,size_mm_printed,range_m,horiz_m,viewing_angle_deg,turn_rad_s,blur_px,tracking,gate_reason,angle_ok,size_ok,phase_target,eligible\n"
+                fm.createFile(atPath: url.path, contents: header.data(using: .utf8))
+            }
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile()
+                h.write((line + "\n").data(using: .utf8)!)
+                try? h.close()
+            }
+        }
+    }
     private let coverageGridLock = OSAllocatedUnfairLock(initialState: GroundCoverageGrid())
 
     var assetWriter: AVAssetWriter?
@@ -3267,8 +3288,17 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
                                 if shouldRunArUco {
                                     let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
+                                    if dets2D.isEmpty {
+                                        CaptureWriterEngine.appendDetectionDebug(captureDir: dir, line: String(format: "%.3f,%d,no_marker_2d,,,,,,,,%.3f,%.2f,%@,,,,,", timestampS, sIdx, turnRateRadS, predictedBlurPx, trackingStr))
+                                    }
                                     for d2 in dets2D {
                                         let pSize = sizesSnapshot[d2.markerID] ?? 250.0
+                                        var didMeasure3D = false
+                                        defer {
+                                            if !didMeasure3D {
+                                                CaptureWriterEngine.appendDetectionDebug(captureDir: dir, line: String(format: "%.3f,%d,seen_2d_no_3d,%d,false,,%.1f,,,,%.3f,%.2f,%@,,,,,", timestampS, sIdx, d2.markerID, pSize, turnRateRadS, predictedBlurPx, trackingStr))
+                                            }
+                                        }
                                         if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
                                             markerID: d2.markerID,
                                             cornersUV: d2.cornersUV,
@@ -3286,6 +3316,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                             cameraToWorld: cMat
                                         ) {
                                             rawDetected3D.append(s3D)
+                                            didMeasure3D = true
                                             // Anchor Marker 0 ground plane BEFORE updating ground coverage (`YS-78`)
                                             if s3D.markerID == 0 {
                                                 let mq = simd_quatd(ix: s3D.quaternionXYZW.x, iy: s3D.quaternionXYZW.y, iz: s3D.quaternionXYZW.z, r: s3D.quaternionXYZW.w)
@@ -3316,9 +3347,16 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                                     return s3D.markerID == 0 && !isClosingM0LockedSnapshot
                                                 }
                                             }()
-                                            if (trackingStr == "normal" && verdict.passes && angleOK && sizeOK && isUnlockedPhaseTarget) || forceArUco {
+                                            let isEligible = (trackingStr == "normal" && verdict.passes && angleOK && sizeOK && isUnlockedPhaseTarget) || forceArUco
+                                            if isEligible {
                                                 eligibleSightings.append(s3D)
                                             }
+                                            CaptureWriterEngine.appendDetectionDebug(captureDir: dir, line: String(
+                                                format: "%.3f,%d,seen_3d,%d,true,%.2f,%.1f,%.3f,%.3f,%.1f,%.3f,%.2f,%@,%@,%@,%@,%@,%@",
+                                                timestampS, sIdx, s3D.markerID, s3D.sizeMMMeasured, s3D.sizeMMPrinted, s3D.rangeMeters, rngXZ,
+                                                s3D.viewingAngleDeg, turnRateRadS, predictedBlurPx, trackingStr,
+                                                verdict.reason ?? "pass", angleOK ? "true" : "false", sizeOK ? "true" : "false",
+                                                isUnlockedPhaseTarget ? "true" : "false", isEligible ? "true" : "false"))
                                         }
                                     }
                                 }
@@ -3389,6 +3427,13 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         )
                                         let eligibleIDSet = Set(eligibleSightings.map(\.markerID))
                                         confirmedSightings = jpegConfirmed.filter { eligibleIDSet.contains($0.markerID) }
+                                        CaptureWriterEngine.appendDetectionDebug(captureDir: dir, line: String(
+                                            format: "%.3f,%d,jpeg_confirm,%@,,,,,,,%.3f,%.2f,%@,eligible=%@ confirmed=%@ gate=%@,,,,",
+                                            timestampS, sIdx, eligibleSightings.map { String($0.markerID) }.joined(separator: "|"),
+                                            turnRateRadS, predictedBlurPx, trackingStr,
+                                            eligibleSightings.map { String($0.markerID) }.joined(separator: "|"),
+                                            confirmedSightings.map { String($0.markerID) }.joined(separator: "|"),
+                                            gateDecision.reason ?? "none"))
                                     }
 
                                     // Write the still if it is a periodic still OR if at least one marker was confirmed on the JPEG (`YS-70`)
