@@ -59,7 +59,9 @@ final class GradeModelTests: XCTestCase {
             var inp = GradeModel.Inputs()
             inp.tapeChecks = v.tapes.map { t in
                 let tape = t[1].double
-                return GradeModel.TapeCheck(tapeM: tape, residualM: abs(t[2].double - tape), isHeldOut: t[0].string == "held_out")
+                let u = t.count > 3 ? t[3].double : 0.0
+                return GradeModel.TapeCheck(
+                    tapeM: tape, residualM: abs(t[2].double - tape), isHeldOut: t[0].string == "held_out", tapeUncertaintyM: u)
             }
             inp.scaleErrorEff = v.scale_eff
             inp.rawMarker0GapM = v.gap

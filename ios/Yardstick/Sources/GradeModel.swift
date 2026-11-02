@@ -28,10 +28,18 @@ public enum GradeModel {
         public var tapeM: Double
         public var residualM: Double
         public var isHeldOut: Bool
-        public init(tapeM: Double, residualM: Double, isHeldOut: Bool = false) {
+        /// The tape's own error (YS-86): grass ~0.05 m, along a wall ~0.02 m; 0 = tape treated as exact.
+        public var tapeUncertaintyM: Double
+        public init(tapeM: Double, residualM: Double, isHeldOut: Bool = false, tapeUncertaintyM: Double = 0.0) {
             self.tapeM = tapeM
             self.residualM = residualM
             self.isHeldOut = isHeldOut
+            self.tapeUncertaintyM = tapeUncertaintyM
+        }
+        /// Part of the residual the tape cannot explain: sqrt(max(0, r² − u²)) (`residual_beyond_tape`).
+        public var residualBeyondTapeM: Double {
+            let u = max(0.0, tapeUncertaintyM)
+            return sqrt(max(0.0, residualM * residualM - u * u))
         }
     }
 
@@ -69,7 +77,8 @@ public enum GradeModel {
         var floor = 0.0
         for tc in primaryTapes {
             let tapeM = max(tc.tapeM, 2.0)
-            floor = max(floor, tc.residualM, tc.residualM * max(1.0, r / tapeM))
+            let res = tc.residualBeyondTapeM
+            floor = max(floor, res, res * max(1.0, r / tapeM))
         }
         let rss = sqrt(
             sigmaLidarM * sigmaLidarM
@@ -98,7 +107,7 @@ public enum GradeModel {
 
         var floor10 = 0.0
         for tc in primary {
-            floor10 = max(floor10, tc.residualM * max(1.0, referenceRangeM / max(tc.tapeM, 2.0)))
+            floor10 = max(floor10, tc.residualBeyondTapeM * max(1.0, referenceRangeM / max(tc.tapeM, 2.0)))
         }
         let distTol = tolerance(
             atRangeM: referenceRangeM, primaryTapes: primary, scaleErrorEff: inp.scaleErrorEff,
@@ -147,7 +156,7 @@ public enum GradeModel {
             caps.append("no_tape_check")
         }
         let failedHeldOut = heldOut.filter { tc in
-            tc.residualM > tolerance(
+            tc.residualBeyondTapeM > tolerance(
                 atRangeM: tc.tapeM, primaryTapes: primary, scaleErrorEff: inp.scaleErrorEff,
                 loopGapPerM: loopGapPerM, sigmaTrackingM: sigmaTracking) + 1e-9
         }

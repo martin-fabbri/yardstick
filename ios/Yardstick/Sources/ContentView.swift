@@ -675,6 +675,13 @@ private struct BeforeYouStartSheetView: View {
                             .font(.title3)
                             .foregroundStyle(.secondary)
                     }
+                    Picker("Tape lay", selection: $recorder.tapeSurface) {
+                        ForEach(CaptureSessionRecorder.TapeSurface.allCases, id: \.self) { surface in
+                            Text(surface.label).tag(surface)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .accessibilityLabel("Where the tape lay")
                 }
                 .padding(.vertical, 4)
                 .contentShape(Rectangle())

@@ -223,5 +223,111 @@
   "expected_caps": [
    "marker_0_tilted"
   ]
+ },
+ {
+  "name": "walk6_grass_5cm",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    2.947672,
+    0.05
+   ]
+  ],
+  "scale_eff": 0.004845,
+  "gap": 0.007393,
+  "jumps": [],
+  "walk": 40.0154,
+  "limited": 0.001868,
+  "expected_grade": "B",
+  "expected_distance_m": 0.099975,
+  "expected_caps": []
+ },
+ {
+  "name": "walk7_grass_5cm",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    2.865254,
+    0.05
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.014244,
+  "jumps": [
+   0.10814,
+   0.093554
+  ],
+  "walk": 41.0163,
+  "limited": 0.002588,
+  "expected_grade": "fail",
+  "expected_distance_m": 0.417086,
+  "expected_caps": []
+ },
+ {
+  "name": "walk6_wall_2cm",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    2.947672,
+    0.02
+   ]
+  ],
+  "scale_eff": 0.004845,
+  "gap": 0.007393,
+  "jumps": [],
+  "walk": 40.0154,
+  "limited": 0.001868,
+  "expected_grade": "C",
+  "expected_distance_m": 0.161184,
+  "expected_caps": []
+ },
+ {
+  "name": "tape_explains_all",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.03,
+    0.05
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "A",
+  "expected_distance_m": 0.031672,
+  "expected_caps": []
+ },
+ {
+  "name": "held_out_beyond_uncertainty_still_fails",
+  "tapes": [
+   [
+    "primary",
+    3.0,
+    3.004,
+    0.02
+   ],
+   [
+    "held_out",
+    4.0,
+    4.07,
+    0.05
+   ]
+  ],
+  "scale_eff": 0.0,
+  "gap": 0.01,
+  "jumps": [],
+  "walk": 30.0,
+  "limited": 0.0,
+  "expected_grade": "C",
+  "expected_distance_m": 0.031672,
+  "expected_caps": [
+   "held_out_tape_failed_1"
+  ]
  }
 ]

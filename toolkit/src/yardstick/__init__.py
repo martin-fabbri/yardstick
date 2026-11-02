@@ -16,5 +16,5 @@
 
 __version__ = "0.1.0"
 CONTRACT_VERSION = "yardstick-capture/1"
-GRADING_VERSION = "yardstick-grade/1"
+GRADING_VERSION = "yardstick-grade/2"
 

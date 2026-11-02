@@ -23,7 +23,7 @@
       "type": "string"
     },
     "grading_version": {
-      "const": "yardstick-grade/1"
+      "const": "yardstick-grade/2"
     },
     "marker_scale": {
       "additionalProperties": false,
@@ -128,6 +128,11 @@
             "minItems": 3,
             "type": "array"
           },
+          "residual_beyond_tape_m": {
+            "description": "YS-86: sqrt(max(0, residual^2 - tape_uncertainty^2)); this, not residual_m, sets the tape floor.",
+            "minimum": 0,
+            "type": "number"
+          },
           "residual_m": {
             "minimum": 0,
             "type": "number"
@@ -141,6 +146,12 @@
           },
           "tape_m": {
             "exclusiveMinimum": 0,
+            "type": "number"
+          },
+          "tape_uncertainty_m": {
+            "description": "YS-86: the tape's own error (grass ~0.05 m, along a wall ~0.02 m); 0 or absent = tape treated as exact.",
+            "maximum": 0.2,
+            "minimum": 0,
             "type": "number"
           },
           "tolerance_at_tape_m": {
