@@ -385,23 +385,38 @@ public struct GroundCoverageGrid: Sendable, Equatable {
 
 // MARK: - YS-79: Look-Up & House-Wall Step
 
-/// Tracks the post-markers-1–3 house-wall and roof-edge look-up step (`YS-79`).
+/// Tracks the post-markers-1–3 look-up step (`YS-79`) as two confirmed stages: the roof edge, then the trees.
 ///
-/// Coaches `"Look up at the roof edge and the trees"` for at least `3.0 s` cumulative at a tilt of
-/// `+15°` to `+35°` with valid depth. Above `+45°` with no depth, coaches `"Point at the roof edge, not the sky"`.
-/// Provides a one-tap `Skip` recorded in `guidance.csv`.
+/// Device walks 7–8 (2026-11-01): one combined "roof edge and the trees" step with a `+15°..+35°` window, no live
+/// tilt feedback and a points-above-2 m input that one call path always sent as 0 never completed. Each stage now
+/// completes after `3.0 s` cumulative with valid LiDAR depth inside its tilt window, and says so.
+/// Above `+45°` with no depth, coaches "not the sky". `Skip` skips the current stage only.
 public struct HouseWallLookUpTracker: Sendable, Equatable {
-    public static let minTargetPitchDeg: Double = 15.0
-    public static let maxTargetPitchDeg: Double = 35.0
+    public enum Stage: String, Sendable, Equatable {
+        case roof
+        case trees
+    }
+
+    public static let roofMinPitchDeg: Double = 10.0
+    public static let roofMaxPitchDeg: Double = 55.0
+    public static let treesMinPitchDeg: Double = 20.0
+    public static let treesMaxPitchDeg: Double = 85.0
     public static let skyWarningPitchDeg: Double = 45.0
     public static let requiredDurationS: Double = 3.0
 
+    public private(set) var stage: Stage = .roof
+    public private(set) var roofCompleted: Bool = false
+    public private(set) var roofSkipped: Bool = false
     public private(set) var accumulatedValidDurationS: Double = 0.0
     public private(set) var isCompleted: Bool = false
     public private(set) var isSkipped: Bool = false
     public private(set) var elevatedPointsAbove2mCount: Int = 0
     public private(set) var insufficientFeaturesLossCount: Int = 0
     public private(set) var skyWarningActive: Bool = false
+    /// True when the latest pitch is below the current stage's window (drives "Tilt up").
+    public private(set) var isBelowTargetTilt: Bool = true
+    /// Set on the update that completed a stage; the engine turns it into a "Got the roof" / "Got the trees" banner.
+    public private(set) var stageJustCompleted: Stage? = nil
 
     public init() {}
 
@@ -414,7 +429,9 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
         return min(1.0, max(0.0, accumulatedValidDurationS / Self.requiredDurationS))
     }
 
-    /// Update the look-up step for a frame with `dt`, `pitchDeg`, `hasValidDepth`, `elevatedPointsAbove2m`, and `trackingReason`.
+    private var minPitchDeg: Double { stage == .roof ? Self.roofMinPitchDeg : Self.treesMinPitchDeg }
+    private var maxPitchDeg: Double { stage == .roof ? Self.roofMaxPitchDeg : Self.treesMaxPitchDeg }
+
     public mutating func update(
         dt: Double,
         pitchDeg: Double,
@@ -423,6 +440,7 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
         trackingState: String,
         trackingReason: String
     ) {
+        stageJustCompleted = nil
         elevatedPointsAbove2mCount += max(0, elevatedPointsAbove2m)
         if trackingState == "limited" && trackingReason == "insufficient_features" {
             insufficientFeaturesLossCount += 1
@@ -432,6 +450,7 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
             return
         }
 
+        isBelowTargetTilt = pitchDeg < minPitchDeg
         if pitchDeg > Self.skyWarningPitchDeg && !hasValidDepth {
             skyWarningActive = true
             return
@@ -440,20 +459,39 @@ public struct HouseWallLookUpTracker: Sendable, Equatable {
 
         if trackingState == "normal",
            hasValidDepth,
-           pitchDeg >= Self.minTargetPitchDeg,
-           pitchDeg <= Self.maxTargetPitchDeg,
+           pitchDeg >= minPitchDeg,
+           pitchDeg <= maxPitchDeg,
            dt > 0.0 {
             accumulatedValidDurationS += min(dt, 0.25)
-            if accumulatedValidDurationS >= Self.requiredDurationS && elevatedPointsAbove2mCount > 0 {
-                isCompleted = true
+            if accumulatedValidDurationS >= Self.requiredDurationS {
+                completeCurrentStage(skipped: false)
             }
         }
     }
 
     public mutating func skip() {
-        guard !isCompleted else { return }
-        isSkipped = true
-        skyWarningActive = false
+        guard !isDone else { return }
+        completeCurrentStage(skipped: true)
+    }
+
+    private mutating func completeCurrentStage(skipped: Bool) {
+        switch stage {
+        case .roof:
+            roofCompleted = !skipped
+            roofSkipped = skipped
+            stageJustCompleted = skipped ? nil : .roof
+            stage = .trees
+            accumulatedValidDurationS = 0.0
+            isBelowTargetTilt = true
+        case .trees:
+            stageJustCompleted = skipped ? nil : .trees
+            if skipped {
+                isSkipped = true
+            } else {
+                isCompleted = true
+            }
+            skyWarningActive = false
+        }
     }
 }
 
@@ -813,8 +851,8 @@ public struct GuidedCaptureEngine: Sendable {
             lookUpTracker = HouseWallLookUpTracker()
             phase = .houseWallLookUp
             commitInstruction(
-                key: "lookup_step",
-                text: "Look up at the roof edge and the trees",
+                key: "lookup_roof_tilt_up",
+                text: "Tilt up to the roof edge",
                 isCorrection: false,
                 at: timestampS,
                 forceImmediate: true
@@ -895,7 +933,15 @@ public struct GuidedCaptureEngine: Sendable {
 
     public mutating func skipLookUpStep(at timestampS: Double) {
         lookUpTracker.skip()
-        if phase == .houseWallLookUp {
+        if phase == .houseWallLookUp && !lookUpTracker.isDone {
+            commitInstruction(
+                key: "lookup_trees_tilt_up",
+                text: "Now tilt up to the tree branches",
+                isCorrection: false,
+                at: timestampS,
+                forceImmediate: true
+            )
+        } else if phase == .houseWallLookUp {
             phase = .closingMarker0
             commitInstruction(
                 key: "return_marker_0",
@@ -1198,6 +1244,11 @@ public struct GuidedCaptureEngine: Sendable {
                 trackingState: trackingState,
                 trackingReason: trackingReason
             )
+            if let done = lookUpTracker.stageJustCompleted {
+                justLockedKey = done == .roof ? "lookup_got_roof" : "lookup_got_trees"
+                justLockedText = done == .roof ? "Got the roof" : "Got the trees"
+                justLockedBannerUntilS = timestampS + Self.minInstructionDwellS
+            }
             if lookUpTracker.isDone {
                 phase = .closingMarker0
             }
@@ -1267,10 +1318,20 @@ public struct GuidedCaptureEngine: Sendable {
 
             // Look-up step owns the screen: its instruction is never replaced by pace cues (device walk 4, 2026-11-01).
             if phase == .houseWallLookUp {
+                let isRoof = lookUpTracker.stage == .roof
                 if lookUpTracker.skyWarningActive {
-                    return ("lookup_sky_warning", "Point at the roof edge, not the sky", false)
+                    return isRoof
+                        ? ("lookup_sky_warning", "Too high. Aim at the roof edge", false)
+                        : ("lookup_sky_warning_trees", "Too high. Aim at the branches", false)
                 }
-                return ("lookup_step", "Look up at the roof edge and the trees", true)
+                if lookUpTracker.isBelowTargetTilt {
+                    return isRoof
+                        ? ("lookup_roof_tilt_up", "Tilt up to the roof edge", true)
+                        : ("lookup_trees_tilt_up", "Now tilt up to the tree branches", true)
+                }
+                return isRoof
+                    ? ("lookup_roof_hold", "Hold on the roof edge", false)
+                    : ("lookup_trees_hold", "Hold on the branches", false)
             }
             // Corrections are silent while a hold is counting; outside a hold, check pace & tilt (`YS-73`, `YS-74`)
             if turnRateRadS > ExposureAndStillnessGate.maxTurnRateRadS {
@@ -1297,7 +1358,9 @@ public struct GuidedCaptureEngine: Sendable {
                 }
                 return ("look_for_markers", "Look around for your markers", true)
             case .houseWallLookUp:
-                return ("lookup_step", "Look up at the roof edge and the trees", true)
+                return lookUpTracker.stage == .roof
+                    ? ("lookup_roof_tilt_up", "Tilt up to the roof edge", true)
+                    : ("lookup_trees_tilt_up", "Now tilt up to the tree branches", true)
             case .closingMarker0:
                 return ("return_marker_0", "Head back to marker 0", true)
             case .readyToFinish:
@@ -1318,6 +1381,7 @@ public struct GuidedCaptureEngine: Sendable {
                 || candKey == "all_done_finish"
                 || candKey == "finish_loop_not_closed"
                 || candKey.hasPrefix("locked_marker_")
+                || candKey.hasPrefix("lookup_got_")
                 || phaseChangedThisStep
                 || didLockMarkerThisStep
                 || (candKey == "hold_steady" && didStartHoldThisStep && !activeInstructionIsCorrection)
@@ -1551,10 +1615,20 @@ public enum GuidedVoiceCatalog: Sendable {
             return "Move the phone more slowly."
         case "dark_exposure":
             return "It's getting dark. Hold each marker longer."
-        case "lookup_step":
-            return "Now look up at the roof edge, then the trees."
+        case "lookup_step", "lookup_roof_tilt_up":
+            return "Now tilt up to the roof edge."
+        case "lookup_trees_tilt_up":
+            return "Now tilt up to the tree branches."
+        case "lookup_roof_hold", "lookup_trees_hold":
+            return nil
+        case "lookup_got_roof":
+            return "Got the roof."
+        case "lookup_got_trees":
+            return "Got the trees."
         case "lookup_sky_warning":
-            return "Point at the roof edge, not the sky."
+            return "Too high. Aim at the roof edge."
+        case "lookup_sky_warning_trees":
+            return "Too high. Aim at the branches."
         case "return_marker_0":
             return "That's all of them. Head back to marker zero."
         case "all_done_finish":

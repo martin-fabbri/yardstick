@@ -568,7 +568,9 @@ final class CaptureReplayTests: XCTestCase {
 
         // After Markers 1–3 are locked, phase transitions to `.houseWallLookUp` (YS-79)
         XCTAssertEqual(engine.phase, .houseWallLookUp)
-        engine.skipLookUpStep(at: t + 0.5)
+        engine.skipLookUpStep(at: t + 0.4)  // skips the roof stage
+        XCTAssertEqual(engine.phase, .houseWallLookUp)
+        engine.skipLookUpStep(at: t + 0.5)  // skips the trees stage
         XCTAssertEqual(engine.phase, .closingMarker0)
         XCTAssertEqual(engine.activeInstruction, "Head back to marker 0")
         XCTAssertFalse(engine.isFinishAvailable(unifiedLoopClosed: false))
@@ -776,26 +778,33 @@ final class CaptureReplayTests: XCTestCase {
         XCTAssertTrue(tracker.skyWarningActive)
         XCTAssertEqual(tracker.accumulatedValidDurationS, 0.0, accuracy: 1e-6)
 
-        // 2. Tilt within +15°..+35° (+24°) with valid depth and elevated points > 2 m for 20 x 0.20 s = 4.0 s -> completes!
+        // 2. Roof stage: +15° (inside roof 10–55°, below trees 20°) with valid depth for 4.0 s -> roof completes, step moves to trees
         for _ in 0..<20 {
-            tracker.update(
-                dt: 0.20,
-                pitchDeg: 24.0,
-                hasValidDepth: true,
-                elevatedPointsAbove2m: 14,
-                trackingState: "normal",
-                trackingReason: ""
-            )
+            tracker.update(dt: 0.20, pitchDeg: 15.0, hasValidDepth: true, elevatedPointsAbove2m: 14, trackingState: "normal", trackingReason: "")
+        }
+        XCTAssertTrue(tracker.roofCompleted, "YS-79: >= 3.0 s on the roof edge with valid depth completes the roof stage")
+        XCTAssertEqual(tracker.stage, .trees)
+        XCTAssertFalse(tracker.isDone)
+
+        // 3. Trees stage: +5° is below the window -> "tilt up"; +40° for 4.0 s -> trees complete, step done
+        tracker.update(dt: 0.20, pitchDeg: 5.0, hasValidDepth: true, elevatedPointsAbove2m: 0, trackingState: "normal", trackingReason: "")
+        XCTAssertTrue(tracker.isBelowTargetTilt)
+        XCTAssertEqual(tracker.accumulatedValidDurationS, 0.0, accuracy: 1e-6)
+        for _ in 0..<20 {
+            tracker.update(dt: 0.20, pitchDeg: 40.0, hasValidDepth: true, elevatedPointsAbove2m: 0, trackingState: "normal", trackingReason: "")
         }
         XCTAssertFalse(tracker.skyWarningActive)
-        XCTAssertTrue(tracker.isCompleted, "YS-79: >= 3.0 s of +24° tilt with valid depth must complete Look-Up step")
+        XCTAssertTrue(tracker.isCompleted, "YS-79: roof then trees must complete the look-up step")
         XCTAssertTrue(tracker.isDone)
-        XCTAssertGreaterThan(tracker.elevatedPointsAbove2mCount, 0, "YS-79: Points > 2 m above ground must be recorded")
+        XCTAssertGreaterThan(tracker.elevatedPointsAbove2mCount, 0)
         XCTAssertEqual(tracker.insufficientFeaturesLossCount, 0, "YS-79: 0 tracking losses for insufficient features")
 
         // 3. Verify GuidedCaptureEngine one-tap Skip transitions to .closingMarker0 and formats guidance.csv row
         var engine = GuidedCaptureEngine(requireLookUpStep: true)
         engine.skipLookUpStep(at: 50.0)
+        XCTAssertTrue(engine.lookUpTracker.roofSkipped, "YS-79: first Skip skips the roof stage only")
+        XCTAssertFalse(engine.lookUpTracker.isSkipped)
+        engine.skipLookUpStep(at: 51.0)
         XCTAssertTrue(engine.lookUpTracker.isSkipped)
         let skipRow = ExposureAndStillnessGate.formatGuidanceCSVRow(
             timestampS: 50.0,
