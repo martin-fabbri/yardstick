@@ -1,0 +1,335 @@
+{
+  "$comment": "Apache-2.0 \u2014 Copyright 2026 Martin Fabbri. Yardstick Capture Contract v1 (yardstick-capture/1) \u2014 Visit Plan Echo (YS-92).",
+  "$id": "https://github.com/martin-fabbri/yardstick/contract/visit.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "contract": {
+      "const": "yardstick-capture/1"
+    },
+    "live_warnings": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledged_at_t_s": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "expected_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "measured_m": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "reading_id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "tolerance_m": {
+            "exclusiveMinimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "reading_id",
+          "measured_m",
+          "expected_m",
+          "tolerance_m",
+          "acknowledged_at_t_s"
+        ],
+        "type": "object"
+      },
+      "type": "array"
+    },
+    "markers_placed": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "as_planned": {
+            "enum": [
+              "yes",
+              "moved",
+              "missing"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "maximum": 5,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "measured_yard_xyz_m": {
+            "oneOf": [
+              {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "note": {
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "origin_anchor_a",
+              "anchor_b",
+              "zone",
+              "front_fallback"
+            ],
+            "type": "string"
+          },
+          "sighted": {
+            "type": "boolean"
+          },
+          "sightings_count": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "sighted",
+          "sightings_count",
+          "as_planned",
+          "measured_yard_xyz_m"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "must_capture": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "keyframe_file": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "enum": [
+              "anchor_corner",
+              "wall",
+              "eave",
+              "zone_coverage",
+              "passage",
+              "tag"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "saved_index": {
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "enum": [
+              "done",
+              "skipped"
+            ],
+            "type": "string"
+          },
+          "t_s": {
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "status"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "plan_id": {
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "plan_sha256": {
+      "pattern": "^[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "records": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "assumed_accuracy": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "by": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "unit": {
+                    "enum": [
+                      "ft",
+                      "m",
+                      "deg"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {
+                    "minimum": 0,
+                    "type": "number"
+                  },
+                  "why": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "value",
+                  "unit",
+                  "by",
+                  "why"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "layer": {
+            "enum": [
+              "parcel",
+              "building_footprints",
+              "zoning",
+              "aerial_imagery"
+            ],
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "record_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "document": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "issuer": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "query": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "service_url": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "issuer",
+                  "service_url",
+                  "query"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stated_accuracy": {
+            "oneOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "unit": {
+                    "enum": [
+                      "ft",
+                      "m",
+                      "deg"
+                    ],
+                    "type": "string"
+                  },
+                  "value": {
+                    "minimum": 0,
+                    "type": "number"
+                  }
+                },
+                "required": [
+                  "value",
+                  "unit"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "enum": [
+              "available",
+              "not_available"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "layer",
+          "status",
+          "source",
+          "record_date",
+          "stated_accuracy",
+          "assumed_accuracy"
+        ],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    }
+  },
+  "required": [
+    "contract",
+    "plan_id",
+    "plan_sha256",
+    "records",
+    "markers_placed",
+    "must_capture",
+    "live_warnings"
+  ],
+  "title": "Yardstick Level 2 Visit Plan Echo",
+  "type": "object"
+}
