@@ -525,6 +525,7 @@ private struct BeforeYouStartSheetView: View {
     @State private var preWalkTapeInput: String = ""
     @State private var customPrintSizeCMInput: String = "18.0"
     @State private var showPrintCustomSizeField: Bool = false
+    @FocusState private var isTapeFieldFocused: Bool
 
     private var isSimulatorPreviewAllowed: Bool {
         ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--ui-test-screen=") }
@@ -654,36 +655,49 @@ private struct BeforeYouStartSheetView: View {
                 }
                 .padding(.vertical, 4)
 
-                LabeledContent {
+                VStack(alignment: .leading, spacing: 8) {
                     HStack(spacing: 6) {
-                        TextField("4.21", text: $preWalkTapeInput)
+                        Image(systemName: (recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? "checkmark.circle.fill" : "circle")
+                            .foregroundStyle((recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? .green : .secondary)
+                        Text("Tape measurement")
+                    }
+                    Text("Measure from the centre of marker 0 to the centre of marker 1.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    HStack(spacing: 8) {
+                        TextField("Metres, for example 3.00", text: $preWalkTapeInput)
                             .keyboardType(.decimalPad)
-                            .multilineTextAlignment(.trailing)
-                            .frame(maxWidth: 90)
+                            .focused($isTapeFieldFocused)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.title3)
+                            .accessibilityLabel("Tape measurement in metres")
                             .onChange(of: preWalkTapeInput) { _, newValue in
-                                if let val = Double(newValue), val > 0 {
+                                let normalized = newValue
+                                    .trimmingCharacters(in: .whitespaces)
+                                    .replacingOccurrences(of: ",", with: ".")
+                                if let val = Double(normalized), val > 0 {
                                     recorder.setPreWalkTapeMeters0To1(val)
-                                } else if newValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                                } else if normalized.isEmpty {
                                     recorder.setPreWalkTapeMeters0To1(nil)
                                 }
                             }
                         Text("m")
-                            .foregroundStyle(.secondary)
-                    }
-                } label: {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Image(systemName: (recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? "checkmark.circle.fill" : "circle")
-                                .foregroundStyle((recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? .green : .secondary)
-                            Text("Tape measurement")
-                        }
-                        Text("Measure from the centre of marker 0 to the centre of marker 1.")
-                            .font(.footnote)
+                            .font(.title3)
                             .foregroundStyle(.secondary)
                     }
                 }
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+                .onTapGesture { isTapeFieldFocused = true }
             } footer: {
                 Text("Stops you: too dark, no space, too hot.")
+            }
+        }
+        .scrollDismissesKeyboard(.interactively)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Done") { isTapeFieldFocused = false }
             }
         }
     }
