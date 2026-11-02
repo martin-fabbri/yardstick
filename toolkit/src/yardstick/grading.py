@@ -54,7 +54,17 @@ def recompute_tape_check(tc: dict[str, Any]) -> dict[str, Any]:
     out["phone_measured_m"] = phone_measured
     out["phone_residual_m"] = phone_residual
     out["phone_mismatch"] = phone_mismatch
+    # YS-86: the tape has its own error (grass ~5 cm, along a wall ~2 cm). Only the part of the residual the tape
+    # cannot explain counts against the phone; independent errors combine in quadrature.
+    u_m = max(0.0, float(tc.get("tape_uncertainty_m", 0.0)))
+    out["tape_uncertainty_m"] = u_m
+    out["residual_beyond_tape_m"] = residual_beyond_tape(residual_m, u_m)
     return out
+
+
+def residual_beyond_tape(residual_m: float, tape_uncertainty_m: float) -> float:
+    """Part of a tape residual not explained by the tape's own error: sqrt(max(0, r^2 - u^2)) (YS-86)."""
+    return math.sqrt(max(0.0, residual_m * residual_m - tape_uncertainty_m * tape_uncertainty_m))
 
 
 def compute_tolerance_at_range(
@@ -69,7 +79,7 @@ def compute_tolerance_at_range(
     primary_floor = 0.0
     for tc in primary_tape_checks:
         rtc = recompute_tape_check(tc) if "point_a_world_m" in tc else tc
-        res_m = float(rtc["residual_m"])
+        res_m = residual_beyond_tape(float(rtc["residual_m"]), float(rtc.get("tape_uncertainty_m", 0.0)))
         tape_m = max(float(rtc["tape_m"]), 2.0)
         scaled = res_m * max(1.0, float(r_m) / tape_m)
         primary_floor = max(primary_floor, res_m, scaled)
@@ -128,7 +138,7 @@ def compute_grade_and_tolerances(
 
     primary_floor_10m = 0.0
     for tc in primary_tapes:
-        res_m = float(tc["residual_m"])
+        res_m = float(tc["residual_beyond_tape_m"])
         tape_m = max(float(tc["tape_m"]), 2.0)
         primary_floor_10m = max(primary_floor_10m, res_m * max(1.0, REFERENCE_RANGE_M / tape_m))
 
@@ -182,8 +192,10 @@ def compute_grade_and_tolerances(
                 "tape_m": round(tape_m, 6),
                 "measured_m": round(measured_m, 6),
                 "residual_m": round(residual_m, 6),
+                "tape_uncertainty_m": round(float(tc["tape_uncertainty_m"]), 6),
+                "residual_beyond_tape_m": round(float(tc["residual_beyond_tape_m"]), 6),
                 "tolerance_at_tape_m": round(tol_at_tape, 6),
-                "within_tolerance": bool(residual_m <= tol_at_tape + 1e-9),
+                "within_tolerance": bool(float(tc["residual_beyond_tape_m"]) <= tol_at_tape + 1e-9),
             }
         )
 
@@ -201,6 +213,12 @@ def compute_grade_and_tolerances(
 
     if primary_tapes:
         reasons.append(f"max_primary_tape_residual_m={max_primary_residual_m:.4f}m")
+        for tc in primary_tapes:
+            if float(tc["tape_uncertainty_m"]) > 0.0:
+                reasons.append(
+                    f"tape_uncertainty_m={float(tc['tape_uncertainty_m']):.3f}m -> residual_beyond_tape_m="
+                    f"{float(tc['residual_beyond_tape_m']):.4f}m (id={tc['id']})"
+                )
     else:
         reasons.append("primary_tape_checks=0")
 

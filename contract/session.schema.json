@@ -459,6 +459,12 @@
           "tape_m": {
             "exclusiveMinimum": 0,
             "type": "number"
+          },
+          "tape_uncertainty_m": {
+            "description": "YS-86: the tape's own error (grass ~0.05 m, along a wall ~0.02 m); 0 or absent = tape treated as exact.",
+            "maximum": 0.2,
+            "minimum": 0,
+            "type": "number"
           }
         },
         "required": [

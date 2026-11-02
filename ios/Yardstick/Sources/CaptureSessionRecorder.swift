@@ -987,6 +987,23 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return probe
     }
 
+    /// Where the tape lay (YS-86): on grass it bows and twists (~5 cm, Martin's field number); along a wall it stays
+    /// straight (~2 cm). Recorded per tape check as `tape_uncertainty_m`; the grade discounts only that much.
+    public enum TapeSurface: String, CaseIterable, Sendable {
+        case grass, wall
+        public var uncertaintyM: Double { self == .grass ? 0.05 : 0.02 }
+        public var label: String { self == .grass ? "On grass (±5 cm)" : "Along a wall (±2 cm)" }
+    }
+    private static let tapeSurfaceDefaultsKey = "io.buildnexus.yardstick.tapeSurface.v1"
+    @Published public var tapeSurface: TapeSurface =
+        TapeSurface(rawValue: UserDefaults.standard.string(forKey: CaptureSessionRecorder.tapeSurfaceDefaultsKey) ?? "") ?? .grass {
+        didSet {
+            UserDefaults.standard.set(tapeSurface.rawValue, forKey: Self.tapeSurfaceDefaultsKey)
+            for i in tapeChecks.indices { tapeChecks[i]["tape_uncertainty_m"] = tapeSurface.uncertaintyM }
+            updateProvisionalGrade()
+        }
+    }
+
     /// Set the pre-walk centre-to-centre tape distance (`Marker 0 -> Marker 1`, `YS-77`) and synchronize `session.json["tape_checks"]`
     /// once both Marker 0 and Marker 1 are locked.
     public func setPreWalkTapeMeters0To1(_ meters: Double?) {
@@ -997,7 +1014,8 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     /// without requiring any mid-walk typing or writing an operator tap event (`events.csv`).
     public func syncMarker0To1PreWalkTapeCheckIfNeeded() {
         guard let autoEntry = guidedEngine.generatedMarker0To1TapeCheck else { return }
-        let dict = autoEntry.toJSONDictionary()
+        var dict = autoEntry.toJSONDictionary()
+        dict["tape_uncertainty_m"] = tapeSurface.uncertaintyM
         let summaryStr = String(
             format: "Marker 0→1 (%@): tape %.2f m · phone %.2f m (diff %.1f cm)",
             autoEntry.role, autoEntry.tapeM, autoEntry.measuredM, autoEntry.residualM * 100.0
@@ -1598,6 +1616,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
             "tape_m": tapeMeters,
             "measured_m": measuredM,
             "residual_m": residualM,
+            "tape_uncertainty_m": tapeSurface.uncertaintyM,
         ]
         tapeChecks.append(entry)
         tapeCheckCount = tapeChecks.count
@@ -1971,7 +1990,8 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         inp.tapeChecks = tapeChecks.compactMap { item -> GradeModel.TapeCheck? in
             guard let tape = item["tape_m"] as? Double, let res = item["residual_m"] as? Double else { return nil }
             let role = (item["role"] as? String) ?? "primary"
-            return GradeModel.TapeCheck(tapeM: tape, residualM: res, isHeldOut: role == "held_out")
+            let u = (item["tape_uncertainty_m"] as? Double) ?? 0.0
+            return GradeModel.TapeCheck(tapeM: tape, residualM: res, isHeldOut: role == "held_out", tapeUncertaintyM: u)
         }
         var sizes: [Int: (printedMM: Double, measuredMM: [Double])] = [:]
         for s in phoneLoopState.allSightings where s.sighting.sizeMMMeasured > 0 {

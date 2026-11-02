@@ -1132,8 +1132,9 @@ def test_grade_parity_vectors() -> None:
     assert {"walk6_real", "walk7_real"} <= names
     for v in vectors:
         tcs = [
-            {"id": k, "role": r, "tape_m": t, "point_a_world_m": [0, 0, 0], "point_b_world_m": [m, 0, 0]}
-            for k, (r, t, m) in enumerate(v["tapes"])
+            {"id": k, "role": e[0], "tape_m": e[1], "point_a_world_m": [0, 0, 0], "point_b_world_m": [e[2], 0, 0],
+             "tape_uncertainty_m": e[3] if len(e) > 3 else 0.0}
+            for k, e in enumerate(v["tapes"])
         ]
         fi = {
             "method": "marker",
