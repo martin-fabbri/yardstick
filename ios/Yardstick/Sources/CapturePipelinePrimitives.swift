@@ -470,8 +470,8 @@ public enum DiskSpaceMonitor {
 /// - Emits `"Turn a little slower"` or `"Hold steady"` before blur degrades a marker sighting.
 /// - Flags any marker whose median measured size across `>= 3` sightings deviates by `> 3%` from its printed size.
 public enum ExposureAndStillnessGate {
-    public static let maxPredictedBlurPx: Double = 1.5
-    public static let maxTurnRateRadS: Double = 0.15
+    public static let maxPredictedBlurPx: Double = 4.0  // was 1.5; device walk 3 (2026-11-01): handheld holds never stayed under it
+    public static let maxTurnRateRadS: Double = 0.35  // was 0.15 (8.6°/s); ~20°/s; size check and 3-still spread still guard accuracy
     public static let minMarkerDistanceM: Double = 0.50
     public static let maxMarkerDistanceM: Double = 1.50
     public static let maxMarkerSizeDeviationRatio: Double = 0.03
