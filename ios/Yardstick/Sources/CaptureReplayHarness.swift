@@ -140,6 +140,11 @@ public struct PhoneLoopRuleState: Sendable {
 
     public var allSightings: [ReplayMarkerSighting] = []
     public var cameraPositionsByIndex: [Int: SIMD3<Double>] = [:]
+    /// Timestamp of every saved frame's pose, for the YS-32 pose-jump sum (same input as the toolkit's `poses.csv`).
+    public var cameraTimestampsByIndex: [Int: Double] = [:]
+    /// Pose jumps found by `PoseJumpDetector` (YS-32); their sum floors the loop gap, as in the toolkit (YS-88).
+    public private(set) var detectedPoseJumps: [DetectedPoseJump] = []
+    private var poseJumpCacheFrameCount: Int = -1
     public var walkStartTimeS: Double? = nil
     public var walkEndTimeS: Double? = nil
     public var lastOperatorTapTimeS: Double? = nil
@@ -155,6 +160,7 @@ public struct PhoneLoopRuleState: Sendable {
     ) {
         if let sIdx = savedIndex {
             cameraPositionsByIndex[sIdx] = camPosW
+            if let t = timestampS { cameraTimestampsByIndex[sIdx] = t }
         }
         if let t = timestampS {
             if walkStartTimeS == nil { walkStartTimeS = t }
@@ -179,6 +185,12 @@ public struct PhoneLoopRuleState: Sendable {
         if loopClosedEventTimeS == nil || timestampS > loopClosedEventTimeS! {
             loopClosedEventTimeS = timestampS
         }
+        evaluateUnifiedLoopClosure()
+    }
+
+    /// Final loop gap at the end of the walk: a full pose-jump pass over every frame, as the toolkit does (YS-88).
+    public mutating func finalizeLoopGapForSeal() {
+        _ = currentPoseJumpSumM(force: true)
         evaluateUnifiedLoopClosure()
     }
 
@@ -287,12 +299,28 @@ public struct PhoneLoopRuleState: Sendable {
         )
     }
 
+    /// Sum of pose jumps over every saved frame with a timestamp (recomputed only when new frames arrived).
+    /// Recomputes at most every 60 new frames (about 2 s) during the walk; `force` runs a full pass (the seal).
+    public mutating func currentPoseJumpSumM(force: Bool = false) -> Double {
+        let count = cameraTimestampsByIndex.count
+        if count != poseJumpCacheFrameCount && (force || poseJumpCacheFrameCount < 0 || count - poseJumpCacheFrameCount >= 60) {
+            let idx = cameraTimestampsByIndex.keys.sorted()
+            detectedPoseJumps = PoseJumpDetector.detect(
+                timestamps: idx.map { cameraTimestampsByIndex[$0]! },
+                positions: idx.map { cameraPositionsByIndex[$0] ?? .zero },
+                savedIndices: idx
+            )
+            poseJumpCacheFrameCount = count
+        }
+        return detectedPoseJumps.reduce(0.0) { $0 + $1.jumpM }
+    }
+
     /// Evaluate the unified `YS-71` loop-closure rule (`toolkit/src/yardstick/geometry.py:512–598`).
     public mutating func evaluateUnifiedLoopClosure(
         confirmedMarker0StillIndices: Set<Int>? = nil,
         requireAllFourMarkersOrEndEarly: Bool = true,
         maxClosingDistanceM: Double = 1.50,
-        poseJumpSumM: Double = 0.0
+        poseJumpSumM: Double? = nil
     ) {
         let passesByMarker = Self.clusterMarkerPasses(
             sightings: allSightings,
@@ -403,7 +431,9 @@ public struct PhoneLoopRuleState: Sendable {
         let pFirst = Self.medianPosition3D(firstPass.map(\.sighting.positionWorld))
         let pLast = Self.medianPosition3D(validClosingRows.map(\.sighting.positionWorld))
         let rawGap = simd_length(pLast - pFirst)
-        let effGap = max(rawGap, poseJumpSumM)
+        // YS-32 / YS-88: the gap is never smaller than the sum of pose jumps, exactly as the toolkit computes it.
+        let jumpSum = poseJumpSumM ?? currentPoseJumpSumM()
+        let effGap = max(rawGap, jumpSum)
 
         unifiedLoopClosed = true
         unifiedLoopClosureGapMeters = effGap
