@@ -26,9 +26,9 @@ Yardstick is divided into two decoupled levels connected by an immutable, hash-s
 
 1. **Level 1 — The Recording (`<capture-id>/`, written on the iPhone):**
    - Records raw sensor measurements on a single monotonic clock (`t = 0.0` at first delivered camera frame) without interpretation or silent coordinate flips.
-   - Detects printed ArUco markers (`DICT_5X5_250`, IDs `0–5`) live at 5–10 Hz, logs interactive raycast tape checks, computes a live loop-closure gap and provisional grade before leaving the yard, seals all files in `manifest.json` with SHA-256 hashes, and shares `<capture-id>.zip` (ZIP store mode, compression level 0) via AirDrop.
+   - Detects printed ArUco markers (`DICT_5X5_250`, IDs `0–7`) live at 5–10 Hz, records camera-space marker poses (`markers.csv`) and one-frame neighbour pair measurements (`pairs.csv`), logs interactive or pre-walk tape checks, computes a live loop-closure gap and provisional grade before leaving the yard, seals all files in `manifest.json` with SHA-256 hashes, and shares `<capture-id>.zip` (ZIP store mode, compression level 0) via AirDrop.
 2. **Level 2 — The Standard Capture (`<capture-id>/standard/`, built on the laptop):**
-   - Verifies Level 1 integrity (`yardstick validate`), fits the yard ground plane (`z = 0`) and Marker 0 origin (`yardstick convert`), evaluates independent marker scale error and the closed-form 95% measurement tolerance (`yardstick grade`), and writes the standard geometry and metadata files consumed by LotFit.
+   - Verifies Level 1 integrity (`yardstick validate`), fits the yard ground plane (`z = 0`) and Marker 0 origin (`yardstick convert`), solves the drift-free SE(2)+$z$ marker layout graph from one-frame neighbour pairs with printed-size scale correction (`YS-115`), warps the VIO trajectory and point cloud to the solved marker layout while keeping the raw unwarped `trajectory.raw.json` and `cloud.raw.ply` alongside `trajectory.json` and `cloud.ply`, evaluates independent marker scale error and the closed-form 95% measurement tolerance (`yardstick grade`), and writes the standard geometry and metadata files consumed by LotFit.
 
 ---
 
@@ -57,8 +57,8 @@ Yardstick is divided into two decoupled levels connected by an immutable, hash-s
     $$\text{range\_m} = \sqrt{x_{\text{cam}}^2 + y_{\text{cam}}^2 + z_{\text{cam}}^2}$$
 - **Quaternions:** All quaternions are unit Hamilton quaternions representing the rotation from camera local axes (or marker local axes) to the target world frame, serialized in order `qx, qy, qz, qw` where $q = q_w + q_x i + q_y j + q_z k$.
 
-### 2.3 Printed Marker Coordinate Frame (`YS-30`, `YS-31`, `MARKERS.md`)
-- Dictionary: `DICT_5X5_250`. Single markers: IDs `0–5` (`250.0 mm` on tabloid or `180.0 mm` on letter). Optional ChArUco board: $6 \times 9$ squares, $40\text{ mm}$ squares, $30\text{ mm}$ markers, IDs `100–126` (detected on the laptop).
+### 2.3 Printed Marker Coordinate Frame (`YS-30`, `YS-31`, `YS-115`, `MARKERS.md`)
+- Dictionary: `DICT_5X5_250`. Single markers: IDs `0–7` (`250.0 mm` on tabloid, `180.0 mm` on letter, or `160.0 mm`). Optional ChArUco board: $6 \times 9$ squares, $40\text{ mm}$ squares, $30\text{ mm}$ markers, IDs `100–126` (detected on the laptop).
 - **Marker local axes (`MARKERS.md` & `CAPTURE-CONTRACT.md`):**
   - Corners are ordered `(c0: top-left, c1: top-right, c2: bottom-right, c3: bottom-left)` looking at the printed face, where **top** is the edge away from the printed text label.
   - Origin $(0, 0, 0)$ is the center of the black outer square.
@@ -130,6 +130,24 @@ To measure marker size without circular dependence on the PnP size input and wit
 - For any marker seen in $\ge 2$ passes, its loop-closure gap `gap_m` is:
   $$\text{gap\_m}(id) = \max\left(\|\bar{p}_{\text{last}}(id) - \bar{p}_{\text{first}}(id)\|_2,\; \sum_{\text{snaps}} \|\Delta p_{\text{snap}}\|_2\right)$$
 - If Marker 0 is seen only in a single pass (walker never looped back to Marker 0 at the end of the walk), `loop_closure_gap_m` for Marker 0 is `null` (unverified loop closure), which caps the grade at `C` (`YS-32`, `YS-42`).
+
+### 3.4 Eight Tossed Markers, One-Frame Neighbour Pairs, Drift-Free Layout Solver & Trajectory Warp (`YS-115`)
+To eliminate ARKit VIO trajectory drift (`1.6%` systematic scale shrink and `23–81 cm` loop-closure drift observed on device walks 5–8) without requiring manual tape measurements:
+1. **Eight Tossed Markers (`IDs 0–7`) & Walk Without Solo Locks (`L37` Condition 1 & Condition 2):**
+   - The walker receives one placement instruction at the start: *"Toss them 2–3 big steps apart"*.
+   - A marker is done as soon as it is in at least one confirmed neighbour pair connected to Marker 0 (`connectedToOrigin`); close-range solo locks ($\le 1.5\text{ m}$) are not required. If a marker is $> 3.5\text{ m}$ from every neighbour, the app coaches the walker to nudge it closer or toss another marker between them so both fit in a single camera frame.
+2. **One-Frame Camera-Space Pair Extraction (`pairs.csv`):**
+   - Whenever two markers $(a, b)$ with $a < b$ are simultaneously visible in the same camera frame at ranges $0.50\text{–}4.20\text{ m}$ (with `minQuadAreaRatio = 0.0004`), both markers are measured directly in the instantaneous camera frame ($T_{\text{cam} \leftarrow m_a}, T_{\text{cam} \leftarrow m_b}$) without touching `poses.csv`.
+   - The relative displacement in Marker $a$'s local horizontal frame $(\Delta x_{ab}, \Delta y_{ab}, \Delta z_{ab})$, distance $d_{ab}$, relative yaw $\Delta \psi_{ab}$, ranges, viewing angles, and inverse-variance weight are written to `pairs.csv` (and re-extracted from `stills/*.jpg` + `depth/*.png` by the toolkit).
+3. **Printed-Size Scale Correction (`Condition 3`):**
+   - Across all close-range camera-space marker sightings, the toolkit computes the empirical printed-size scale ratio $\hat{\alpha}_{\text{print}} = \text{median}(s_{\text{printed}} / s_{\text{measured}})$ and its standard error $\text{SE}(\hat{\alpha}_{\text{print}})$.
+   - When $|\hat{\alpha}_{\text{print}} - 1| > 2 \cdot \text{SE}(\hat{\alpha}_{\text{print}})$ (and within $[0.95, 1.05]$), `solve_marker_layout_graph` multiplies every pair edge $(\Delta x_{ab}, \Delta y_{ab}, \Delta z_{ab})$ by $\hat{\alpha}_{\text{print}}$ and records `printed_scale_factor`, `printed_scale_se`, and `scale_applied: true` in `frame.json#marker_layout` and `grade.json#marker_layout_summary`.
+4. **Drift-Free SE(2)+$z$ Gauss-Newton Layout Graph Solver (`solve_marker_layout_graph`):**
+   - Anchors Marker 0 at $(0, 0, 0)$ with $\psi_0 = 0$ and solves for all connected marker poses $\{(x_i, y_i, z_i, \psi_i)\}$ via weighted Gauss-Newton with Huber IRLS over the multi-frame robust-fused pair edges $E$.
+   - Reports graph connectivity (`connected`), independent cycle count (`cycle_count = |E_0| - (|V_0| - 1)`), open-loop vs. closed-loop cycle residual (`open_loop_residual_m`), per-edge residuals, and 95% per-marker positional uncertainties (`uncertainty_95_m`).
+5. **Piecewise-Linear / IDW Trajectory & Point-Cloud Warp with Raw Scan Kept (`Condition 4`):**
+   - When `marker_layout` is connected with $\ge 2$ markers, `warp_trajectory_to_marker_layout` computes each marker's VIO drift correction $\Delta_i = p_i^{\text{solved}} - \bar{p}_i^{\text{VIO}}$, interpolates $\Delta(t)$ piecewise-linearly in time between marker sightings (and inverse-distance weighted in space), and applies $\Delta(t)$ to the trajectory and unprojected LiDAR cloud (also applying `depth_scale = printed_scale_factor` when `scale_applied` is true).
+   - The warped geometry is written as the default `standard/trajectory.json` and `standard/cloud.ply`, while the unwarped VIO originals are always preserved alongside as `standard/trajectory.raw.json` and `standard/cloud.raw.ply` (and sealed in `standard/capture.json`). Nothing is ever adjusted to a physical tape check (`YS-43`).
 
 ---
 
@@ -224,9 +242,13 @@ Every JSON file is UTF-8 with sorted keys, `"contract": "yardstick-capture/1"`, 
   ```csv
   t,saved_index,file,px,py,pz,qx,qy,qz,qw,fx,fy,cx,cy,width,height
   ```
-- **`markers.csv`** (`x,y,z,qx,qy,qz,qw` is marker-to-world $T_{\text{world} \leftarrow \text{marker}}$ in ARKit world coordinates, plus 2D pixel corners `c0_u..c3_v` in RGB image coordinates):
+- **`markers.csv`** (`x,y,z,qx,qy,qz,qw` is marker-to-world $T_{\text{world} \leftarrow \text{marker}}$ in ARKit world coordinates, `c0_u..c3_v` are 2D RGB corners, and the 12 trailing `YS-115` columns record camera-space pose `cam_x..cam_qw`, range, viewing angle, 3D edge disagreement, plane RMSE, and depth sample count):
   ```csv
-  t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v
+  t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v,cam_x,cam_y,cam_z,cam_qx,cam_qy,cam_qz,cam_qw,range_m,angle_deg,edge_disagreement_ratio,plane_rmse_m,depth_sample_count
+  ```
+- **`pairs.csv`** (`YS-115` one-frame camera-space neighbour pair measurements for $id_a < id_b$):
+  ```csv
+  t,saved_index,id_a,id_b,dx_cam_m,dy_cam_m,dz_cam_m,dist_m,dyaw_rad,range_a_m,range_b_m,angle_a_deg,angle_b_deg,weight
   ```
 
 ### 6.2 Level 1 JSON Files (`session.json`, `manifest.json`)
@@ -308,6 +330,7 @@ Every JSON file is UTF-8 with sorted keys, `"contract": "yardstick-capture/1"`, 
   - `tolerances_95pct`: `{ "distance_m": 0.048, "height_m": 0.039, "position_m": 0.034, "reference_range_m": 10.0, "formula": "max(primary_tape_floor(r), 1.96 * sqrt(sigma_lidar_m^2 + (scale_error_eff * r)^2 + (loop_gap_per_m * r)^2 + sigma_tracking_m^2))", "coefficients": { "max_tape_residual_m": 0.021, "primary_tape_floor_10m_m": 0.042, "sigma_lidar_m": 0.015, "scale_error_ratio": 0.004, "scale_error_se": 0.0025, "scale_error_eff": 0.000, "loop_closure_gap_m": 0.038, "walk_length_m": 42.5, "loop_gap_per_m": 0.000894, "sigma_tracking_m": 0.006, "limited_tracking_share": 0.02 }, "evidence_basis": ["tape_checks", "loop_closure_gaps", "marker_scale_error", "tracking_quality", "lidar_noise_floor"] }`
   - `tape_checks`: `[{ "id": 0, "role": "primary" | "held_out", "point_a_yard_m": [x, y, z], "point_b_yard_m": [x, y, z], "tape_m": 5.000, "measured_m": 5.021, "residual_m": 0.021, "tolerance_at_tape_m": 0.035, "within_tolerance": true }]`
   - `marker_scale`: `{ "scale_error_ratio": 0.004, "scale_error_se": 0.0025, "scale_error_eff": 0.000, "sightings_used": 12, "per_marker": [{ "marker_id": 0, "size_mm_printed": 250.0, "size_mm_measured": 251.0, "scale_error_ratio": 0.004, "scale_error_se": 0.0025, "sightings_count": 12 }] }`
-  - `caps_applied`: array of cap codes (`[]` or `["no_tape_check"]`, etc.)
+  - `caps_applied`: array of cap codes (`[]` or `["no_tape_check"]`, `["disconnected_marker_graph"]`, `["pair_graph_no_closed_cycle"]`, etc.)
+  - `marker_layout_summary`: optional `YS-115` summary object (`{ "connected", "markers_connected_count", "edges_count", "cycle_count", "open_loop_residual_m", "max_edge_residual_m", "max_marker_uncertainty_95_m", "printed_scale_factor", "printed_scale_se", "scale_applied", "trajectory_warp_applied" }`)
   - `reasons`: array of human-readable and machine-parseable evidence strings explaining the grade and every cap applied.
 

@@ -285,6 +285,7 @@
             "type": "number"
           },
           "marker_id": {
+            "maximum": 7,
             "minimum": 0,
             "type": "integer"
           }
@@ -308,10 +309,14 @@
         "printed_sizes_mm": {
           "additionalProperties": {
             "enum": [
+              160.0,
               180.0,
               250.0
             ],
             "type": "number"
+          },
+          "propertyNames": {
+            "pattern": "^[0-7]$"
           },
           "type": "object"
         }

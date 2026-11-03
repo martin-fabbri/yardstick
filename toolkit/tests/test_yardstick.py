@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -1255,4 +1256,374 @@ def test_ys92_visit_json_validates_and_rejects_interpretation_keys(
     assert rep_hash["status"] == "invalid"
     codes_hash = {f["code"] for f in rep_hash["findings"]}
     assert "visit_plan_hash_mismatch" in codes_hash
+
+
+def test_aruco_dict_0_to_7_parity() -> None:
+    """YS-115 §4.2: Verify generator, Python data, and Swift data exact hex/bit parity for IDs 0..7 and Hamming >= 5."""
+    import re
+    import sys
+
+    import cv2
+
+    repo_root = Path(__file__).resolve().parents[2]
+    scripts_dir = repo_root / "toolkit" / "scripts"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
+    from generate_aruco_dict import extract_dict_5x5_patterns
+    from yardstick.aruco_dict_data import ARUCO_DICT_5X5_PATTERNS
+
+    gen_patterns = extract_dict_5x5_patterns(max_id=7)
+    assert set(gen_patterns.keys()) == set(range(8))
+
+    py_keys = {int(k): v for k, v in ARUCO_DICT_5X5_PATTERNS.items()}
+    assert set(py_keys.keys()) == set(range(8)), "Run toolkit/scripts/generate_aruco_dict.py to update aruco_dict_data.py"
+    for mid in range(8):
+        assert py_keys[mid] == gen_patterns[mid]
+
+    swift_text = (repo_root / "ios" / "Yardstick" / "Sources" / "ArUcoDictionaryData.swift").read_text(encoding="utf-8")
+    swift_patterns: dict[int, list[int]] = {}
+    for m in re.finditer(r"(\d+)\s*:\s*\[([^\]]+)\]", swift_text):
+        mid = int(m.group(1))
+        vals = [int(tok.strip(), 16) for tok in m.group(2).split(",") if tok.strip()]
+        swift_patterns[mid] = vals
+    assert set(swift_patterns.keys()) == set(range(8)), "Run toolkit/scripts/generate_aruco_dict.py to update ArUcoDictionaryData.swift"
+    for mid in range(8):
+        assert swift_patterns[mid] == gen_patterns[mid]
+
+    # Minimum pairwise Hamming distance across all 8 * 4 = 32 rotated codewords must be >= 5
+    all_codewords = [(mid, rot, gen_patterns[mid][rot]) for mid in range(8) for rot in range(4)]
+    for i in range(len(all_codewords)):
+        for j in range(i + 1, len(all_codewords)):
+            _, _, w1 = all_codewords[i]
+            _, _, w2 = all_codewords[j]
+            hamming = int(bin(w1 ^ w2).count("1"))
+            assert hamming >= 5, f"Codewords {all_codewords[i]} and {all_codewords[j]} have Hamming distance {hamming} < 5"
+
+    # Verify rendered marker patches for IDs 0..7 at all 4 rotations decode cleanly with OpenCV
+    for mid in range(8):
+        patch_rgb = _render_aruco_Test_patch(mid)
+        for k_rot in range(4):
+            rot_img = np.rot90(patch_rgb, k=-k_rot)
+            dets = detect_aruco_markers_opencv(rot_img)
+            assert set(dets.keys()) == {mid}
+
+
+def _render_aruco_Test_patch(marker_id: int) -> np.ndarray:
+    from yardstick.synth import _render_aruco_marker_patch
+
+    return _render_aruco_marker_patch(marker_id, size_px=240)
+
+
+def _eight_marker_ground_truth_layout() -> tuple[dict[int, tuple[float, float, float, float]], list[tuple[int, int]]]:
+    """Return 8 tossed markers (0..7) in non-sequential order with 2.15..2.85 m neighbour spacing and cross-chords."""
+    # ARKit world coordinates (X_w, Y_w=0, Z_w, yaw_rad).
+    # Note: In Yard Frame with Marker 0 at (0,0,0) and yaw=0:
+    # X_yard = +X_w, Y_yard = -Z_w, Z_yard = +Y_w.
+    layout: dict[int, tuple[float, float, float, float]] = {
+        0: (0.00, 0.0, 0.00, 0.00),
+        5: (2.40, 0.0, -0.15, 0.12),
+        2: (4.85, 0.0, 0.10, -0.18),
+        7: (7.20, 0.0, -0.10, 0.25),
+        1: (7.10, 0.0, -2.35, -0.10),
+        6: (4.75, 0.0, -2.45, 0.08),
+        3: (2.35, 0.0, -2.30, -0.22),
+        4: (0.10, 0.0, -2.20, 0.15),
+    }
+    pair_seq: list[tuple[int, int]] = [
+        (0, 5),
+        (5, 2),
+        (2, 7),
+        (7, 1),
+        (1, 6),
+        (6, 3),
+        (3, 4),
+        (4, 0),
+        (5, 3),  # Cross-chord triangle bracing
+        (2, 6),  # Second cross-chord
+    ]
+    return layout, pair_seq
+
+
+def test_ys115_eight_tossed_markers_recovers_layout_under_shrink_and_jump(tmp_path: Path) -> None:
+    """YS-115 §5.1.1: 8 tossed markers in non-sequential loop recover layout within <= 1.5 cm RMSE under -4.5% VIO shrink + 25 cm jump."""
+    layout, pair_seq = _eight_marker_ground_truth_layout()
+    cap_dir = tmp_path / "cap_ys115_eight_markers"
+    generate_synthetic_capture(
+        cap_dir,
+        SynthOptions(
+            markers_world_layout=layout,
+            walk_pair_sequence=pair_seq,
+            vio_scale_shrink_ratio=-0.045,
+            pose_jump_m=0.25,
+            loop_drift_xy_m=(0.18, -0.14),
+            include_tape_checks=False,
+            write_pairs_csv=True,
+        ),
+    )
+
+    rep1 = validate_recording(cap_dir)
+    assert rep1["status"] == "clean", f"Level 1 validation findings: {rep1['findings']}"
+
+    res = convert_recording_to_standard(cap_dir)
+    rep2 = validate_standard_capture(cap_dir / "standard")
+    assert rep2["status"] == "clean", f"Level 2 validation findings: {rep2['findings']}"
+
+    ml = res["frame"]["marker_layout"]
+    assert ml["pair_graph_connected"] is True
+    assert set(ml["markers_connected_ids"]) == {0, 1, 2, 3, 4, 5, 6, 7}
+    assert ml["cycle_count"] >= 1
+    assert ml["closed_loop_edge_rmse_m"] is not None and ml["closed_loop_edge_rmse_m"] <= 0.010
+    assert ml["trajectory_warp_applied"] is True
+    assert len(ml["per_marker_warp_corrections"]) >= 8
+
+    # Condition 4: Verify raw scan files are kept alongside warped defaults and hashed in capture.json
+    std_dir = cap_dir / "standard"
+    assert (std_dir / "cloud.ply").exists()
+    assert (std_dir / "cloud.raw.ply").exists()
+    assert (std_dir / "trajectory.json").exists()
+    assert (std_dir / "trajectory.raw.json").exists()
+    cap_files = {f["path"] for f in res["capture"]["files"]}
+    assert {"cloud.ply", "cloud.raw.ply", "trajectory.json", "trajectory.raw.json"} <= cap_files
+
+    # Compare solved Yard Frame positions against ground truth: X_yard = X_w, Y_yard = -Z_w, Z_yard = Y_w
+    gt_yard = {
+        mid: np.array([spec[0], -spec[2], spec[1]], dtype=np.float64)
+        for mid, spec in layout.items()
+    }
+    solved_yard = {
+        int(m["marker_id"]): np.array(m["xyz_m"], dtype=np.float64)
+        for m in res["frame"]["markers_yard"]
+    }
+    assert set(solved_yard.keys()) == set(range(8))
+
+    pos_errors = [float(np.linalg.norm(solved_yard[mid] - gt_yard[mid])) for mid in range(8)]
+    rmse_m = float(np.sqrt(np.mean(np.square(pos_errors))))
+    max_err_m = float(np.max(pos_errors))
+    assert rmse_m <= 0.015, f"Expected layout RMSE <= 0.015 m, got {rmse_m:.4f} m"
+    assert max_err_m <= 0.025, f"Expected max marker error <= 0.025 m, got {max_err_m:.4f} m"
+
+    # Verify all pairwise distances match ground truth within <= 0.8%
+    for i in range(8):
+        for j in range(i + 1, 8):
+            d_gt = float(np.linalg.norm(gt_yard[j] - gt_yard[i]))
+            d_sol = float(np.linalg.norm(solved_yard[j] - solved_yard[i]))
+            rel_err = abs(d_sol - d_gt) / d_gt
+            assert rel_err <= 0.008, f"Pair ({i}, {j}) distance error {rel_err*100:.2f}% > 0.8%"
+
+
+def test_ys115_injected_depth_scale_bias_recovered_by_printed_size(tmp_path: Path) -> None:
+    """YS-115 Condition 3: Injected -1.6% single-frame LiDAR depth-scale bias is corrected by printed marker size."""
+    layout, pair_seq = _eight_marker_ground_truth_layout()
+    cap_dir = tmp_path / "cap_ys115_depth_bias"
+    generate_synthetic_capture(
+        cap_dir,
+        SynthOptions(
+            markers_world_layout=layout,
+            walk_pair_sequence=pair_seq,
+            vio_scale_shrink_ratio=-0.040,
+            depth_scale_bias_ratio=-0.016,
+            actual_marker_size_mm=180.0,
+            declared_marker_size_mm=180.0,
+            include_tape_checks=False,
+            write_pairs_csv=True,
+        ),
+    )
+
+    res = convert_recording_to_standard(cap_dir)
+    ml = res["frame"]["marker_layout"]
+    expected_alpha = 1.0 / (1.0 - 0.016)  # ~1.01626
+    assert ml["printed_scale_factor"] is not None
+    assert abs(float(ml["printed_scale_factor"]) - expected_alpha) <= 0.004
+    assert abs(float(ml["scale_applied"]) - expected_alpha) <= 0.004
+
+    gt_yard = {
+        mid: np.array([spec[0], -spec[2], spec[1]], dtype=np.float64)
+        for mid, spec in layout.items()
+    }
+    solved_yard = {
+        int(m["marker_id"]): np.array(m["xyz_m"], dtype=np.float64)
+        for m in res["frame"]["markers_yard"]
+    }
+    pos_errors = [float(np.linalg.norm(solved_yard[mid] - gt_yard[mid])) for mid in range(8)]
+    rmse_m = float(np.sqrt(np.mean(np.square(pos_errors))))
+    assert rmse_m <= 0.015, f"Expected depth-bias-corrected layout RMSE <= 0.015 m, got {rmse_m:.4f} m"
+
+
+def test_ys115_wall_single_band_after_trajectory_warp(tmp_path: Path) -> None:
+    """YS-115 §5.1.2 & Condition 4: Doubled Pass-1/Pass-2 wall in cloud.raw.ply collapses to a single <= 2.5 cm band in cloud.ply."""
+    layout, pair_seq = _eight_marker_ground_truth_layout()
+    cap_dir = tmp_path / "cap_ys115_wall_band"
+    generate_synthetic_capture(
+        cap_dir,
+        SynthOptions(
+            markers_world_layout=layout,
+            walk_pair_sequence=pair_seq,
+            vio_scale_shrink_ratio=-0.045,
+            pose_jump_m=0.25,
+            loop_drift_xy_m=(0.12, -0.05),
+            include_tape_checks=False,
+            write_pairs_csv=True,
+            wall_pass1_and_pass2=True,
+        ),
+    )
+    convert_recording_to_standard(cap_dir)
+
+    verts_raw = read_cloud_ply(cap_dir / "standard" / "cloud.raw.ply")
+    verts_warped = read_cloud_ply(cap_dir / "standard" / "cloud.ply")
+
+    # Select elevated wall points (z > 0.15 m) near X_yard ~ 1.65 m
+    wall_raw_x = verts_raw["x"][verts_raw["z"] > 0.15]
+    wall_warped_x = verts_warped["x"][verts_warped["z"] > 0.15]
+    assert len(wall_raw_x) >= 20
+    assert len(wall_warped_x) >= 20
+
+    raw_spread_p95 = float(np.percentile( np.abs(wall_raw_x - np.median(wall_raw_x)), 95))
+    warped_spread_p95 = float(np.percentile(np.abs(wall_warped_x - np.median(wall_warped_x)), 95))
+
+    assert raw_spread_p95 >= 0.10, f"Expected raw unwarped wall to show pass-1/pass-2 split, got {raw_spread_p95:.4f} m"
+    assert warped_spread_p95 <= 0.025, f"Expected warped wall 95th-percentile thickness <= 0.025 m, got {warped_spread_p95:.4f} m"
+
+
+def test_ys115_disconnected_pair_graph_fallback_and_grade_cap(tmp_path: Path) -> None:
+    """YS-115 §5.1.3: Connected loop {0, 2, 5, 6} + unconnected solo Marker 7 triggers vio_similarity_fallback and disconnected_marker_graph cap."""
+    layout = {
+        0: (0.00, 0.0, 0.00, 0.0),
+        2: (2.40, 0.0, 0.00, 0.0),
+        5: (2.40, 0.0, -2.30, 0.0),
+        6: (0.00, 0.0, -2.30, 0.0),
+        7: (5.20, 0.0, -5.20, 0.0),  # Far solo marker, zero one-frame pairs
+    }
+    pair_seq = [(0, 2), (2, 5), (5, 6), (6, 0)]
+    cap_dir = tmp_path / "cap_ys115_disconnected"
+    generate_synthetic_capture(
+        cap_dir,
+        SynthOptions(
+            markers_world_layout=layout,
+            walk_pair_sequence=pair_seq,
+            solo_sightings_ids=[7],
+            vio_scale_shrink_ratio=-0.040,
+            include_tape_checks=False,
+            write_pairs_csv=True,
+        ),
+    )
+
+    res = convert_recording_to_standard(cap_dir)
+    ml = res["frame"]["marker_layout"]
+    assert ml["pair_graph_connected"] is False
+    assert ml["markers_connected_ids"] == [0, 2, 5, 6]
+    assert ml["unconnected_marker_ids"] == [7]
+
+    by_id = {int(m["marker_id"]): m for m in res["frame"]["markers_yard"]}
+    for mid in (0, 2, 5, 6):
+        assert by_id[mid]["connected_to_origin"] is True
+        assert by_id[mid]["placement_source"] == "pair_graph"
+        gt_y = np.array([layout[mid][0], -layout[mid][2], layout[mid][1]], dtype=np.float64)
+        err = float(np.linalg.norm(np.array(by_id[mid]["xyz_m"]) - gt_y))
+        assert err <= 0.015
+
+    assert by_id[7]["connected_to_origin"] is False
+    assert by_id[7]["placement_source"] == "vio_similarity_fallback"
+    assert "disconnected_marker_graph" in res["grade"]["caps_applied"]
+    assert res["grade"]["grade"] == "C"
+
+
+def test_ys115_exp2_replay_and_false_positive_gate(tmp_path: Path) -> None:
+    """YS-115 §5.2: Replay Experiment 2 captures if present on disk and verify zero false positives for IDs 4..7."""
+    # Always verify that structured high-frequency synthetic yard/fence textures produce zero false positives for IDs 0..7
+    rng = np.random.default_rng(11502)
+    for trial in range(4):
+        noise_img = rng.integers(30, 225, size=(480, 640), dtype=np.uint8)
+        # Add synthetic fence slats / grass stripes
+        for x_slat in range(0, 640, 18 + trial * 4):
+            noise_img[:, x_slat : min(640, x_slat + 6)] = 45
+        dets_noise = detect_aruco_markers_opencv(noise_img)
+        assert not (set(dets_noise.keys()) & set( range(8) )), f"False positive in synthetic yard texture: {dets_noise.keys()}"
+
+    exp2_root = Path(os.environ.get("YARDSTICK_REPLAY_ROOT", "/nonexistent")) / "2026-11-02-exp2"
+    if not exp2_root.exists():
+        pytest.skip("Experiment 2 scrap captures not present on this machine")
+
+    scan_dirs = sorted({p.parent for p in exp2_root.rglob("session.json")})
+    if not scan_dirs and exp2_root.parent.exists():
+        scan_dirs = sorted({p.parent for p in exp2_root.parent.rglob("session.json") if "exp2" in str(p)})
+
+    still_files: list[Path] = []
+    for scan_dir in scan_dirs:
+        stills_dir = scan_dir / "stills"
+        if stills_dir.exists():
+            still_files.extend(sorted(stills_dir.glob("*.jpg"))[:15])
+    if not still_files:
+        still_files = sorted(exp2_root.rglob("*.jpg"))[:30]
+
+    for still_p in still_files:
+        gray = np.array(Image.open(still_p).convert("L"), dtype=np.uint8)
+        dets = detect_aruco_markers_opencv(gray)
+        false_ids = set(dets.keys()) - {0, 1, 2, 3}
+        assert not false_ids, f"False positive marker IDs {false_ids} detected in {still_p}"
+
+
+def test_ys115_ground_plane_printed_size_fallback_and_w3_pairs() -> None:
+    """YS-115 C5/C6: Ground-plane + 180 mm printed size recovers 3D position for far 2D markers (`seen_2d_no_3d`) in w3 frames 3960 and 3966."""
+    from yardstick.markers import (
+        measure_marker_3d_camera_frame,
+        measure_marker_3d_from_ground_plane_and_printed_size,
+    )
+
+    w3_dir = Path(os.environ.get("YARDSTICK_REPLAY_ROOT", "/nonexistent")) / "2026-11-02-eight" / "w3" / "20261103T005121Z_yardstick"
+    if not w3_dir.exists():
+        pytest.skip("Field walk w3 not present on disk")
+
+    poses_by_idx = {}
+    with (w3_dir / "poses.csv").open("r", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            poses_by_idx[int(r["saved_index"])] = r
+
+    for s_idx in (3960, 3966):
+        pr = poses_by_idx[s_idx]
+        T_wc = pose_to_matrix(
+            float(pr["px"]),
+            float(pr["py"]),
+            float(pr["pz"]),
+            float(pr["qx"]),
+            float(pr["qy"]),
+            float(pr["qz"]),
+            float(pr["qw"]),
+        )
+        gray = np.array(Image.open(w3_dir / "stills" / f"{s_idx:06d}.jpg").convert("L"), dtype=np.uint8)
+        dets = detect_aruco_markers_opencv(gray)
+        assert {5, 6}.issubset(set(dets.keys())), f"Expected both markers 5 and 6 detected in 2D in still {s_idx}"
+
+        depth_mm = np.array(Image.open(w3_dir / "depth" / f"{s_idx:06d}.png"), dtype=np.uint16)
+        conf_img = np.array(Image.open(w3_dir / "confidence" / f"{s_idx:06d}.png"), dtype=np.uint8)
+
+        m5 = measure_marker_3d_camera_frame(
+            corners_uv=dets[5],
+            depth_mm=depth_mm,
+            conf_img=conf_img,
+            fx=float(pr["fx"]),
+            fy=float(pr["fy"]),
+            cx=float(pr["cx"]),
+            cy=float(pr["cy"]),
+            rgb_width=int(pr["width"]),
+            rgb_height=int(pr["height"]),
+            T_world_from_cam=T_wc,
+        )
+        assert m5 is not None
+        m6 = measure_marker_3d_from_ground_plane_and_printed_size(
+            corners_uv=dets[6],
+            printed_size_mm=180.0,
+            fx=float(pr["fx"]),
+            fy=float(pr["fy"]),
+            cx=float(pr["cx"]),
+            cy=float(pr["cy"]),
+            T_world_from_cam=T_wc,
+            reference_ground_normal_cam=m5["R_cam_from_marker"][:, 2],
+        )
+        assert m6 is not None
+        assert m6["is_ground_plane_printed_size_fallback"] is True
+        assert m6["position_uncertainty_m"] > 0.03
+        dist_56 = float(np.linalg.norm(m6["center_world"] - m5["center_world"]))
+        assert 3.00 <= dist_56 <= 3.30, f"Expected 5-6 pair distance ~3.1-3.2 m in frame {s_idx}, got {dist_56:.3f} m"
+
+
 

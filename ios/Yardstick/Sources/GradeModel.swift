@@ -54,6 +54,10 @@ public enum GradeModel {
         public var poseJumpSumM: Double = 0.0
         public var walkLengthM: Double = 0.0
         public var limitedTrackingShare: Double = 0.0
+        /// Pair-graph connectivity and closed-cycle count (`YS-115`); nil when pair graph is not used.
+        public var pairGraphConnected: Bool? = nil
+        public var pairGraphCycleCount: Int = 0
+        public var pairGraphOpenLoopResidualM: Double? = nil
         public init() {}
     }
 
@@ -94,8 +98,10 @@ public enum GradeModel {
         let heldOut = inp.tapeChecks.filter { $0.isHeldOut }
         let maxPrimaryRes = primary.map(\.residualM).max() ?? 0.0
 
-        let hasLoop = inp.rawMarker0GapM != nil
-        var m0Gap: Double? = inp.rawMarker0GapM
+        let hasClosedPairCycle = (inp.pairGraphConnected == true && inp.pairGraphCycleCount >= 1)
+        let effectiveRawGap = inp.rawMarker0GapM ?? (hasClosedPairCycle ? inp.pairGraphOpenLoopResidualM : nil)
+        let hasLoop = effectiveRawGap != nil || hasClosedPairCycle
+        var m0Gap: Double? = effectiveRawGap
         if let g = m0Gap {
             m0Gap = max(g, inp.poseJumpSumM)
         } else if inp.poseJumpSumM > 0.0 {
@@ -151,7 +157,14 @@ public enum GradeModel {
             band = min(band, 1)
             caps.append("no_loop_closure")
         }
-        if primary.isEmpty {
+        if inp.pairGraphConnected == false {
+            band = min(band, 1)
+            caps.append("disconnected_marker_graph")
+        } else if inp.pairGraphConnected == true && inp.pairGraphCycleCount == 0 {
+            band = min(band, 2)
+            caps.append("pair_graph_no_closed_cycle")
+        }
+        if primary.isEmpty && !hasClosedPairCycle {
             band = min(band, 1)
             caps.append("no_tape_check")
         }

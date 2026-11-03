@@ -25,6 +25,53 @@
     "grading_version": {
       "const": "yardstick-grade/2"
     },
+    "marker_layout_summary": {
+      "additionalProperties": false,
+      "properties": {
+        "closed_loop_edge_rmse_m": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cycle_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "markers_connected_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "markers_seen_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "max_marker_position_uncertainty_m": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pair_graph_connected": {
+          "type": "boolean"
+        },
+        "scale_applied": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        }
+      },
+      "required": [
+        "pair_graph_connected",
+        "markers_seen_count",
+        "markers_connected_count",
+        "cycle_count",
+        "closed_loop_edge_rmse_m",
+        "max_marker_position_uncertainty_m"
+      ],
+      "type": "object"
+    },
     "marker_scale": {
       "additionalProperties": false,
       "properties": {
@@ -198,9 +245,30 @@
               "minimum": 0,
               "type": "number"
             },
+            "max_marker_position_uncertainty_m": {
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
             "max_tape_residual_m": {
               "minimum": 0,
               "type": "number"
+            },
+            "pair_graph_edge_rmse_m": {
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "pair_graph_open_loop_residual_m": {
+              "minimum": 0,
+              "type": [
+                "number",
+                "null"
+              ]
             },
             "primary_tape_floor_10m_m": {
               "minimum": 0,

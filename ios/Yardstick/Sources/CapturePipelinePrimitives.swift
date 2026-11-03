@@ -474,6 +474,8 @@ public enum ExposureAndStillnessGate {
     public static let maxTurnRateRadS: Double = 0.35  // was 0.15 (8.6°/s); ~20°/s; size check and 3-still spread still guard accuracy
     public static let minMarkerDistanceM: Double = 0.50
     public static let maxMarkerDistanceM: Double = 1.50
+    /// Maximum slant range (`4.20 m`) allowed for markers in a two-marker pair frame (`YS-115` C6).
+    public static let maxPairMarkerDistanceM: Double = 4.20
     public static let maxMarkerSizeDeviationRatio: Double = 0.03
 
     /// Compute instantaneous angular turn rate (`rad/s`) from two consecutive camera rotation matrices (`YS-73`).
@@ -525,7 +527,8 @@ public enum ExposureAndStillnessGate {
         predictedBlurPx: Double,
         turnRateRadS: Double,
         rangeMeters3D: Double,
-        horizontalRangeMeters: Double? = nil
+        horizontalRangeMeters: Double? = nil,
+        maxDistanceMeters: Double = maxMarkerDistanceM
     ) -> SightingGateVerdict {
         if turnRateRadS > maxTurnRateRadS {
             return SightingGateVerdict(
@@ -555,7 +558,7 @@ public enum ExposureAndStillnessGate {
                 reason: "marker_too_close"
             )
         }
-        if effectiveMaxRange > maxMarkerDistanceM {
+        if effectiveMaxRange > maxDistanceMeters {
             return SightingGateVerdict(
                 passes: false,
                 coachingCue: "Step closer to the marker",

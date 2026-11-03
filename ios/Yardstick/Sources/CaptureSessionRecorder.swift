@@ -77,6 +77,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var posesFH: FileHandle?
     var stillsFH: FileHandle?
     var markersFH: FileHandle?
+    var pairsFH: FileHandle?
     var eventsFH: FileHandle?
     var guidanceFH: FileHandle?
     var audioFH: FileHandle?
@@ -85,6 +86,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
     var posesDigest = IncrementalByteDigest()
     var stillsDigest = IncrementalByteDigest()
     var markersDigest = IncrementalByteDigest()
+    var pairsDigest = IncrementalByteDigest()
     var eventsDigest = IncrementalByteDigest()
     var guidanceDigest = IncrementalByteDigest()
 
@@ -279,9 +281,15 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             registry: digestRegistry
         )
         try Self.createFileWithHeader(
-            "t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v\n",
+            "t,saved_index,marker_id,size_mm_printed,size_mm_measured,x,y,z,qx,qy,qz,qw,c0_u,c0_v,c1_u,c1_v,c2_u,c2_v,c3_u,c3_v,cam_x,cam_y,cam_z,cam_qx,cam_qy,cam_qz,cam_qw,range_m,angle_deg,edge_disagreement_ratio,plane_rmse_m,depth_sample_count\n",
             at: captureDirURL.appendingPathComponent("markers.csv"),
             digest: &markersDigest,
+            registry: digestRegistry
+        )
+        try Self.createFileWithHeader(
+            "t,saved_index,id_a,id_b,dx_cam_m,dy_cam_m,dz_cam_m,dist_m,dyaw_rad,range_a_m,range_b_m,angle_a_deg,angle_b_deg,weight\n",
+            at: captureDirURL.appendingPathComponent("pairs.csv"),
+            digest: &pairsDigest,
             registry: digestRegistry
         )
         try Self.createFileWithHeader(
@@ -307,6 +315,8 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         try self.stillsFH?.seekToEnd()
         self.markersFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("markers.csv"))
         try self.markersFH?.seekToEnd()
+        self.pairsFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("pairs.csv"))
+        try self.pairsFH?.seekToEnd()
         self.eventsFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("events.csv"))
         try self.eventsFH?.seekToEnd()
         self.guidanceFH = try FileHandle(forWritingTo: captureDirURL.appendingPathComponent("guidance.csv"))
@@ -397,6 +407,8 @@ private final class CaptureWriterEngine: @unchecked Sendable {
             stillsDigest.update(with: data)
         } else if fh === markersFH {
             markersDigest.update(with: data)
+        } else if fh === pairsFH {
+            pairsDigest.update(with: data)
         } else if fh === eventsFH {
             eventsDigest.update(with: data)
         } else if fh === guidanceFH {
@@ -500,6 +512,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         try? posesFH?.close()
         try? stillsFH?.close()
         try? markersFH?.close()
+        try? pairsFH?.close()
         try? eventsFH?.close()
         try? guidanceFH?.close()
 
@@ -507,6 +520,7 @@ private final class CaptureWriterEngine: @unchecked Sendable {
         digestRegistry.record(posesDigest.finalize(), forRelativePath: "poses.csv")
         digestRegistry.record(stillsDigest.finalize(), forRelativePath: "stills.csv")
         digestRegistry.record(markersDigest.finalize(), forRelativePath: "markers.csv")
+        digestRegistry.record(pairsDigest.finalize(), forRelativePath: "pairs.csv")
         digestRegistry.record(eventsDigest.finalize(), forRelativePath: "events.csv")
         digestRegistry.record(guidanceDigest.finalize(), forRelativePath: "guidance.csv")
 
@@ -627,6 +641,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     @Published public private(set) var guidedWalkPhase: GuidedWalkPhase = .openingMarker0
     @Published public private(set) var activeRingState: MarkerRingVisualState? = nil
     @Published public private(set) var lockedMarkerIDs: Set<Int> = []
+    @Published public private(set) var seenMarkerIDs: Set<Int> = []
     @Published public private(set) var isFinishAvailable: Bool = false {
         didSet {
             if !oldValue && isFinishAvailable {
@@ -709,15 +724,15 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
 
     private static let markerSizesDefaultsKey = "io.buildnexus.yardstick.markerSizesMM.v2"
 
-    /// Per-marker printed size configuration (`180.0` mm default for all markers `0–5` per `YS-80` #3), persisted in `UserDefaults`.
+    /// Per-marker printed size configuration (`180.0` mm default for all markers `0–7` per `YS-80` #3 / `YS-115`), persisted in `UserDefaults`.
     @Published public var markerSizesMM: [Int: Double] = CaptureSessionRecorder.loadPersistedMarkerSizes()
 
     public static func loadPersistedMarkerSizes(defaults: UserDefaults = .standard) -> [Int: Double] {
         var sizes: [Int: Double] = [
-            0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 180.0,
+            0: 180.0, 1: 180.0, 2: 180.0, 3: 180.0, 4: 180.0, 5: 180.0, 6: 180.0, 7: 180.0,
         ]
         if let saved = defaults.dictionary(forKey: markerSizesDefaultsKey) {
-            for mid in 0..<6 {
+            for mid in 0..<8 {
                 if let num = saved[String(mid)] as? NSNumber {
                     let val = num.doubleValue
                     if val >= 80.0 && val <= 400.0 {
@@ -729,11 +744,11 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         return sizes
     }
 
-    /// Sets every marker ID (`0...5`) to the given printed size in millimeters (`YS-80` correction #3:
+    /// Sets every marker ID (`0...7`) to the given printed size in millimeters (`YS-80` correction #3, `YS-115`:
     /// "the marker-size setting sets every marker ID").
     public func setAllMarkersPrintedSizeMM(_ sizeMM: Double, defaults: UserDefaults = .standard) {
         guard sizeMM >= 80.0 && sizeMM <= 400.0 else { return }
-        for mid in 0..<6 {
+        for mid in 0..<8 {
             markerSizesMM[mid] = sizeMM
         }
         persistMarkerSizes(defaults: defaults)
@@ -796,7 +811,7 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
     private var locationAuthStatus: String = "unavailable"
     private var northSamples: [[String: Double]] = []
     private var phoneLoopState = PhoneLoopRuleState()
-    private var guidedEngine = GuidedCaptureEngine()
+    private var guidedEngine = GuidedCaptureEngine(tossedMarkerMode: true)
     private var latestValidDepthSamplesCount: Int = 100
     private var latestElevatedPointsAbove2m: Int = 0
     private var marker0FirstPassPos: SIMD3<Double>? {
@@ -1191,12 +1206,13 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         exposureCapController = ExposureCapExperimentController()
         lastPauseStartedTimestampS = nil
         isLoopClosed = false
-        guidedEngine = GuidedCaptureEngine(preWalkTapeMeters0To1: preWalkTapeMeters0To1)
+        guidedEngine = GuidedCaptureEngine(preWalkTapeMeters0To1: preWalkTapeMeters0To1, tossedMarkerMode: true)
         guidedEngine.isVoiceCoachEnabled = isVoiceCoachEnabled
         spokenCoachHistory = []
         guidedWalkPhase = .openingMarker0
         activeRingState = nil
         lockedMarkerIDs = []
+        seenMarkerIDs = []
         isFinishAvailable = false
         coveredGroundCellCount = 0
         coveredGroundAreaM2 = 0.0
@@ -2234,6 +2250,9 @@ public final class CaptureSessionRecorder: NSObject, ObservableObject {
         ]
         if precomputedCRCByRelPath["guidance.csv"] != nil {
             streamsDeclared.append("guidance")
+        }
+        if precomputedCRCByRelPath["pairs.csv"] != nil {
+            streamsDeclared.append("pairs")
         }
 
         let formatter = ISO8601DateFormatter()
@@ -3293,39 +3312,47 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             let detectState = sp.beginInterval("ArUcoDetectAndMeasure")
                             var rawDetected3D: [DetectedMarkerSighting] = []
                             var eligibleSightings: [DetectedMarkerSighting] = []
+                            var seen2DMarkerIDs: [Int] = []
                             var sharpnessVal: Double? = nil
 
                             if (shouldRunArUco || shouldConsiderPeriodicStill),
                                let luma = Self.extractLumaBytes(from: sendableRGB.buffer) {
                                 if shouldRunArUco {
                                     let dets2D = ArUcoDetector.detectMarkers2D(lumaBytes: luma, width: rgbW, height: rgbH)
+                                    seen2DMarkerIDs = dets2D.map(\.markerID)
                                     if dets2D.isEmpty {
                                         CaptureWriterEngine.appendDetectionDebug(captureDir: dir, line: String(format: "%.3f,%d,no_marker_2d,,,,,,,,%.3f,%.2f,%@,,,,,", timestampS, sIdx, turnRateRadS, predictedBlurPx, trackingStr))
                                     }
+                                    let measured3DList = ArUcoDetector.measureMarkers3DForFrame(
+                                        dets2D: dets2D,
+                                        printedSizesByMarker: sizesSnapshot,
+                                        defaultPrintedSizeMM: 180.0,
+                                        depthMapMM: dPixels,
+                                        confidenceMap: cPixels,
+                                        depthWidth: wD,
+                                        depthHeight: hD,
+                                        rgbWidth: rgbW,
+                                        rgbHeight: rgbH,
+                                        fx: fx,
+                                        fy: fy,
+                                        cx: cx,
+                                        cy: cy,
+                                        cameraToWorld: cMat
+                                    )
+                                    let measured3DByID = Dictionary(uniqueKeysWithValues: measured3DList.map { ($0.markerID, $0) })
+                                    let isMultiMarkerPairFrame = dets2D.count >= 2
+                                    let maxGateDistM = isMultiMarkerPairFrame
+                                        ? ExposureAndStillnessGate.maxPairMarkerDistanceM
+                                        : ExposureAndStillnessGate.maxMarkerDistanceM
                                     for d2 in dets2D {
-                                        let pSize = sizesSnapshot[d2.markerID] ?? 250.0
+                                        let pSize = sizesSnapshot[d2.markerID] ?? 180.0
                                         var didMeasure3D = false
                                         defer {
                                             if !didMeasure3D {
                                                 CaptureWriterEngine.appendDetectionDebug(captureDir: dir, line: String(format: "%.3f,%d,seen_2d_no_3d,%d,false,,%.1f,,,,%.3f,%.2f,%@,,,,,", timestampS, sIdx, d2.markerID, pSize, turnRateRadS, predictedBlurPx, trackingStr))
                                             }
                                         }
-                                        if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
-                                            markerID: d2.markerID,
-                                            cornersUV: d2.cornersUV,
-                                            printedSizeMM: pSize,
-                                            depthMapMM: dPixels,
-                                            confidenceMap: cPixels,
-                                            depthWidth: wD,
-                                            depthHeight: hD,
-                                            rgbWidth: rgbW,
-                                            rgbHeight: rgbH,
-                                            fx: fx,
-                                            fy: fy,
-                                            cx: cx,
-                                            cy: cy,
-                                            cameraToWorld: cMat
-                                        ) {
+                                        if let s3D = measured3DByID[d2.markerID] {
                                             rawDetected3D.append(s3D)
                                             didMeasure3D = true
                                             // Anchor Marker 0 ground plane BEFORE updating ground coverage (`YS-78`)
@@ -3342,19 +3369,29 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                                 predictedBlurPx: predictedBlurPx,
                                                 turnRateRadS: turnRateRadS,
                                                 rangeMeters3D: s3D.rangeMeters,
-                                                horizontalRangeMeters: rngXZ
+                                                horizontalRangeMeters: rngXZ,
+                                                maxDistanceMeters: maxGateDistM
                                             )
                                             let angleOK = s3D.viewingAngleDeg <= GuidedCaptureEngine.maxViewingAngleDeg
                                             let sizeOK = s3D.sizeMMPrinted > 0
                                                 ? (abs(s3D.sizeMMMeasured - s3D.sizeMMPrinted) / s3D.sizeMMPrinted) <= GuidedCaptureEngine.maxSizeDeviationRatio
                                                 : true
                                             let isUnlockedPhaseTarget: Bool = {
+                                                if isMultiMarkerPairFrame && (0...7).contains(s3D.markerID) {
+                                                    return true
+                                                }
                                                 switch guidedPhaseSnapshot {
                                                 case .openingMarker0:
-                                                    return s3D.markerID == 0 && !lockedMarkersSnapshot.contains(0)
+                                                    if s3D.markerID == 0 && !lockedMarkersSnapshot.contains(0) { return true }
+                                                    return (1...7).contains(s3D.markerID) && !lockedMarkersSnapshot.contains(s3D.markerID)
                                                 case .markers1To3:
-                                                    return (1...3).contains(s3D.markerID) && !lockedMarkersSnapshot.contains(s3D.markerID)
-                                                case .houseWallLookUp, .closingMarker0, .readyToFinish:
+                                                    return (1...7).contains(s3D.markerID) && !lockedMarkersSnapshot.contains(s3D.markerID)
+                                                case .closingMarker0:
+                                                    if !isClosingM0LockedSnapshot && (1...7).contains(s3D.markerID) && !lockedMarkersSnapshot.contains(s3D.markerID) {
+                                                        return true
+                                                    }
+                                                    return s3D.markerID == 0 && !isClosingM0LockedSnapshot
+                                                case .houseWallLookUp, .readyToFinish:
                                                     return s3D.markerID == 0 && !isClosingM0LockedSnapshot
                                                 }
                                             }()
@@ -3425,7 +3462,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         let jpegConfirmed = ArUcoDetector.confirmSightingsInJPEGData(
                                             jpegData,
                                             printedSizesByMarker: sizesSnapshot,
-                                            defaultPrintedSizeMM: 250.0,
+                                            defaultPrintedSizeMM: 180.0,
                                             depthMapMM: dPixels,
                                             confidenceMap: cPixels,
                                             depthWidth: wD,
@@ -3472,29 +3509,67 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                             var markerLines: [String] = []
                             for m in confirmedSightings {
                                 let mq = m.quaternionXYZW
+                                let mcq = m.quaternionCameraXYZW
                                 let c = m.cornersUV
                                 let mLine = String(
-                                    format: "%.6f,%d,%d,%.2f,%.3f,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                                    format: "%.6f,%d,%d,%.2f,%.3f,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.6f,%.6f,%.6f,%.8f,%.8f,%.8f,%.8f,%.4f,%.2f,%.5f,%.5f,%d\n",
                                     timestampS, sIdx, m.markerID,
                                     m.sizeMMPrinted, m.sizeMMMeasured,
                                     m.positionWorld.x, m.positionWorld.y, m.positionWorld.z,
                                     mq.x, mq.y, mq.z, mq.w,
-                                    c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y
+                                    c[0].x, c[0].y, c[1].x, c[1].y, c[2].x, c[2].y, c[3].x, c[3].y,
+                                    m.positionCamera.x, m.positionCamera.y, m.positionCamera.z,
+                                    mcq.x, mcq.y, mcq.z, mcq.w,
+                                    m.rangeMeters, m.viewingAngleDeg,
+                                    m.edgeDisagreementRatio, m.planeRMSEMeters, m.depthSampleCount
                                 )
                                 markerLines.append(mLine)
                             }
 
+                            var pairLines: [String] = []
+                            let sightingsForPairs: [DetectedMarkerSighting] = {
+                                if confirmedSightings.count >= 2 {
+                                    return confirmedSightings
+                                } else if rawDetected3D.count >= 2 && trackingStr == "normal" && isSteadyEnoughForStill {
+                                    return rawDetected3D
+                                }
+                                return []
+                            }()
+                            if sightingsForPairs.count >= 2 {
+                                for i in 0..<sightingsForPairs.count {
+                                    for j in (i + 1)..<sightingsForPairs.count {
+                                        if let pair = ArUcoDetector.computeSingleFramePairMeasurement(
+                                            sightingA: sightingsForPairs[i],
+                                            sightingB: sightingsForPairs[j]
+                                        ) {
+                                            let pLine = String(
+                                                format: "%.6f,%d,%d,%d,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%.2f,%.2f,%.4f\n",
+                                                timestampS, sIdx, pair.idA, pair.idB,
+                                                pair.dxCamM, pair.dyCamM, pair.dzCamM,
+                                                pair.distM, pair.dYawRad,
+                                                pair.rangeAM, pair.rangeBM,
+                                                pair.angleADeg, pair.angleBDeg,
+                                                pair.weight
+                                            )
+                                            pairLines.append(pLine)
+                                        }
+                                    }
+                                }
+                            }
+
                             let finalDetected = confirmedSightings
                             let finalRawDetected = rawDetected3D
+                            let finalSeen2D = seen2DMarkerIDs
                             let finalEncodedStill = encodedStill
                             let finalMarkerLines = markerLines
+                            let finalPairLines = pairLines
                             if let m0 = finalDetected.first(where: { $0.markerID == 0 }) {
                                 let mq = simd_quatd(ix: m0.quaternionXYZW.x, iy: m0.quaternionXYZW.y, iz: m0.quaternionXYZW.z, r: m0.quaternionXYZW.w)
                                 let m0XAxis = simd_act(mq, SIMD3<Double>(1.0, 0.0, 0.0))
                                 engine.anchorMarker0Frame(originWorld: m0.positionWorld, xAxisWorld: m0XAxis)
                             }
 
-                            if finalEncodedStill != nil || !finalMarkerLines.isEmpty {
+                            if finalEncodedStill != nil || !finalMarkerLines.isEmpty || !finalPairLines.isEmpty {
                                 self.writerQueue.async { [weak self] in
                                     guard let self, !engine.isClosed else { return }
                                     do {
@@ -3507,6 +3582,9 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         }
                                         for mLine in finalMarkerLines {
                                             try engine.appendLine(mLine, to: engine.markersFH)
+                                        }
+                                        for pLine in finalPairLines {
+                                            try engine.appendLine(pLine, to: engine.pairsFH)
                                         }
                                     } catch {
                                         let errMsg = error.localizedDescription
@@ -3571,6 +3649,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                         cameraPositionWorld: camPosW,
                                         confirmedSightings: finalDetected,
                                         rawSightings: finalRawDetected,
+                                        seen2DMarkerIDs: finalSeen2D,
                                         unifiedLoopClosed: self.phoneLoopState.unifiedLoopClosed,
                                         thermalLevel: activeThermalLevel,
                                         lowDiskSpaceWarning: self.lowDiskSpaceWarning != nil,
@@ -3598,6 +3677,7 @@ extension CaptureSessionRecorder: ARSessionDelegate {
                                     self.guidedWalkPhase = self.guidedEngine.phase
                                     self.activeRingState = self.guidedEngine.activeRingState
                                     self.lockedMarkerIDs = self.guidedEngine.lockedMarkerIDs
+                                    self.seenMarkerIDs = self.guidedEngine.pairGraphState.seenMarkerIDs.union(self.phoneLoopState.detectedMarkerIDs)
                                     self.lookUpProgressFraction = self.guidedEngine.lookUpTracker.progressFraction
                                     self.isLookUpDone = self.guidedEngine.lookUpTracker.isDone
                                     self.thermalSchedule = detStep.thermalSchedule

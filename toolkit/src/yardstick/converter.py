@@ -14,9 +14,9 @@
 
 """Convert a Level 1 raw phone recording into a Level 2 Standard Capture (`standard/`).
 
-Implements YS-14, YS-21, YS-31, YS-32, YS-33, YS-41, YS-42, YS-43, YS-50, YS-51, YS-52, YS-53.
+Implements YS-14, YS-21, YS-31, YS-32, YS-33, YS-41, YS-42, YS-43, YS-50, YS-51, YS-52, YS-53, YS-115.
 Notice (YS-43): `tape_checks` in `session.json` are NEVER consulted while building
-`cloud.ply`, `frame.json`, `keyframes.json`, `trajectory.json`, or `coverage.json`.
+`cloud.ply`, `cloud.raw.ply`, `frame.json`, `keyframes.json`, `trajectory.json`, `trajectory.raw.json`, or `coverage.json`.
 """
 
 from __future__ import annotations
@@ -41,9 +41,15 @@ from yardstick.geometry import (
     pose_to_matrix,
     unproject_depth_frame,
     voxel_downsample_point_cloud,
+    warp_trajectory_to_marker_layout,
 )
 from yardstick.grading import compute_grade_and_tolerances
-from yardstick.markers import detect_aruco_markers_opencv, evaluate_marker_scale_errors
+from yardstick.markers import (
+    detect_aruco_markers_opencv,
+    evaluate_marker_scale_errors,
+    extract_one_frame_pairs,
+    solve_marker_layout_graph,
+)
 from yardstick.ply import write_cloud_ply
 from yardstick.validator import sha256_file, validate_recording
 
@@ -132,7 +138,9 @@ def convert_recording_to_standard(
     for srow in stills_rows:
         stills_by_saved[int(srow["saved_index"])] = srow
 
-    # 2. Unproject LiDAR depth frames into ARKit world coordinates
+    # 2. Unproject LiDAR depth frames in camera coordinates & ARKit world coordinates
+    eye4 = np.eye(4, dtype=np.float64)
+    per_frame_cam_clouds: list[tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     all_pts_w: list[np.ndarray] = []
     all_rgb: list[np.ndarray] = []
     all_conf: list[np.ndarray] = []
@@ -170,7 +178,7 @@ def convert_recording_to_standard(
                     integrity_status = "invalid"
                     rgb_img = None
 
-        pts_w, colors_u8, confs_u8, ranges_m = unproject_depth_frame(
+        pts_cam, colors_u8, confs_u8, ranges_m = unproject_depth_frame(
             depth_mm=depth_mm,
             conf_img=conf_img,
             rgb_img=rgb_img,
@@ -180,12 +188,14 @@ def convert_recording_to_standard(
             cy=float(prow["cy"]),
             rgb_width=int(prow["width"]),
             rgb_height=int(prow["height"]),
-            T_target_from_cam=T_wc,
+            T_target_from_cam=eye4,
             min_conf=1,
             min_range_m=0.20,
             max_range_m=4.50,
         )
-        if pts_w.shape[0] > 0:
+        if pts_cam.shape[0] > 0:
+            per_frame_cam_clouds.append((s_idx, pts_cam, colors_u8, confs_u8, ranges_m))
+            pts_w = (pts_cam @ T_wc[:3, :3].T) + T_wc[:3, 3]
             all_pts_w.append(pts_w)
             all_rgb.append(colors_u8)
             all_conf.append(confs_u8)
@@ -296,6 +306,49 @@ def convert_recording_to_standard(
         T_yard_from_world=T_yard_from_world,
     )
 
+    # 5b. Evaluate printed-marker scale (never reads tape_checks) & solve one-frame pair layout graph (YS-115)
+    marker_scale_info = evaluate_marker_scale_errors(
+        capture_dir=capture_dir,
+        markers_rows=markers_rows,
+        poses_by_index=poses_by_index,
+        passes_by_marker=passes_by_marker,
+    )
+    pair_rows = extract_one_frame_pairs(
+        capture_dir=capture_dir,
+        markers_rows=markers_rows,
+        poses_by_index=poses_by_index,
+        ground_normal_world=ground_normal_w,
+    )
+    layout_res = solve_marker_layout_graph(
+        markers_rows=markers_rows,
+        pair_rows=pair_rows,
+        passes_by_marker=passes_by_marker,
+        T_yard_from_world=T_yard_from_world,
+        origin_height_m=float(yard_frame_dict["origin_height_m"]),
+        marker_scale_info=marker_scale_info,
+    )
+    scale_applied = float(layout_res["marker_layout"]["scale_applied"])
+
+    warp_res = warp_trajectory_to_marker_layout(
+        camera_poses_world=camera_poses_world,
+        poses_by_index=poses_by_index,
+        T_yard_from_world=T_yard_from_world,
+        markers_rows=markers_rows,
+        passes_by_marker=passes_by_marker,
+        solved_positions_yard=layout_res["solved_positions_yard"],
+        vio_similarity=layout_res["vio_similarity"],
+        scale_applied=scale_applied,
+    )
+    warped_poses_yard: dict[int, np.ndarray] = warp_res["warped_poses_yard"]
+    raw_poses_yard: dict[int, np.ndarray] = warp_res["raw_poses_yard"]
+
+    layout_res["marker_layout"]["trajectory_warp_applied"] = bool(warp_res["trajectory_warp_applied"])
+    layout_res["marker_layout"]["trajectory_warp_method"] = str(warp_res["trajectory_warp_method"])
+    layout_res["marker_layout"]["per_marker_warp_corrections"] = warp_res["per_marker_warp_corrections"]
+
+    yard_frame_dict["markers_yard"] = layout_res["markers_yard"]
+    yard_frame_dict["marker_layout"] = layout_res["marker_layout"]
+
     frame_json_data = {
         "contract": CONTRACT_VERSION,
         "method": yard_frame_dict["method"],
@@ -311,21 +364,44 @@ def convert_recording_to_standard(
         "loop_closure_gaps": yard_frame_dict["loop_closure_gaps"],
         "pose_jumps": yard_frame_dict["pose_jumps"],
         "pose_jump_window_t_s": yard_frame_dict["pose_jump_window_t_s"],
+        "markers_yard": layout_res["markers_yard"],
+        "marker_layout": layout_res["marker_layout"],
     }
 
-    # 6. Transform point cloud into Yard Frame & voxel downsample (YS-50)
+    # 6. Transform point cloud into Yard Frame (both raw unwarped and default warped) & voxel downsample (YS-50, YS-115 Condition 4)
     if pts_world.shape[0] > 0:
-        pts_yard = (pts_world @ R_yw.T) + t_yw
+        pts_yard_raw = (pts_world @ R_yw.T) + t_yw
     else:
-        pts_yard = np.zeros((0, 3), dtype=np.float64)
+        pts_yard_raw = np.zeros((0, 3), dtype=np.float64)
 
-    ds_xyz, ds_rgb, ds_conf, ds_ranges = voxel_downsample_point_cloud(
-        points_xyz=pts_yard,
+    ds_raw_xyz, ds_raw_rgb, ds_raw_conf, ds_raw_ranges = voxel_downsample_point_cloud(
+        points_xyz=pts_yard_raw,
         colors_rgb=rgb_world,
         confidences=conf_world,
         ranges_m=ranges_world,
         voxel_size_m=voxel_size_m,
     )
+
+    if per_frame_cam_clouds and warp_res["trajectory_warp_applied"]:
+        warped_pts_list: list[np.ndarray] = []
+        warped_ranges_list: list[np.ndarray] = []
+        for s_idx, pts_cam, _, _, ranges_m in per_frame_cam_clouds:
+            T_yc_w = warped_poses_yard.get(s_idx, raw_poses_yard[s_idx])
+            pts_cam_scaled = scale_applied * pts_cam
+            pts_y_w = (pts_cam_scaled @ T_yc_w[:3, :3].T) + T_yc_w[:3, 3]
+            warped_pts_list.append(pts_y_w)
+            warped_ranges_list.append(scale_applied * ranges_m)
+        pts_yard_warped = np.vstack(warped_pts_list)
+        ranges_warped = np.concatenate(warped_ranges_list)
+        ds_xyz, ds_rgb, ds_conf, ds_ranges = voxel_downsample_point_cloud(
+            points_xyz=pts_yard_warped,
+            colors_rgb=rgb_world,
+            confidences=conf_world,
+            ranges_m=ranges_warped,
+            voxel_size_m=voxel_size_m,
+        )
+    else:
+        ds_xyz, ds_rgb, ds_conf, ds_ranges = ds_raw_xyz, ds_raw_rgb, ds_raw_conf, ds_raw_ranges
 
     # 7. Compute scanned ground coverage polygon & holes (YS-52)
     try:
@@ -352,16 +428,17 @@ def convert_recording_to_standard(
             },
         }
 
-    # 8. Build `trajectory.json` and compute total walk length
+    # 8. Build `trajectory.json` (warped default) and `trajectory.raw.json` (unwarped original)
     traj_poses_list: list[dict[str, Any]] = []
+    traj_raw_poses_list: list[dict[str, Any]] = []
     walk_length_m = 0.0
     prev_pos_yard: np.ndarray | None = None
 
     for s_idx in sorted(poses_by_index.keys()):
         prow = poses_by_index[s_idx]
-        T_wc = camera_poses_world[s_idx]
-        T_yc = T_yard_from_world @ T_wc
-        pos_y = T_yc[:3, 3]
+        T_yc_raw = raw_poses_yard[s_idx]
+        T_yc_warped = warped_poses_yard.get(s_idx, T_yc_raw)
+        pos_y = T_yc_warped[:3, 3]
         if prev_pos_yard is not None:
             walk_length_m += float(np.linalg.norm(pos_y - prev_pos_yard))
         prev_pos_yard = pos_y
@@ -369,13 +446,24 @@ def convert_recording_to_standard(
             {
                 "t": round(float(prow["t"]), 6),
                 "saved_index": s_idx,
-                "pose": [round(float(x), 8) for x in T_yc.flatten()],
+                "pose": [round(float(x), 8) for x in T_yc_warped.flatten()],
+            }
+        )
+        traj_raw_poses_list.append(
+            {
+                "t": round(float(prow["t"]), 6),
+                "saved_index": s_idx,
+                "pose": [round(float(x), 8) for x in T_yc_raw.flatten()],
             }
         )
 
     trajectory_json_data = {
         "contract": CONTRACT_VERSION,
         "poses": traj_poses_list,
+    }
+    trajectory_raw_json_data = {
+        "contract": CONTRACT_VERSION,
+        "poses": traj_raw_poses_list,
     }
 
     # 9. Build `standard/` directory and write geometry files
@@ -384,14 +472,16 @@ def convert_recording_to_standard(
     kf_dir = std_dir / "keyframes"
     kf_dir.mkdir(parents=True, exist_ok=True)
 
-    # 9a. `standard/cloud.ply`
+    # 9a. `standard/cloud.ply` (warped default) and `standard/cloud.raw.ply` (unwarped original, Condition 4)
     write_cloud_ply(std_dir / "cloud.ply", ds_xyz, ds_conf, ds_rgb, ds_ranges)
+    write_cloud_ply(std_dir / "cloud.raw.ply", ds_raw_xyz, ds_raw_conf, ds_raw_rgb, ds_raw_ranges)
 
     # 9b. `standard/frame.json`
     _write_json(std_dir / "frame.json", frame_json_data)
 
-    # 9c. `standard/trajectory.json`
+    # 9c. `standard/trajectory.json` and `standard/trajectory.raw.json`
     _write_json(std_dir / "trajectory.json", trajectory_json_data)
+    _write_json(std_dir / "trajectory.raw.json", trajectory_raw_json_data)
 
     # 9d. `standard/coverage.json`
     _write_json(std_dir / "coverage.json", coverage_json_data)
@@ -408,16 +498,19 @@ def convert_recording_to_standard(
         if src_path.exists():
             shutil.copy2(src_path, dst_path)
 
-        T_wc = pose_to_matrix(
-            float(srow["px"]),
-            float(srow["py"]),
-            float(srow["pz"]),
-            float(srow["qx"]),
-            float(srow["qy"]),
-            float(srow["qz"]),
-            float(srow["qw"]),
-        )
-        T_yc = T_yard_from_world @ T_wc
+        if s_idx in warped_poses_yard:
+            T_yc = warped_poses_yard[s_idx]
+        else:
+            T_wc = pose_to_matrix(
+                float(srow["px"]),
+                float(srow["py"]),
+                float(srow["pz"]),
+                float(srow["qx"]),
+                float(srow["qy"]),
+                float(srow["qz"]),
+                float(srow["qw"]),
+            )
+            T_yc = T_yard_from_world @ T_wc
         keyframes_list.append(
             {
                 "id": kf_id,
@@ -467,14 +560,8 @@ def convert_recording_to_standard(
     }
     _write_json(std_dir / "events.json", events_json_data)
 
-    # 10. Compute marker scale error & `standard/grade.json` (YS-33, YS-41, YS-42, YS-43)
+    # 10. Compute `standard/grade.json` (YS-33, YS-41, YS-42, YS-43, YS-115)
     # Notice (YS-43): `tape_checks` are ONLY read here, AFTER all geometry files have been written!
-    marker_scale_info = evaluate_marker_scale_errors(
-        capture_dir=capture_dir,
-        markers_rows=markers_rows,
-        poses_by_index=poses_by_index,
-        passes_by_marker=passes_by_marker,
-    )
     tape_checks_world = session.get("tape_checks", [])
     grade_json_data = compute_grade_and_tolerances(
         integrity_status=integrity_status,

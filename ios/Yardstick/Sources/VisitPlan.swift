@@ -533,6 +533,14 @@ public struct VisitPlan: Codable, Equatable, Sendable {
                 )
             }
         }
+        for m in markers {
+            if m.id < 0 || m.id > 7 {
+                throw VisitPlanValidationError.ruleViolation(
+                    rule: "marker_id_out_of_range",
+                    detail: "Marker id \(m.id) must be in 0...7 (YS-115)"
+                )
+            }
+        }
 
         // Rule 2: map_image_corners_required
         if map.imagePath != nil {
