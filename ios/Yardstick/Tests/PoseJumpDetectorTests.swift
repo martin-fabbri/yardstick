@@ -55,7 +55,7 @@ final class PoseJumpDetectorTests: XCTestCase {
 
     /// Walk 7 (2026-11-01): the toolkit found two jumps (0.108140 m at saved index 8339, 0.093554 m at 9164).
     func testYS88_Walk7RealPoses_MatchToolkitJumpsExactly() throws {
-        let root = ProcessInfo.processInfo.environment["YARDSTICK_REPLAY_ROOT"] ?? "/Users/martinfabbri/Workspace/scrap/yardstick-captures"
+        let root = ProcessInfo.processInfo.environment["YARDSTICK_REPLAY_ROOT"] ?? ProcessInfo.processInfo.environment["TEST_RUNNER_YARDSTICK_REPLAY_ROOT"] ?? "/nonexistent"
         let url = URL(fileURLWithPath: root)
             .appendingPathComponent("2026-11-01/walk-7/20261102T004449Z_yardstick/poses.csv")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else {

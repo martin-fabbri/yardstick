@@ -153,8 +153,9 @@ def unproject_depth_frame(
     min_conf: int = 1,
     min_range_m: float = 0.20,
     max_range_m: float = 4.50,
+    depth_scale: float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Unproject 16-bit depth (mm) into 3D points in target frame (YS-04, YS-50).
+    """Unproject 16-bit depth (mm) into 3D points in target frame (YS-04, YS-50, YS-115).
 
     Returns (points_xyz, colors_rgb, confidences, ranges_m).
     """
@@ -166,7 +167,7 @@ def unproject_depth_frame(
     cx_d = cx * scale_x
     cy_d = cy * scale_y
 
-    z_d = depth_mm.astype(np.float64) / 1000.0
+    z_d = (depth_mm.astype(np.float64) / 1000.0) * float(depth_scale)
     valid = (depth_mm > 0) & (conf_img >= min_conf)
     if not np.any(valid):
         return (
@@ -1081,4 +1082,181 @@ def compute_scanned_ground_coverage(
             "simplify_epsilon_m": simplify_epsilon_m,
         },
     }
+
+
+def warp_trajectory_to_marker_layout(
+    camera_poses_world: dict[int, np.ndarray],
+    poses_by_index: dict[int, dict[str, Any]],
+    T_yard_from_world: np.ndarray,
+    markers_rows: list[dict[str, Any]],
+    passes_by_marker: dict[int, list[list[dict[str, Any]]]],
+    solved_positions_yard: dict[int, np.ndarray],
+    vio_similarity: tuple[float, np.ndarray, np.ndarray] | None = None,
+    scale_applied: float = 1.0,
+) -> dict[str, Any]:
+    """Piecewise-warp camera trajectory in the Yard Frame onto solved marker sightings (YS-115 §3.6, Condition 4).
+
+    Returns:
+      - `warped_poses_yard`: dict[saved_index, 4x4 SE(3) matrix in Yard Frame]
+      - `raw_poses_yard`: dict[saved_index, 4x4 SE(3) matrix in Yard Frame]
+      - `trajectory_warp_applied`: bool
+      - `trajectory_warp_method`: str
+      - `per_marker_warp_corrections`: list[dict]
+    """
+    R_yw = T_yard_from_world[:3, :3]
+    t_yw = T_yard_from_world[:3, 3]
+
+    sorted_indices = sorted(camera_poses_world.keys())
+    raw_poses_yard: dict[int, np.ndarray] = {}
+    for s_idx in sorted_indices:
+        raw_poses_yard[s_idx] = T_yard_from_world @ camera_poses_world[s_idx]
+
+    if not sorted_indices or not solved_positions_yard or not markers_rows:
+        return {
+            "warped_poses_yard": {k: v.copy() for k, v in raw_poses_yard.items()},
+            "raw_poses_yard": raw_poses_yard,
+            "trajectory_warp_applied": False,
+            "trajectory_warp_method": "none",
+            "per_marker_warp_corrections": [],
+        }
+
+    # Build frame-level marker sighting anchors
+    anchor_offsets_by_idx: dict[int, np.ndarray] = {}
+    rows_by_idx: dict[int, list[dict[str, Any]]] = {}
+    for r in markers_rows:
+        s_idx = int(r["saved_index"])
+        mid = int(r["marker_id"])
+        if s_idx in raw_poses_yard and mid in solved_positions_yard:
+            rows_by_idx.setdefault(s_idx, []).append(r)
+
+    for s_idx, f_rows in sorted(rows_by_idx.items()):
+        T_yc_raw = raw_poses_yard[s_idx]
+        T_wc = camera_poses_world[s_idx]
+        R_wc_inv = T_wc[:3, :3].T
+        t_wc = T_wc[:3, 3]
+        offsets: list[np.ndarray] = []
+        for r in f_rows:
+            mid = int(r["marker_id"])
+            target_y = solved_positions_yard[mid]
+            # If camera-space coordinates are recorded or derivable from same-frame world pose:
+            if all(r.get(c, "") != "" for c in ("cam_x", "cam_y", "cam_z")):
+                p_cam = np.array([float(r["cam_x"]), float(r["cam_y"]), float(r["cam_z"])], dtype=np.float64)
+            else:
+                p_w = np.array([float(r["x"]), float(r["y"]), float(r["z"])], dtype=np.float64)
+                p_cam = R_wc_inv @ (p_w - t_wc)
+            p_raw_y = (T_yc_raw[:3, :3] @ (float(scale_applied) * p_cam)) + T_yc_raw[:3, 3]
+            off = target_y - p_raw_y
+            # Keep vertical ground plane at z=0 unless vertical drift exceeds 3 cm
+            if abs(float(off[2])) <= 0.03:
+                off[2] = 0.0
+            offsets.append(off)
+        if offsets:
+            anchor_offsets_by_idx[s_idx] = np.mean(np.stack(offsets, axis=0), axis=0)
+
+    # Record per-marker pass warp corrections for frame.json (Condition 4)
+    per_marker_corrections: list[dict[str, Any]] = []
+    for mid, m_passes in sorted(passes_by_marker.items()):
+        if mid not in solved_positions_yard:
+            continue
+        target_y = solved_positions_yard[mid]
+        for p_idx, m_pass in enumerate(m_passes):
+            valid_rows = [r for r in m_pass if int(r["saved_index"]) in raw_poses_yard]
+            if not valid_rows:
+                continue
+            mid_row = valid_rows[len(valid_rows) // 2]
+            rep_idx = int(mid_row["saved_index"])
+            rep_t = float(mid_row["t"])
+            raw_pts_y = []
+            for r in valid_rows:
+                k = int(r["saved_index"])
+                T_yc_raw = raw_poses_yard[k]
+                T_wc = camera_poses_world[k]
+                if all(r.get(c, "") != "" for c in ("cam_x", "cam_y", "cam_z")):
+                    p_cam = np.array([float(r["cam_x"]), float(r["cam_y"]), float(r["cam_z"])], dtype=np.float64)
+                else:
+                    p_w = np.array([float(r["x"]), float(r["y"]), float(r["z"])], dtype=np.float64)
+                    p_cam = T_wc[:3, :3].T @ (p_w - T_wc[:3, 3])
+                raw_pts_y.append((T_yc_raw[:3, :3] @ (float(scale_applied) * p_cam)) + T_yc_raw[:3, 3])
+            raw_med_y = np.median(np.stack(raw_pts_y, axis=0), axis=0)
+            corr = target_y - raw_med_y
+            if abs(float(corr[2])) <= 0.03:
+                corr[2] = 0.0
+            corr_norm = float(np.linalg.norm(corr))
+            per_marker_corrections.append(
+                {
+                    "marker_id": int(mid),
+                    "pass_index": int(p_idx),
+                    "t_s": round(rep_t, 6),
+                    "saved_index": int(rep_idx),
+                    "raw_yard_xyz_m": [round(float(x), 6) for x in raw_med_y],
+                    "target_yard_xyz_m": [round(float(x), 6) for x in target_y],
+                    "correction_xyz_m": [round(float(x), 6) for x in corr],
+                    "correction_norm_m": round(corr_norm, 6),
+                }
+            )
+
+    if not anchor_offsets_by_idx:
+        return {
+            "warped_poses_yard": {k: v.copy() for k, v in raw_poses_yard.items()},
+            "raw_poses_yard": raw_poses_yard,
+            "trajectory_warp_applied": False,
+            "trajectory_warp_method": "none",
+            "per_marker_warp_corrections": per_marker_corrections,
+        }
+
+    # Interpolate camera translation offsets across all saved_indices using step-excess weighted arc length
+    anchor_keys = sorted(anchor_offsets_by_idx.keys())
+    pos_raw = np.array([raw_poses_yard[k][:3, 3] for k in sorted_indices], dtype=np.float64)
+    if len(sorted_indices) >= 2:
+        step_dists = np.linalg.norm(np.diff(pos_raw, axis=0), axis=1)
+        med_step = float(np.median(step_dists)) if len(step_dists) > 0 else 0.05
+        # Concentrate interpolation weight on sudden pose jump steps (> 3x median step)
+        step_weights = np.maximum(1e-4, step_dists + 50.0 * np.maximum(0.0, step_dists - max(0.08, 2.5 * med_step)))
+        cum_w = np.concatenate([[0.0], np.cumsum(step_weights)])
+    else:
+        cum_w = np.zeros(len(sorted_indices), dtype=np.float64)
+
+    idx_to_pos = {k: i for i, k in enumerate(sorted_indices)}
+    warped_poses_yard: dict[int, np.ndarray] = {}
+
+    for k in sorted_indices:
+        T_w = raw_poses_yard[k].copy()
+        if k in anchor_offsets_by_idx:
+            delta_t = anchor_offsets_by_idx[k]
+        elif k < anchor_keys[0]:
+            delta_t = anchor_offsets_by_idx[anchor_keys[0]]
+        elif k > anchor_keys[-1]:
+            delta_t = anchor_offsets_by_idx[anchor_keys[-1]]
+        else:
+            # Find surrounding anchor keys k_lo < k < k_hi
+            hi_pos = int(np.searchsorted(anchor_keys, k))
+            k_lo = anchor_keys[hi_pos - 1]
+            k_hi = anchor_keys[hi_pos]
+            w_lo = cum_w[idx_to_pos[k_lo]]
+            w_hi = cum_w[idx_to_pos[k_hi]]
+            w_k = cum_w[idx_to_pos[k]]
+            alpha = (w_k - w_lo) / max(w_hi - w_lo, 1e-9)
+            delta_t = (1.0 - alpha) * anchor_offsets_by_idx[k_lo] + alpha * anchor_offsets_by_idx[k_hi]
+        T_w[:3, 3] = T_w[:3, 3] + delta_t
+        warped_poses_yard[k] = T_w
+
+    has_multi_marker_sim = (
+        vio_similarity is not None
+        and len(solved_positions_yard) >= 2
+        and abs(float(vio_similarity[0]) - 1.0) > 1e-5
+    )
+    warp_method = (
+        "similarity_plus_piecewise_anchor_v1"
+        if has_multi_marker_sim
+        else "piecewise_anchor_v1"
+    )
+
+    return {
+        "warped_poses_yard": warped_poses_yard,
+        "raw_poses_yard": raw_poses_yard,
+        "trajectory_warp_applied": True,
+        "trajectory_warp_method": warp_method,
+        "per_marker_warp_corrections": per_marker_corrections,
+    }
+
 

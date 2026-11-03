@@ -53,12 +53,256 @@
         "null"
       ]
     },
+    "marker_layout": {
+      "additionalProperties": false,
+      "properties": {
+        "closed_loop_edge_rmse_m": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "cycle_count": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "markers_connected_ids": {
+          "items": {
+            "maximum": 7,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "markers_seen_ids": {
+          "items": {
+            "maximum": 7,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "max_edge_residual_m": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "open_loop_cycle_residual_m": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "pair_edges": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "dist_3d_measured_m": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "dist_3d_solved_m": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "dist_horiz_measured_m": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "dz_measured_m": {
+                "type": "number"
+              },
+              "marker_i": {
+                "maximum": 7,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "marker_j": {
+                "maximum": 7,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "rel_yaw_measured_rad": {
+                "type": "number"
+              },
+              "residual_m": {
+                "type": "number"
+              },
+              "sightings_count": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "sigma_dist_m": {
+                "minimum": 0,
+                "type": "number"
+              }
+            },
+            "required": [
+              "marker_i",
+              "marker_j",
+              "sightings_count",
+              "dist_3d_measured_m",
+              "dist_3d_solved_m",
+              "dist_horiz_measured_m",
+              "dz_measured_m",
+              "rel_yaw_measured_rad",
+              "residual_m",
+              "sigma_dist_m"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "pair_graph_connected": {
+          "type": "boolean"
+        },
+        "per_marker_warp_corrections": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "correction_norm_m": {
+                "minimum": 0,
+                "type": "number"
+              },
+              "correction_xyz_m": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "marker_id": {
+                "maximum": 7,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "pass_index": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "raw_yard_xyz_m": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "saved_index": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "t_s": {
+                "type": "number"
+              },
+              "target_yard_xyz_m": {
+                "items": {
+                  "type": "number"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              }
+            },
+            "required": [
+              "marker_id",
+              "pass_index",
+              "t_s",
+              "saved_index",
+              "raw_yard_xyz_m",
+              "target_yard_xyz_m",
+              "correction_xyz_m",
+              "correction_norm_m"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
+        "printed_scale_factor": {
+          "exclusiveMinimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "printed_scale_se": {
+          "minimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "scale_applied": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        "solver_method": {
+          "enum": [
+            "one_frame_pair_graph_v1",
+            "arkit_world_fallback_v1"
+          ],
+          "type": "string"
+        },
+        "trajectory_warp_applied": {
+          "type": "boolean"
+        },
+        "trajectory_warp_method": {
+          "enum": [
+            "similarity_plus_piecewise_anchor_v1",
+            "piecewise_anchor_v1",
+            "none"
+          ],
+          "type": "string"
+        },
+        "unconnected_marker_ids": {
+          "items": {
+            "maximum": 7,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "type": "array"
+        },
+        "vio_to_pair_scale_ratio": {
+          "exclusiveMinimum": 0,
+          "type": [
+            "number",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "solver_method",
+        "markers_seen_ids",
+        "markers_connected_ids",
+        "unconnected_marker_ids",
+        "pair_graph_connected",
+        "cycle_count",
+        "pair_edges",
+        "open_loop_cycle_residual_m",
+        "closed_loop_edge_rmse_m",
+        "max_edge_residual_m",
+        "printed_scale_factor",
+        "printed_scale_se",
+        "scale_applied",
+        "trajectory_warp_applied"
+      ],
+      "type": "object"
+    },
     "markers_yard": {
       "description": "Optional fused 3D coordinates and normals of detected ArUco markers in the Yard Frame (metres).",
       "items": {
         "additionalProperties": false,
         "properties": {
+          "connected_to_origin": {
+            "type": "boolean"
+          },
           "marker_id": {
+            "maximum": 7,
             "minimum": 0,
             "type": "integer"
           },
@@ -70,9 +314,33 @@
             "minItems": 3,
             "type": "array"
           },
+          "pair_degree": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "placement_source": {
+            "enum": [
+              "pair_graph",
+              "vio_similarity_fallback",
+              "arkit_world_fallback"
+            ],
+            "type": "string"
+          },
+          "position_uncertainty_m": {
+            "minimum": 0,
+            "type": "number"
+          },
           "sightings_count": {
             "minimum": 1,
             "type": "integer"
+          },
+          "xyz_arkit_open_loop_m": {
+            "items": {
+              "type": "number"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": "array"
           },
           "xyz_m": {
             "items": {
@@ -81,6 +349,9 @@
             "maxItems": 3,
             "minItems": 3,
             "type": "array"
+          },
+          "yaw_yard_rad": {
+            "type": "number"
           }
         },
         "required": [

@@ -108,6 +108,19 @@ public struct ReplayMarkerSighting: Sendable {
     }
 }
 
+/// A timed single-frame pair measurement produced during live capture or replay (`YS-115`).
+public struct ReplayPairSighting: Sendable, Equatable {
+    public let timestampS: Double
+    public let savedIndex: Int
+    public let pair: SingleFramePairSighting
+
+    public init(timestampS: Double, savedIndex: Int, pair: SingleFramePairSighting) {
+        self.timestampS = timestampS
+        self.savedIndex = savedIndex
+        self.pair = pair
+    }
+}
+
 /// Encapsulates the phone's marker-excursion and loop-closure tracking state (`YS-66`, `YS-71`),
 /// shared between `CaptureSessionRecorder` and `CaptureReplayHarness`.
 ///
@@ -541,8 +554,10 @@ public struct CaptureReplayResult: Sendable {
     public let stillCount: Int
     public let originalSightings: [ReplayMarkerSighting]
     public let replayedSightings: [ReplayMarkerSighting]
+    public let replayedPairs: [ReplayPairSighting]
     public let phoneLoopState: PhoneLoopRuleState
     public let guidedEngine: GuidedCaptureEngine
+    public let groundCoverageGrid: GroundCoverageGrid
     public let elapsedSeconds: Double
     /// Count of still-backed rows in `originalSightings` rejected by OpenCV `DICT_5X5_250` + sub-pixel corner shift (`YS-70`, `YS-73`).
     public let openCVRejectedOriginalSightingsCount: Int
@@ -854,30 +869,24 @@ public enum CaptureReplayHarness {
                         state[sIdx] = ids2D
                     }
                 }
-                var measured: [DetectedMarkerSighting] = []
-                for d2 in dets2D {
-                    let pSize = immutablePrintedSizes[d2.markerID] ?? defaultPrintedSizeMM
-                    if let s3D = ArUcoDetector.measureMarker3DOnLiDARPlane(
-                        markerID: d2.markerID,
-                        cornersUV: d2.cornersUV,
-                        printedSizeMM: pSize,
-                        depthMapMM: dMM,
-                        confidenceMap: cMap,
-                        depthWidth: dW,
-                        depthHeight: dH,
-                        rgbWidth: pose.w,
-                        rgbHeight: pose.h,
-                        fx: pose.fx,
-                        fy: pose.fy,
-                        cx: pose.cx,
-                        cy: pose.cy,
-                        cameraToWorld: pose.cMat,
-                        maxEdgeDisagreementRatio: 0.04,
-                        maxPlaneTiltFromViewDeg: 60.0
-                    ) {
-                        measured.append(s3D)
-                    }
-                }
+                let measured = ArUcoDetector.measureMarkers3DForFrame(
+                    dets2D: dets2D,
+                    printedSizesByMarker: immutablePrintedSizes,
+                    defaultPrintedSizeMM: defaultPrintedSizeMM,
+                    depthMapMM: dMM,
+                    confidenceMap: cMap,
+                    depthWidth: dW,
+                    depthHeight: dH,
+                    rgbWidth: pose.w,
+                    rgbHeight: pose.h,
+                    fx: pose.fx,
+                    fy: pose.fy,
+                    cx: pose.cx,
+                    cy: pose.cy,
+                    cameraToWorld: pose.cMat,
+                    maxEdgeDisagreementRatio: 0.04,
+                    maxPlaneTiltFromViewDeg: 60.0
+                )
                 if !measured.isEmpty {
                     let snapshot = measured
                     detectionsLock.withLock { state in
@@ -933,22 +942,27 @@ public enum CaptureReplayHarness {
         let detected2DBySavedIndex = detected2DLock.withLock { $0 }
 
         // 6. Feed all frames sequentially in timestamp order through the phone's rules
+        let hasGuidanceStream = FileManager.default.fileExists(atPath: guidanceURL.path)
         var phoneLoopState = PhoneLoopRuleState()
         phoneLoopState.walkStartTimeS = orderedPoses.first?.t
         phoneLoopState.walkEndTimeS = orderedPoses.last?.t
-        phoneLoopState.loopClosedEventTimeS = loopClosedTimes.max()
+        if !hasGuidanceStream {
+            phoneLoopState.loopClosedEventTimeS = loopClosedTimes.max()
+        }
         let filteredTaps = operatorTapTimes.filter { tapT in
-            guard let lcT = phoneLoopState.loopClosedEventTimeS else { return true }
+            guard let lcT = loopClosedTimes.max() else { return true }
             return tapT <= lcT + 1e-6
         }
         phoneLoopState.lastOperatorTapTimeS = filteredTaps.max()
 
-        let hasGuidanceStream = FileManager.default.fileExists(atPath: guidanceURL.path)
         var guidedEngine = GuidedCaptureEngine(
             requireLookUpStep: hasGuidanceStream,
-            preWalkTapeMeters0To1: preWalkTapeMeters0To1
+            preWalkTapeMeters0To1: preWalkTapeMeters0To1,
+            tossedMarkerMode: true
         )
+        var groundCoverageGrid = GroundCoverageGrid()
         var replayedSightings: [ReplayMarkerSighting] = []
+        var replayedPairs: [ReplayPairSighting] = []
         var prevFrameT: Double? = nil
 
         for frame in frames {
@@ -989,15 +1003,59 @@ public enum CaptureReplayHarness {
                 turnRateRadS: tr,
                 exposureDurationS: expS
             )
+            let isMultiMarkerFrame = dets.count >= 2
+            let gateMaxDist = isMultiMarkerFrame
+                ? ExposureAndStillnessGate.maxPairMarkerDistanceM
+                : ExposureAndStillnessGate.maxMarkerDistanceM
             let steadyDets = dets.filter { s in
                 let rngXZ = hypot(camPosW.x - s.positionWorld.x, camPosW.z - s.positionWorld.z)
                 return ExposureAndStillnessGate.evaluateMarkerSighting(
                     predictedBlurPx: predBlur,
                     turnRateRadS: tr,
                     rangeMeters3D: s.rangeMeters,
-                    horizontalRangeMeters: rngXZ
+                    horizontalRangeMeters: rngXZ,
+                    maxDistanceMeters: gateMaxDist
                 ).passes
             }
+            let pairSource: [DetectedMarkerSighting] = {
+                if steadyDets.count >= 2 { return steadyDets }
+                if dets.count >= 2 && frame.trackingState == "normal" { return dets }
+                return []
+            }()
+            if pairSource.count >= 2 {
+                let sortedPairSource = pairSource.sorted { $0.markerID < $1.markerID }
+                for i in 0..<(sortedPairSource.count - 1) {
+                    for j in (i + 1)..<sortedPairSource.count {
+                        if let pairMeas = ArUcoDetector.computeSingleFramePairMeasurement(
+                            sightingA: sortedPairSource[i],
+                            sightingB: sortedPairSource[j]
+                        ) {
+                            replayedPairs.append(
+                                ReplayPairSighting(timestampS: frame.timestampS, savedIndex: sIdx, pair: pairMeas)
+                            )
+                        }
+                    }
+                }
+            }
+
+            if let m0 = dets.first(where: { $0.markerID == 0 }) {
+                let q0 = simd_quatd(
+                    ix: m0.quaternionXYZW.x,
+                    iy: m0.quaternionXYZW.y,
+                    iz: m0.quaternionXYZW.z,
+                    r: m0.quaternionXYZW.w
+                )
+                let xAxisW = simd_act(q0, SIMD3<Double>(1.0, 0.0, 0.0))
+                groundCoverageGrid.anchorMarker0Frame(originWorld: m0.positionWorld, xAxisWorld: xAxisW)
+            }
+            if groundCoverageGrid.isMarker0FrameAnchored && frame.trackingState == "normal" {
+                let groundY = groundCoverageGrid.groundPlaneYWorld ?? (camPosW.y - 1.30)
+                let fwdXZ = SIMD3<Double>(-cMat.columns.2.x, 0.0, -cMat.columns.2.z)
+                let lookPt = SIMD3<Double>(camPosW.x + fwdXZ.x * 1.4, groundY, camPosW.z + fwdXZ.z * 1.4)
+                groundCoverageGrid.markCoveredWorldPoint(lookPt, highConfidence: true)
+            }
+
+            let seen2D = Array(detected2DBySavedIndex[sIdx] ?? [])
             _ = guidedEngine.step(
                 timestampS: frame.timestampS,
                 savedIndex: sIdx,
@@ -1010,11 +1068,19 @@ public enum CaptureReplayHarness {
                 cameraPositionWorld: camPosW,
                 confirmedSightings: steadyDets,
                 rawSightings: dets,
+                seen2DMarkerIDs: seen2D,
                 unifiedLoopClosed: phoneLoopState.unifiedLoopClosed,
                 hasValidDepthForLookUp: true,
                 elevatedPointsAbove2m: pitchDeg >= 15.0 ? 10 : 0,
-                didRunMarkerDetection: !dets.isEmpty
+                didRunMarkerDetection: !dets.isEmpty || !seen2D.isEmpty
             )
+            if guidedEngine.isClosingMarker0Locked && phoneLoopState.loopClosedEventTimeS == nil {
+                phoneLoopState.recordLoopClosedEvent(at: frame.timestampS)
+            }
+        }
+
+        if phoneLoopState.loopClosedEventTimeS == nil, let fallbackLC = loopClosedTimes.max() {
+            phoneLoopState.recordLoopClosedEvent(at: fallbackLC)
         }
 
         // Finalize unified YS-71 loop closure evaluation at the end of the walk
@@ -1102,8 +1168,10 @@ public enum CaptureReplayHarness {
             stillCount: stillPathByIdx.count,
             originalSightings: originalSightings,
             replayedSightings: replayedSightings,
+            replayedPairs: replayedPairs,
             phoneLoopState: phoneLoopState,
             guidedEngine: guidedEngine,
+            groundCoverageGrid: groundCoverageGrid,
             elapsedSeconds: CFAbsoluteTimeGetCurrent() - tStart,
             openCVRejectedOriginalSightingsCount: openCVRejectedCount,
             ys73FlaggedOfOpenCVRejectedCount: ys73FlaggedOfRejectedCount,

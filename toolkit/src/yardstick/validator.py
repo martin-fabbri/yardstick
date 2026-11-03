@@ -32,7 +32,12 @@ from PIL import Image
 
 from yardstick.geometry import is_orthonormal_se3, is_simple_polygon, is_valid_unit_quaternion, pose_to_matrix
 from yardstick.grading import recompute_tape_check
-from yardstick.markers import detect_aruco_markers_opencv
+from yardstick.markers import (
+    MARKERS_CSV_BASE_COLUMNS,
+    MARKERS_CSV_CAMERA_COLUMNS,
+    PAIR_CSV_COLUMNS,
+    detect_aruco_markers_opencv,
+)
 from yardstick.ply import read_cloud_ply
 
 FORBIDDEN_INTERPRETATION_KEYS = {
@@ -579,21 +584,23 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                         except Exception as exc:
                             add_finding("corrupt_still_file", "error", f"Corrupt still image {rel_f}: {exc}")
 
-    # Validate markers.csv & OpenCV agreement on still-backed sightings (YS-30)
+    # Validate markers.csv & OpenCV agreement on still-backed sightings (YS-30, YS-115)
     markers_path = capture_dir / "markers.csv"
     if not markers_path.exists():
         add_finding("missing_markers_csv", "error", "markers.csv is missing")
     else:
         with open(markers_path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
-            expected_cols = [
-                "t", "saved_index", "marker_id", "size_mm_printed", "size_mm_measured",
-                "x", "y", "z", "qx", "qy", "qz", "qw",
-                "c0_u", "c0_v", "c1_u", "c1_v", "c2_u", "c2_v", "c3_u", "c3_v",
-            ]
-            if reader.fieldnames != expected_cols:
-                add_finding("markers_csv_header", "error", f"markers.csv header {reader.fieldnames} != {expected_cols}")
+            expected_cols = list(MARKERS_CSV_BASE_COLUMNS)
+            expected_cols_with_cam = expected_cols + list(MARKERS_CSV_CAMERA_COLUMNS)
+            if reader.fieldnames not in (expected_cols, expected_cols_with_cam):
+                add_finding(
+                    "markers_csv_header",
+                    "error",
+                    f"markers.csv header {reader.fieldnames} != {expected_cols} (or + camera columns)",
+                )
             else:
+                has_cam_cols = reader.fieldnames == expected_cols_with_cam
                 prev_t = -1.0
                 for r in reader:
                     t_val = float(r["t"])
@@ -602,6 +609,8 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     prev_t = t_val
                     s_idx = int(r["saved_index"])
                     mid = int(r["marker_id"])
+                    if not (0 <= mid <= 7):
+                        add_finding("marker_id_out_of_range", "error", f"Marker ID {mid} at {s_idx} not in 0..7")
                     mqx, mqy, mqz, mqw = float(r["qx"]), float(r["qy"]), float(r["qz"]), float(r["qw"])
                     T_m = pose_to_matrix(
                         float(r["x"]),
@@ -615,6 +624,29 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                     )
                     if not is_valid_unit_quaternion(mqx, mqy, mqz, mqw, tol=1e-4) or not is_orthonormal_se3(T_m, tol=1e-4):
                         add_finding("marker_pose_not_orthonormal", "error", f"Marker {mid} pose at {s_idx} not orthonormal")
+                    if has_cam_cols and r.get("cam_qx", "") != "":
+                        cqx, cqy, cqz, cqw = (
+                            float(r["cam_qx"]),
+                            float(r["cam_qy"]),
+                            float(r["cam_qz"]),
+                            float(r["cam_qw"]),
+                        )
+                        T_cm = pose_to_matrix(
+                            float(r["cam_x"]),
+                            float(r["cam_y"]),
+                            float(r["cam_z"]),
+                            cqx,
+                            cqy,
+                            cqz,
+                            cqw,
+                            normalize=False,
+                        )
+                        if not is_valid_unit_quaternion(cqx, cqy, cqz, cqw, tol=1e-4) or not is_orthonormal_se3(T_cm, tol=1e-4):
+                            add_finding(
+                                "marker_cam_pose_not_orthonormal",
+                                "error",
+                                f"Marker {mid} camera-space pose at {s_idx} not orthonormal",
+                            )
                     if verify_opencv_markers and s_idx in stills_by_idx:
                         still_fp = capture_dir / stills_by_idx[s_idx]
                         if still_fp.exists():
@@ -626,6 +658,40 @@ def validate_recording(capture_dir: Path, verify_opencv_markers: bool = True) ->
                                     "error",
                                     f"Phone logged marker_id={mid} at saved_index={s_idx}, but laptop OpenCV did not detect it in {stills_by_idx[s_idx]} (YS-30)",
                                 )
+
+    # Validate optional pairs.csv stream (YS-115)
+    pairs_path = capture_dir / "pairs.csv"
+    if "pairs" in declared_streams and not pairs_path.exists():
+        add_finding("missing_pairs_csv", "error", "pairs stream declared in manifest.json but pairs.csv is missing (YS-115)")
+    if pairs_path.exists():
+        with open(pairs_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames != list(PAIR_CSV_COLUMNS):
+                add_finding("pairs_csv_header", "error", f"pairs.csv header {reader.fieldnames} != {PAIR_CSV_COLUMNS}")
+            else:
+                prev_t = -1.0
+                for row_num, r in enumerate(reader):
+                    try:
+                        t_val = float(r["t"])
+                        s_idx = int(r["saved_index"])
+                        mi = int(r["marker_i"])
+                        mj = int(r["marker_j"])
+                        d3 = float(r["dist_3d_m"])
+                        dh = float(r["dist_horiz_m"])
+                        sd = float(r["sigma_dist_m"])
+                        sy = float(r["sigma_yaw_rad"])
+                    except Exception as exc:
+                        add_finding("pairs_csv_parse_error", "error", f"Invalid numeric value in pairs.csv row {row_num}: {exc}")
+                        continue
+                    if t_val < prev_t:
+                        add_finding("pairs_non_monotonic", "error", f"pairs.csv timestamps not monotonic at row {row_num}")
+                    prev_t = t_val
+                    if s_idx not in poses_by_idx:
+                        add_finding("pair_invalid_saved_index", "error", f"pairs.csv row {row_num} references unknown saved_index {s_idx}")
+                    if not (0 <= mi < mj <= 7):
+                        add_finding("pair_invalid_marker_ids", "error", f"pairs.csv row {row_num} has invalid pair ({mi}, {mj}); expected 0 <= marker_i < marker_j <= 7")
+                    if d3 < 0.0 or dh < 0.0 or sd <= 0.0 or sy <= 0.0:
+                        add_finding("pair_invalid_distance_or_sigma", "error", f"pairs.csv row {row_num} has negative distance or non-positive sigma")
 
     has_errors = any(f["severity"] == "error" for f in findings)
     has_warnings = any(f["severity"] == "warning" for f in findings)
@@ -704,8 +770,14 @@ def validate_standard_capture(capture_dir: Path) -> dict[str, Any]:
         except Exception as exc:
             add_finding("standard_schema_error", "error", f"standard/visit.json failed schema validation: {exc}")
 
-    # Check YS-53 forbidden files in standard/
-    allowed_top_files = set(schema_map.keys()) | {"visit.json", "cloud.ply", "audio.wav"}
+    # Check YS-53 forbidden files in standard/ (allowing YS-115 raw unwarped trajectory & cloud)
+    allowed_top_files = set(schema_map.keys()) | {
+        "visit.json",
+        "cloud.ply",
+        "cloud.raw.ply",
+        "trajectory.raw.json",
+        "audio.wav",
+    }
     actual_std_files: set[str] = set()
     for p in sorted(std_dir.rglob("*")):
         if p.is_file():
@@ -747,17 +819,33 @@ def validate_standard_capture(capture_dir: Path) -> dict[str, Any]:
         if not is_orthonormal_se3(T_yw, tol=1e-4):
             add_finding("frame_transform_not_se3", "error", "frame.json world_to_yard_transform is not orthonormal SE(3)")
 
-    # Verify trajectory.json SE(3) poses
-    if "trajectory.json" in loaded_json:
-        prev_t = -1.0
-        for p_item in loaded_json["trajectory.json"]["poses"]:
-            t_val = float(p_item["t"])
-            if t_val <= prev_t and prev_t >= 0.0:
-                add_finding("trajectory_non_monotonic", "error", "trajectory.json timestamps not strictly increasing")
-            prev_t = t_val
-            T_p = np.array(p_item["pose"], dtype=np.float64).reshape(4, 4)
-            if not is_orthonormal_se3(T_p, tol=1e-4):
-                add_finding("trajectory_pose_not_se3", "error", f"Trajectory pose at saved_index={p_item['saved_index']} not orthonormal SE(3)")
+    # Verify trajectory.json SE(3) poses (and optional trajectory.raw.json)
+    for traj_fname in ("trajectory.json", "trajectory.raw.json"):
+        traj_fp = std_dir / traj_fname
+        if traj_fname == "trajectory.raw.json" and traj_fp.exists():
+            try:
+                raw_t_data = json.loads(traj_fp.read_text(encoding="utf-8"))
+                forbidden_raw_t = _check_no_forbidden_keys(raw_t_data, traj_fname)
+                if forbidden_raw_t:
+                    add_finding(
+                        "forbidden_interpretation_field",
+                        "error",
+                        f"Forbidden interpretation fields in {traj_fname}: {forbidden_raw_t} (YS-53)",
+                    )
+                jsonschema.validate(instance=raw_t_data, schema=_load_schema("trajectory.schema.json"))
+                loaded_json[traj_fname] = raw_t_data
+            except Exception as exc:
+                add_finding("standard_schema_error", "error", f"standard/{traj_fname} failed schema validation: {exc}")
+        if traj_fname in loaded_json:
+            prev_t = -1.0
+            for p_item in loaded_json[traj_fname]["poses"]:
+                t_val = float(p_item["t"])
+                if t_val <= prev_t and prev_t >= 0.0:
+                    add_finding("trajectory_non_monotonic", "error", f"{traj_fname} timestamps not strictly increasing")
+                prev_t = t_val
+                T_p = np.array(p_item["pose"], dtype=np.float64).reshape(4, 4)
+                if not is_orthonormal_se3(T_p, tol=1e-4):
+                    add_finding("trajectory_pose_not_se3", "error", f"{traj_fname} pose at saved_index={p_item['saved_index']} not orthonormal SE(3)")
 
     # Verify keyframes.json poses and existence in recording
     if "keyframes.json" in loaded_json:
@@ -819,17 +907,19 @@ def validate_standard_capture(capture_dir: Path) -> dict[str, Any]:
                 f"grade.json has 1 failing held-out tape check but grade is {gr['grade']} (must be capped at C, YS-42)",
             )
 
-    # Verify cloud.ply binary little-endian format (YS-50)
-    ply_path = std_dir / "cloud.ply"
-    if not ply_path.exists():
-        add_finding("missing_cloud_ply", "error", "standard/cloud.ply is missing")
-    else:
-        try:
-            verts = read_cloud_ply(ply_path)
-            if len(verts) == 0:
-                add_finding("empty_cloud_ply", "error", "standard/cloud.ply has 0 vertices")
-        except Exception as exc:
-            add_finding("invalid_cloud_ply", "error", f"standard/cloud.ply failed validation: {exc}")
+    # Verify cloud.ply (and optional cloud.raw.ply) binary little-endian format (YS-50, YS-115)
+    for ply_name in ("cloud.ply", "cloud.raw.ply"):
+        ply_path = std_dir / ply_name
+        if not ply_path.exists():
+            if ply_name == "cloud.ply":
+                add_finding("missing_cloud_ply", "error", "standard/cloud.ply is missing")
+        else:
+            try:
+                verts = read_cloud_ply(ply_path)
+                if len(verts) == 0:
+                    add_finding("empty_cloud_ply", "error", f"standard/{ply_name} has 0 vertices")
+            except Exception as exc:
+                add_finding("invalid_cloud_ply", "error", f"standard/{ply_name} failed validation: {exc}")
 
     return {
         "status": "invalid" if any(f["severity"] == "error" for f in findings) else "clean",

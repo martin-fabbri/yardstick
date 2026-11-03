@@ -54,6 +54,7 @@
           "events",
           "stills",
           "markers",
+          "pairs",
           "health",
           "guidance"
         ],

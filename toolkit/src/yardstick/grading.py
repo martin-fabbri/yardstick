@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Closed-form 95% tolerance model and grading engine (YS-40, YS-41, YS-42, YS-43, YS-44, YS-45)."""
+"""Closed-form 95% tolerance model and grading engine (YS-40, YS-41, YS-42, YS-43, YS-44, YS-45, YS-115)."""
 
 from __future__ import annotations
 
@@ -102,7 +102,7 @@ def compute_grade_and_tolerances(
     walk_length_m: float,
     limited_tracking_share: float,
 ) -> dict[str, Any]:
-    """Compute grade.json (tolerances_95pct, tape_checks, marker_scale, caps_applied, reasons) (YS-41..43)."""
+    """Compute grade.json (tolerances_95pct, tape_checks, marker_scale, caps_applied, reasons) (YS-41..43, YS-115)."""
     R_yw = T_yard_from_world[:3, :3]
     t_yw = T_yard_from_world[:3, 3]
 
@@ -112,7 +112,40 @@ def compute_grade_and_tolerances(
 
     scale_error_ratio = float(marker_scale_info.get("scale_error_ratio", 0.0))
     scale_error_se = float(marker_scale_info.get("scale_error_se", 0.0))
-    scale_error_eff = float(marker_scale_info.get("scale_error_eff", max(0.0, abs(scale_error_ratio) - 2.0 * scale_error_se)))
+    scale_error_eff = float(
+        marker_scale_info.get("scale_error_eff", max(0.0, abs(scale_error_ratio) - 2.0 * scale_error_se))
+    )
+
+    marker_layout = frame_info.get("marker_layout")
+    has_marker_layout = isinstance(marker_layout, dict)
+    pair_graph_connected = bool(marker_layout.get("pair_graph_connected", False)) if has_marker_layout else False
+    cycle_count = int(marker_layout.get("cycle_count", 0)) if has_marker_layout else 0
+    pair_edges = marker_layout.get("pair_edges", []) if has_marker_layout else []
+    markers_seen_ids = marker_layout.get("markers_seen_ids", []) if has_marker_layout else []
+    markers_connected_ids = marker_layout.get("markers_connected_ids", []) if has_marker_layout else []
+    unconnected_marker_ids = marker_layout.get("unconnected_marker_ids", []) if has_marker_layout else []
+    closed_loop_edge_rmse_m: float | None = (
+        float(marker_layout["closed_loop_edge_rmse_m"])
+        if (has_marker_layout and marker_layout.get("closed_loop_edge_rmse_m") is not None)
+        else None
+    )
+    open_loop_cycle_residual_m: float | None = (
+        float(marker_layout["open_loop_cycle_residual_m"])
+        if (has_marker_layout and marker_layout.get("open_loop_cycle_residual_m") is not None)
+        else None
+    )
+    scale_applied = float(marker_layout.get("scale_applied", 1.0)) if has_marker_layout else 1.0
+
+    markers_yard = frame_info.get("markers_yard", [])
+    max_marker_pos_unc_m: float | None = None
+    if isinstance(markers_yard, list) and markers_yard:
+        unc_vals = [
+            float(m["position_uncertainty_m"])
+            for m in markers_yard
+            if isinstance(m, dict) and m.get("position_uncertainty_m") is not None
+        ]
+        if unc_vals:
+            max_marker_pos_unc_m = max(unc_vals)
 
     # Marker 0 loop-closure gap (track whether Marker 0 actually closed the loop before applying jump_sum)
     raw_m0_gap: float | None = None
@@ -133,8 +166,20 @@ def compute_grade_and_tolerances(
         m0_gap = jump_sum
 
     eff_walk_len = max(float(walk_length_m), 10.0)
-    # If Marker 0 loop closure is missing, assume a conservative 0.8% open-loop drift rate for tol(r)
-    loop_gap_per_m = (m0_gap / eff_walk_len) if m0_gap is not None else 0.008
+
+    # YS-115 §3.6 & Condition 3: When the one-frame pair graph is connected and has >= 1 closed cycle,
+    # layout distances come from single-frame LiDAR pairs (scale-corrected by printed marker size),
+    # not open-loop VIO translation.
+    if len(markers_connected_ids) >= 2 and cycle_count >= 1 and closed_loop_edge_rmse_m is not None:
+        eff_pair_gap = closed_loop_edge_rmse_m * math.sqrt(max(1, len(markers_connected_ids)))
+        loop_gap_per_m = eff_pair_gap / eff_walk_len
+        gap_for_band = eff_pair_gap
+        # If printed-size scale correction was applied within the +/-6% sanity gate, residual scale error is bounded by SE
+        eff_scale_for_tol = 0.0 if abs(scale_error_ratio) <= 0.06 else scale_error_eff
+    else:
+        loop_gap_per_m = (m0_gap / eff_walk_len) if m0_gap is not None else 0.008
+        gap_for_band = m0_gap if m0_gap is not None else 0.0
+        eff_scale_for_tol = scale_error_eff
 
     sigma_tracking_m = SIGMA_TRACKING_BASE_M + SIGMA_TRACKING_SLOPE_M * float(limited_tracking_share)
 
@@ -147,7 +192,7 @@ def compute_grade_and_tolerances(
     dist_tol_10m = compute_tolerance_at_range(
         r_m=REFERENCE_RANGE_M,
         primary_tape_checks=primary_tapes,
-        scale_error_eff=scale_error_eff,
+        scale_error_eff=eff_scale_for_tol,
         loop_gap_per_m=loop_gap_per_m,
         sigma_tracking_m=sigma_tracking_m,
     )
@@ -159,7 +204,7 @@ def compute_grade_and_tolerances(
     height_tol_m = max(
         ground_res_p95_m,
         ground_res_m * 1.96,
-        1.96 * math.sqrt(SIGMA_LIDAR_M * SIGMA_LIDAR_M + (scale_error_eff * 3.0) ** 2),
+        1.96 * math.sqrt(SIGMA_LIDAR_M * SIGMA_LIDAR_M + (eff_scale_for_tol * 3.0) ** 2),
     )
 
     # Transform tape check points to yard frame and evaluate each against tol(tape_m)
@@ -181,7 +226,7 @@ def compute_grade_and_tolerances(
         tol_at_tape = compute_tolerance_at_range(
             r_m=tape_m,
             primary_tape_checks=primary_tapes,
-            scale_error_eff=scale_error_eff,
+            scale_error_eff=eff_scale_for_tol,
             loop_gap_per_m=loop_gap_per_m,
             sigma_tracking_m=sigma_tracking_m,
         )
@@ -201,8 +246,7 @@ def compute_grade_and_tolerances(
             }
         )
 
-    # Determine raw band from distance_m and m0_gap (YS-42)
-    # Band order: A=3, B=2, C=1, fail=0
+    # Determine raw band from distance_m and gap_for_band (YS-42)
     band_names = {3: "A", 2: "B", 1: "C", 0: "fail"}
     reasons: list[str] = []
     caps_applied: list[str] = []
@@ -212,6 +256,12 @@ def compute_grade_and_tolerances(
         reasons.append(f"loop_closure_gap_m={m0_gap:.4f}m")
     else:
         reasons.append("loop_closure_gap_m=null (Marker 0 not revisited at end of walk)")
+
+    if pair_graph_connected and cycle_count >= 1 and closed_loop_edge_rmse_m is not None:
+        reasons.append(
+            f"pair_graph_closed: connected_markers={len(markers_connected_ids)}, "
+            f"cycles={cycle_count}, edge_rmse_m={closed_loop_edge_rmse_m:.4f}m, scale_applied={scale_applied:.4f}"
+        )
 
     if primary_tapes:
         reasons.append(f"max_primary_tape_residual_m={max_primary_residual_m:.4f}m")
@@ -231,6 +281,11 @@ def compute_grade_and_tolerances(
         f"marker_scale_error_ratio={scale_error_ratio:.4f} (se={scale_error_se:.4f}, eff={scale_error_eff:.4f})"
     )
 
+    if abs(scale_error_ratio) > 0.06 and int(marker_scale_info.get("sightings_used", 0)) >= 1:
+        reasons.append(
+            f"marker_printed_size_mismatch: measured marker scale differs from declared printed size by {scale_error_ratio * 100.0:+.1f}%"
+        )
+
     if pose_jumps:
         for pj in pose_jumps:
             reasons.append(
@@ -238,7 +293,6 @@ def compute_grade_and_tolerances(
                 f"(frames {pj['saved_index_from']}->{pj['saved_index_to']})"
             )
 
-    gap_for_band = m0_gap if m0_gap is not None else 0.0
     if dist_tol_10m <= 0.050 and gap_for_band <= 0.050:
         band = 3  # A
     elif dist_tol_10m <= 0.100 and gap_for_band <= 0.120:
@@ -252,7 +306,7 @@ def compute_grade_and_tolerances(
         if gap_for_band > 0.250:
             reasons.append(f"fail_threshold: loop_closure_gap_m ({gap_for_band:.4f}m) > 0.25m")
 
-    # Apply caps (YS-31, YS-32, YS-42, YS-11)
+    # Apply caps (YS-31, YS-32, YS-42, YS-11, YS-115)
     if integrity_status in ("partial", "invalid"):
         band = 0
         caps_applied.append(f"integrity_{integrity_status}")
@@ -269,13 +323,31 @@ def compute_grade_and_tolerances(
         caps_applied.append("marker_0_tilted")
         reasons.append("cap_applied: marker_0_tilted (>30 deg from ground up) -> max grade C")
 
-    if not has_m0_loop_closure and frame_info.get("method") == "marker":
+    if not has_m0_loop_closure and frame_info.get("method") == "marker" and not (pair_graph_connected and cycle_count >= 1):
         if band > 1:
             band = 1
         caps_applied.append("no_loop_closure")
         reasons.append("cap_applied: no_loop_closure (Marker 0 not revisited at end) -> max grade C")
 
-    if len(primary_tapes) == 0:
+    # YS-115 pair-graph connectivity & cycle caps
+    if has_marker_layout and len(pair_edges) > 0:
+        if not pair_graph_connected:
+            if band > 1:
+                band = 1
+            caps_applied.append("disconnected_marker_graph")
+            reasons.append(
+                f"cap_applied: disconnected_marker_graph (Markers {unconnected_marker_ids} were not captured in a one-frame pair connected to Marker 0) -> max grade C"
+            )
+        elif cycle_count == 0:
+            cap_target = 2 if has_m0_loop_closure else 1
+            if band > cap_target:
+                band = cap_target
+            caps_applied.append("pair_graph_no_closed_cycle")
+            reasons.append(
+                f"cap_applied: pair_graph_no_closed_cycle (pair graph has no closed cycle) -> max grade {band_names[cap_target]}"
+            )
+
+    if len(primary_tapes) == 0 and not (pair_graph_connected and cycle_count >= 1):
         if band > 1:
             band = 1
         caps_applied.append("no_tape_check")
@@ -316,12 +388,46 @@ def compute_grade_and_tolerances(
     evidence_basis = ["lidar_noise_floor", "tracking_quality"]
     if primary_tapes:
         evidence_basis.insert(0, "tape_checks")
+    if pair_graph_connected and cycle_count >= 1:
+        evidence_basis.insert(0, "one_frame_pair_graph")
     if m0_gap is not None:
         evidence_basis.append("loop_closure_gaps")
     if int(marker_scale_info.get("sightings_used", 0)) > 0:
         evidence_basis.append("marker_scale_error")
 
-    return {
+    coefficients: dict[str, Any] = {
+        "max_tape_residual_m": round(max_primary_residual_m, 6),
+        "primary_tape_floor_10m_m": round(primary_floor_10m, 6),
+        "sigma_lidar_m": SIGMA_LIDAR_M,
+        "scale_error_ratio": round(scale_error_ratio, 6),
+        "scale_error_se": round(scale_error_se, 6),
+        "scale_error_eff": round(scale_error_eff, 6),
+        "loop_closure_gap_m": round(m0_gap, 6) if m0_gap is not None else None,
+        "walk_length_m": round(eff_walk_len, 4),
+        "loop_gap_per_m": round(loop_gap_per_m, 8),
+        "sigma_tracking_m": round(sigma_tracking_m, 6),
+        "limited_tracking_share": round(limited_tracking_share, 6),
+    }
+    if has_marker_layout:
+        coefficients["pair_graph_edge_rmse_m"] = (
+            round(closed_loop_edge_rmse_m, 6) if closed_loop_edge_rmse_m is not None else None
+        )
+        coefficients["pair_graph_open_loop_residual_m"] = (
+            round(open_loop_cycle_residual_m, 6) if open_loop_cycle_residual_m is not None else None
+        )
+        coefficients["max_marker_position_uncertainty_m"] = (
+            round(max_marker_pos_unc_m, 6) if max_marker_pos_unc_m is not None else None
+        )
+
+    marker_scale_clean = {
+        "scale_error_ratio": round(scale_error_ratio, 6),
+        "scale_error_se": round(scale_error_se, 6),
+        "scale_error_eff": round(scale_error_eff, 6),
+        "sightings_used": int(marker_scale_info.get("sightings_used", 0)),
+        "per_marker": list(marker_scale_info.get("per_marker", [])),
+    }
+
+    out_grade: dict[str, Any] = {
         "contract": CONTRACT_VERSION,
         "grading_version": GRADING_VERSION,
         "grade": band_names[band],
@@ -331,24 +437,26 @@ def compute_grade_and_tolerances(
             "position_m": round(pos_tol_10m, 6),
             "reference_range_m": REFERENCE_RANGE_M,
             "formula": FORMULA_STRING,
-            "coefficients": {
-                "max_tape_residual_m": round(max_primary_residual_m, 6),
-                "primary_tape_floor_10m_m": round(primary_floor_10m, 6),
-                "sigma_lidar_m": SIGMA_LIDAR_M,
-                "scale_error_ratio": round(scale_error_ratio, 6),
-                "scale_error_se": round(scale_error_se, 6),
-                "scale_error_eff": round(scale_error_eff, 6),
-                "loop_closure_gap_m": round(m0_gap, 6) if m0_gap is not None else None,
-                "walk_length_m": round(eff_walk_len, 4),
-                "loop_gap_per_m": round(loop_gap_per_m, 8),
-                "sigma_tracking_m": round(sigma_tracking_m, 6),
-                "limited_tracking_share": round(limited_tracking_share, 6),
-            },
+            "coefficients": coefficients,
             "evidence_basis": evidence_basis,
         },
         "tape_checks": tape_checks_yard,
-        "marker_scale": marker_scale_info,
+        "marker_scale": marker_scale_clean,
         "caps_applied": caps_applied,
         "reasons": reasons,
     }
-
+    if has_marker_layout:
+        out_grade["marker_layout_summary"] = {
+            "pair_graph_connected": bool(pair_graph_connected),
+            "markers_seen_count": len(markers_seen_ids),
+            "markers_connected_count": len(markers_connected_ids),
+            "cycle_count": int(cycle_count),
+            "closed_loop_edge_rmse_m": (
+                round(closed_loop_edge_rmse_m, 6) if closed_loop_edge_rmse_m is not None else None
+            ),
+            "max_marker_position_uncertainty_m": (
+                round(max_marker_pos_unc_m, 6) if max_marker_pos_unc_m is not None else None
+            ),
+            "scale_applied": round(scale_applied, 6),
+        }
+    return out_grade

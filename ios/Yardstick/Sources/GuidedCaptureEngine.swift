@@ -120,6 +120,7 @@ public struct GroundCoverageGrid: Sendable, Equatable {
 
     public private(set) var groundPlaneYWorld: Double? = nil
     public private(set) var isAnchoredToMarker: Bool = false
+    public private(set) var isMarker0FrameAnchored: Bool = false
     public private(set) var originXZ: SIMD2<Double> = .zero
     public private(set) var uAxisXZ: SIMD2<Double> = SIMD2<Double>(1.0, 0.0)
     public private(set) var vAxisXZ: SIMD2<Double> = SIMD2<Double>(0.0, 1.0)
@@ -171,11 +172,16 @@ public struct GroundCoverageGrid: Sendable, Equatable {
 
     /// Anchor the ground coverage grid to Marker 0's horizontal origin and yaw (`YS-78`) so cell indices `(ix, iz)`
     /// align with the Marker-0 Yard Frame used by `coverage.json`.
+    /// Once anchored on Marker 0's opening pass (`isMarker0FrameAnchored == true`), re-seeing Marker 0 later in the
+    /// walk never wipes accumulated ground coverage (`YS-115` C7).
     public mutating func anchorMarker0Frame(
         originWorld: SIMD3<Double>,
         xAxisWorld: SIMD3<Double> = SIMD3<Double>(1.0, 0.0, 0.0)
     ) {
         anchorGroundPlaneY(originWorld.y)
+        guard !isMarker0FrameAnchored else {
+            return
+        }
         let newOriginXZ = SIMD2<Double>(originWorld.x, originWorld.z)
         let rawU = SIMD2<Double>(xAxisWorld.x, xAxisWorld.z)
         let lenU = simd_length(rawU)
@@ -190,6 +196,7 @@ public struct GroundCoverageGrid: Sendable, Equatable {
         originXZ = newOriginXZ
         uAxisXZ = newU
         vAxisXZ = newV
+        isMarker0FrameAnchored = true
     }
 
     /// Map a 3D world point onto the Marker-0 anchored `0.25 m` horizontal grid (`YS-78`).
@@ -200,6 +207,15 @@ public struct GroundCoverageGrid: Sendable, Equatable {
         let ix = Int(floor(localX / cellSizeM))
         let iz = Int(floor(localZ / cellSizeM))
         return GroundGridCell(ix: ix, iz: iz)
+    }
+
+    /// Directly mark a 3D world point as covered in the Marker-0 anchored grid (`YS-78`, `YS-115` C7).
+    public mutating func markCoveredWorldPoint(_ pt: SIMD3<Double>, highConfidence: Bool = true) {
+        let c = cell(forWorldPoint: pt)
+        coveredCells.insert(c)
+        if highConfidence {
+            highConfidenceCells.insert(c)
+        }
     }
 
     /// Check whether enough time has elapsed for the next coverage update (`2 Hz` normal, `0.5 Hz` serious thermal).
@@ -658,7 +674,165 @@ public struct MarkerHoldProgress: Sendable, Equatable {
     }
 }
 
-/// Pure, deterministic state machine for guided capture coaching, 3-still marker locks,
+/// Tracks the one-frame neighbour pair graph (`G = (V, E)`) for the tossed-marker walk (`0...7`, `YS-115`).
+///
+/// Under Condition 1 (`CC-REVIEW-AG-YS115-DESIGN.md`, `L37`), a marker is done when it is in at least one
+/// confirmed pair connected to Marker 0 (`connectedToOrigin`); no close-range solo lock is required.
+public struct TossedMarkerPairGraphState: Sendable, Equatable {
+    public static let maxPairSpacingMeters: Double = 3.50
+
+    public private(set) var seenMarkerIDs: Set<Int> = []
+    public private(set) var latestSeenPositionsWorld: [Int: SIMD3<Double>] = [:]
+    public private(set) var pairSightingCounts: [String: Int] = [:]
+    public private(set) var confirmedPairEdges: Set<String> = []
+    public private(set) var soloAnchoredMarkerIDs: Set<Int> = [0]
+    public private(set) var connectedToOrigin: Set<Int> = [0]
+    public private(set) var cycleCount: Int = 0
+    public private(set) var isolatedTooFarMarkerID: Int? = nil
+
+    public init() {}
+
+    public static func edgeKey(_ a: Int, _ b: Int) -> String {
+        let lo = min(a, b)
+        let hi = max(a, b)
+        return "\(lo)-\(hi)"
+    }
+
+    public var isAllSeenConnectedToOrigin: Bool {
+        guard seenMarkerIDs.contains(0), seenMarkerIDs.count >= 2 else { return false }
+        return seenMarkerIDs.isSubset(of: connectedToOrigin)
+    }
+
+    public var unconnectedSeenMarkerIDs: [Int] {
+        seenMarkerIDs.subtracting(connectedToOrigin).sorted()
+    }
+
+    public mutating func recordSeenMarkerIDs(_ ids: [Int]) {
+        for id in ids where (0...7).contains(id) {
+            seenMarkerIDs.insert(id)
+        }
+    }
+
+    /// Mark a marker as anchored via a close-range solo hold and propagate connectivity across any confirmed pair edges (`YS-115`).
+    @discardableResult
+    public mutating func markSoloLocked(_ markerID: Int) -> [Int] {
+        guard (0...7).contains(markerID) else { return [] }
+        seenMarkerIDs.insert(markerID)
+        let prevConnected = connectedToOrigin
+        soloAnchoredMarkerIDs.insert(markerID)
+        recomputeConnectivityAndCycles()
+        return connectedToOrigin.subtracting(prevConnected).sorted()
+    }
+
+    /// Record single-frame marker sightings and update pair edges, BFS connectivity to Marker 0, and cycle count (`YS-115`).
+    /// Returns any marker IDs newly connected to Marker 0 on this step and whether a loop-closing cycle was just formed.
+    public mutating func ingestFrameSightings(
+        confirmedSightings: [DetectedMarkerSighting],
+        rawSightings: [DetectedMarkerSighting],
+        trackingNormal: Bool
+    ) -> (newlyConnectedIDs: [Int], didFormCycleThisStep: Bool) {
+        let allVisible = !confirmedSightings.isEmpty ? confirmedSightings : rawSightings
+        for s in allVisible where (0...7).contains(s.markerID) {
+            seenMarkerIDs.insert(s.markerID)
+            latestSeenPositionsWorld[s.markerID] = s.positionWorld
+        }
+
+        let prevConnected = connectedToOrigin
+        let hadOriginPairBefore = confirmedPairEdges.contains { $0.hasPrefix("0-") || $0.hasSuffix("-0") }
+        let prevCycles = cycleCount
+        isolatedTooFarMarkerID = nil
+
+        let pairSource: [DetectedMarkerSighting]
+        let isJPEGConfirmedPair: Bool
+        if confirmedSightings.count >= 2 {
+            pairSource = confirmedSightings.filter { (0...7).contains($0.markerID) }
+            isJPEGConfirmedPair = true
+        } else if trackingNormal && rawSightings.count >= 2 {
+            pairSource = rawSightings.filter { (0...7).contains($0.markerID) }
+            isJPEGConfirmedPair = false
+        } else {
+            pairSource = []
+            isJPEGConfirmedPair = false
+        }
+
+        if pairSource.count >= 2 {
+            for i in 0..<pairSource.count {
+                for j in (i + 1)..<pairSource.count {
+                    let sA = pairSource[i]
+                    let sB = pairSource[j]
+                    guard sA.markerID != sB.markerID else { continue }
+                    let pA = (simd_length(sA.positionCamera) > 1e-6) ? sA.positionCamera : sA.positionWorld
+                    let pB = (simd_length(sB.positionCamera) > 1e-6) ? sB.positionCamera : sB.positionWorld
+                    let distM = simd_length(pB - pA)
+                    guard distM >= 0.15 else { continue }
+                    if distM <= Self.maxPairSpacingMeters {
+                        let key = Self.edgeKey(sA.markerID, sB.markerID)
+                        let nextCount = (pairSightingCounts[key] ?? 0) + 1
+                        pairSightingCounts[key] = nextCount
+                        if isJPEGConfirmedPair || nextCount >= 3 {
+                            confirmedPairEdges.insert(key)
+                        }
+                    } else {
+                        let candidateID = !connectedToOrigin.contains(sB.markerID) ? sB.markerID : sA.markerID
+                        isolatedTooFarMarkerID = candidateID
+                    }
+                }
+            }
+        } else if allVisible.count == 1, let solo = allVisible.first, (0...7).contains(solo.markerID) {
+            if !connectedToOrigin.contains(solo.markerID), latestSeenPositionsWorld.count >= 2 {
+                var minDist = Double.infinity
+                for (otherID, otherPos) in latestSeenPositionsWorld where otherID != solo.markerID {
+                    let d = simd_length(solo.positionWorld - otherPos)
+                    if d < minDist { minDist = d }
+                }
+                if minDist > Self.maxPairSpacingMeters && minDist < Double.infinity {
+                    isolatedTooFarMarkerID = solo.markerID
+                }
+            }
+        }
+
+        recomputeConnectivityAndCycles()
+        var newlyConnectedSet = connectedToOrigin.subtracting(prevConnected)
+        let hasOriginPairNow = confirmedPairEdges.contains { $0.hasPrefix("0-") || $0.hasSuffix("-0") }
+        if !hadOriginPairBefore && hasOriginPairNow {
+            newlyConnectedSet.insert(0)
+        }
+        let newlyConnected = newlyConnectedSet.sorted()
+        let didFormCycle = (cycleCount > prevCycles) && (cycleCount >= 1) && (connectedToOrigin.count >= 3)
+        return (newlyConnected, didFormCycle)
+    }
+
+    private mutating func recomputeConnectivityAndCycles() {
+        var adj: [Int: Set<Int>] = [:]
+        var uniqueEdges: [(Int, Int)] = []
+        for edgeStr in confirmedPairEdges {
+            let parts = edgeStr.split(separator: "-")
+            guard parts.count == 2, let a = Int(parts[0]), let b = Int(parts[1]) else { continue }
+            adj[a, default: []].insert(b)
+            adj[b, default: []].insert(a)
+            uniqueEdges.append((a, b))
+        }
+
+        var visited: Set<Int> = soloAnchoredMarkerIDs
+        visited.insert(0)
+        var queue: [Int] = Array(visited).sorted()
+        var head = 0
+        while head < queue.count {
+            let cur = queue[head]
+            head += 1
+            for nxt in adj[cur, default: []] where !visited.contains(nxt) {
+                visited.insert(nxt)
+                queue.append(nxt)
+            }
+        }
+        connectedToOrigin = visited
+
+        let edgesInComponent = uniqueEdges.filter { visited.contains($0.0) && visited.contains($0.1) }.count
+        cycleCount = max(0, edgesInComponent - max(0, visited.count - 1))
+    }
+}
+
+/// Pure, deterministic state machine for guided capture coaching, tossed-marker pair connectivity (`YS-115`),
 /// house-wall look-up (`YS-79`), and thermal rate adaptation (`YS-74`, `YS-85`).
 public struct GuidedCaptureEngine: Sendable {
     public static let debounceDurationS: Double = 0.70
@@ -668,16 +842,20 @@ public struct GuidedCaptureEngine: Sendable {
     public static let maxPositionSpreadM: Double = 0.025
     public static let maxSizeDeviationRatio: Double = 0.03
     public static let pitchOutOfBandTriggerS: Double = 3.00
+    /// Single walker placement rule said once at the start (`YS-115` Condition 2).
+    public static let tossedMarkerStartInstruction: String = "Toss them 2–3 big steps apart"
 
     public var requireLookUpStep: Bool
+    public var tossedMarkerMode: Bool = false
     public var isVoiceCoachEnabled: Bool = true
+    public private(set) var pairGraphState = TossedMarkerPairGraphState()
     public var preWalkTapeMeters0To1: Double? = nil {
         didSet {
             recomputeMarker0To1TapeCheckIfPossible()
         }
     }
     public private(set) var generatedMarker0To1TapeCheck: PreWalkTapeCheckEntry? = nil
-    public private(set) var phase: GuidedWalkPhase = .openingMarker0
+    public var phase: GuidedWalkPhase = .openingMarker0
     public private(set) var activeInstruction: String = "Stand over marker 0 and point at it"
     public private(set) var activeInstructionKey: String = "origin_find_marker_0"
     public private(set) var activeInstructionSinceS: Double = -100.0
@@ -690,6 +868,10 @@ public struct GuidedCaptureEngine: Sendable {
         1: MarkerHoldProgress(markerID: 1),
         2: MarkerHoldProgress(markerID: 2),
         3: MarkerHoldProgress(markerID: 3),
+        4: MarkerHoldProgress(markerID: 4),
+        5: MarkerHoldProgress(markerID: 5),
+        6: MarkerHoldProgress(markerID: 6),
+        7: MarkerHoldProgress(markerID: 7),
     ]
     public private(set) var closingMarker0Hold = MarkerHoldProgress(markerID: 0, isClosingHold: true)
 
@@ -724,10 +906,21 @@ public struct GuidedCaptureEngine: Sendable {
     private var holdPausedAccumulatedS: Double = 0.0
     private var didSpeakHoldPausedMovingThisPause: Bool = false
     private var spokenOnceKeys: Set<String> = []
+    public private(set) var hasReachedReadyToFinish: Bool = false
+    private var loopWasClosedAtFinishReady: Bool = false
 
-    public init(requireLookUpStep: Bool = true, preWalkTapeMeters0To1: Double? = nil) {
+    public init(
+        requireLookUpStep: Bool = true,
+        preWalkTapeMeters0To1: Double? = nil,
+        tossedMarkerMode: Bool = false
+    ) {
         self.requireLookUpStep = requireLookUpStep
         self.preWalkTapeMeters0To1 = preWalkTapeMeters0To1
+        self.tossedMarkerMode = tossedMarkerMode
+        if tossedMarkerMode {
+            self.activeInstruction = "Toss markers 2–3 big steps apart, then point at marker 0"
+            self.activeInstructionKey = "origin_toss_and_find_marker_0"
+        }
     }
 
     /// Recompute the automatic centre-to-centre `tape_checks` entry between Marker 0 and Marker 1 (`YS-77`)
@@ -761,33 +954,58 @@ public struct GuidedCaptureEngine: Sendable {
         )
     }
 
-    /// Known 3D world positions of seen or locked markers (`0...3`) for screen-space beacons and edge arrows (`DESIGN-SPEC-NATIVE.md` §3a ④, ⑤).
+    /// Known 3D world positions of seen or locked markers (`0...7`) for screen-space beacons and edge arrows (`DESIGN-SPEC-NATIVE.md` §3a ④, ⑤, `YS-115`).
     public var knownMarkerPositionsWorld: [Int: SIMD3<Double>] {
-        var out: [Int: SIMD3<Double>] = [:]
+        var out: [Int: SIMD3<Double>] = pairGraphState.latestSeenPositionsWorld
         if openingMarker0Hold.isLocked || openingMarker0Hold.confirmedSegments > 0 || simd_length(openingMarker0Hold.latestPositionWorld) > 1e-4 {
             out[0] = openingMarker0Hold.latestPositionWorld
         }
-        for mid in 1...3 {
+        for mid in 1...7 {
             if let h = marker1To3Holds[mid],
                (h.isLocked || h.confirmedSegments > 0 || simd_length(h.latestPositionWorld) > 1e-4) {
                 out[mid] = h.latestPositionWorld
             }
         }
+        for (mid, pos) in lockedPositionsByMarkerID {
+            out[mid] = pos
+        }
         return out
     }
 
-    /// True only when `YS-71` confirms the loop is closed AND Marker 0's closing hold is locked
-    /// after Markers 1–3 (or End Early) and after any `"Fix now"` (`YS-72`, `YS-74`).
+    /// All marker IDs (`0...7`) displayed in the HUD progress capsule (always at least `0...3`, expanding up to `8`
+    /// for every seen or locked marker, `YS-115` C3).
+    public var hudDisplayedMarkerIDs: [Int] {
+        let allSeenOrLocked = lockedMarkerIDs.union(pairGraphState.seenMarkerIDs).filter { (0...7).contains($0) }
+        let maxID = max(3, allSeenOrLocked.max() ?? 3)
+        return Array(0...min(7, maxID))
+    }
+
+    /// True only when `YS-71` / `YS-115` confirms the loop is closed AND Marker 0's closing hold (or closed pair cycle) is locked
+    /// after all placed markers (or End Early) and after any `"Fix now"` (`YS-72`, `YS-74`, `YS-115`).
     public func isFinishAvailable(unifiedLoopClosed: Bool) -> Bool {
-        let markersReady = endEarlyChosen || (lockedMarkerIDs.contains(1) && lockedMarkerIDs.contains(2) && lockedMarkerIDs.contains(3))
-        // A completed return hold on Marker 0 always offers Finish, even when the loop check fails
+        if hasReachedReadyToFinish && !fixNowRequiresReturnToMarker0 {
+            return true
+        }
+        let pairCycleReady = pairGraphState.isAllSeenConnectedToOrigin && pairGraphState.cycleCount >= 1
+        let lookUpReady = !requireLookUpStep || endEarlyChosen || lookUpTracker.isDone
+        if isClosingMarker0Locked && lookUpReady && lockedMarkerIDs.contains(0) && !fixNowRequiresReturnToMarker0 {
+            return true
+        }
+        let targetUpperID = max(3, pairGraphState.seenMarkerIDs.max() ?? 3)
+        let allPlacedLocked = (1...targetUpperID).allSatisfy { mid in
+            if mid <= 3 || pairGraphState.seenMarkerIDs.contains(mid) {
+                return lockedMarkerIDs.contains(mid)
+            }
+            return true
+        }
+        let markersReady = endEarlyChosen || allPlacedLocked || pairCycleReady
+        // A completed return hold on Marker 0 (or closed pair cycle) always offers Finish, even when the loop check fails
         // (device walk 8, 2026-11-01: 0.82 m drift left the walker with no Finish and no way to retry).
         // The grade still records the walk as not closed.
-        let lookUpReady = !requireLookUpStep || endEarlyChosen || lookUpTracker.isDone
-        return (unifiedLoopClosed || isClosingMarker0Locked)
+        return (unifiedLoopClosed || isClosingMarker0Locked || pairCycleReady)
             && lockedMarkerIDs.contains(0)
             && markersReady
-            && isClosingMarker0Locked
+            && (isClosingMarker0Locked || pairCycleReady)
             && lookUpReady
             && !fixNowRequiresReturnToMarker0
     }
@@ -840,9 +1058,11 @@ public struct GuidedCaptureEngine: Sendable {
         at timestampS: Double
     ) {
         fixNowRequiresReturnToMarker0 = true
+        hasReachedReadyToFinish = false
+        loopWasClosedAtFinishReady = false
         isClosingMarker0Locked = false
         closingMarker0Hold = MarkerHoldProgress(markerID: 0, isClosingHold: true)
-        if let mid = targetMarkerID, (1...3).contains(mid) {
+        if let mid = targetMarkerID, (1...7).contains(mid) {
             lockedMarkerIDs.remove(mid)
             marker1To3Holds[mid] = MarkerHoldProgress(markerID: mid)
             phase = .markers1To3
@@ -976,6 +1196,7 @@ public struct GuidedCaptureEngine: Sendable {
         cameraPositionWorld: SIMD3<Double>,
         confirmedSightings: [DetectedMarkerSighting],
         rawSightings: [DetectedMarkerSighting] = [],
+        seen2DMarkerIDs: [Int] = [],
         unifiedLoopClosed: Bool,
         thermalLevel: CaptureThermalLevel = .nominal,
         lowDiskSpaceWarning: Bool = false,
@@ -1010,9 +1231,73 @@ public struct GuidedCaptureEngine: Sendable {
             activeHoldMarkerID = lastActiveHoldMarkerID
         }
 
-        // 1. Determine which marker hold (if any) is relevant in the current phase
+        // 1. Update YS-115 tossed-marker pair graph (Condition 1: no solo lock required when connected to Marker 0 via a pair!)
         let allVisible = !confirmedSightings.isEmpty ? confirmedSightings : rawSightings
+        pairGraphState.recordSeenMarkerIDs(seen2DMarkerIDs)
+        let pairStep = pairGraphState.ingestFrameSightings(
+            confirmedSightings: confirmedSightings,
+            rawSightings: rawSightings,
+            trackingNormal: trackingState == "normal"
+        )
+        if !pairStep.newlyConnectedIDs.isEmpty {
+            didLockMarkerThisStep = true
+            for connectedID in pairStep.newlyConnectedIDs {
+                lockedMarkerIDs.insert(connectedID)
+                if let pos = pairGraphState.latestSeenPositionsWorld[connectedID] {
+                    lockedPositionsByMarkerID[connectedID] = pos
+                }
+                if connectedID == 0 {
+                    openingMarker0Hold.isLocked = true
+                    openingMarker0Hold.lockedAtTimestampS = timestampS
+                } else {
+                    var h = marker1To3Holds[connectedID] ?? MarkerHoldProgress(markerID: connectedID)
+                    h.isLocked = true
+                    h.lockedAtTimestampS = timestampS
+                    if let pos = pairGraphState.latestSeenPositionsWorld[connectedID] {
+                        h.latestPositionWorld = pos
+                    }
+                    marker1To3Holds[connectedID] = h
+                }
+            }
+            if let lastID = pairStep.newlyConnectedIDs.last {
+                emittedHaptic = .markerLocked(markerID: lastID)
+                justLockedKey = "locked_marker_\(lastID)"
+                justLockedText = "Got marker \(lastID)"
+                justLockedBannerUntilS = timestampS + Self.minInstructionDwellS
+            }
+        }
+        if pairStep.didFormCycleThisStep && pairGraphState.isAllSeenConnectedToOrigin {
+            isClosingMarker0Locked = true
+            closingMarker0Hold.isLocked = true
+            closingMarker0Hold.lockedAtTimestampS = timestampS
+            fixNowRequiresReturnToMarker0 = false
+            didLockMarkerThisStep = true
+            emittedHaptic = .loopClosedPathComplete
+            if requireLookUpStep && !lookUpTracker.isDone && !endEarlyChosen {
+                justLockedKey = "locked_marker_0_closing"
+                justLockedText = "Back at marker 0. Now look up at the roof."
+                justLockedBannerUntilS = timestampS + Self.minInstructionDwellS
+            }
+        }
+
+        // Item 1 (C1, C4): A new marker 1...7 seen while in closing_marker_0 sends the walk back to collecting (.markers1To3), never ignored.
+        if phase == .closingMarker0 && !isClosingMarker0Locked && !endEarlyChosen {
+            let hasUnlockedSeenNonZero = pairGraphState.seenMarkerIDs.contains { (1...7).contains($0) && !lockedMarkerIDs.contains($0) }
+                || allVisible.contains { (1...7).contains($0.markerID) && !lockedMarkerIDs.contains($0.markerID) }
+            if hasUnlockedSeenNonZero {
+                phase = .markers1To3
+            }
+        }
+
+        // Determine which marker hold (if any) is relevant in the current phase
+        let isPairFrameThisStep = allVisible.filter({ (0...7).contains($0.markerID) }).count >= 2
+        let hasCloseSoloCandidate = allVisible.contains {
+            (0...7).contains($0.markerID) && !lockedMarkerIDs.contains($0.markerID) && $0.rangeMeters <= 1.60
+        }
         let targetSighting: (sighting: DetectedMarkerSighting, isConfirmedStill: Bool, isClosing: Bool)? = {
+            if isPairFrameThisStep && !pairGraphState.confirmedPairEdges.isEmpty && !hasCloseSoloCandidate {
+                return nil
+            }
             switch phase {
             case .openingMarker0:
                 if let c0 = confirmedSightings.first(where: { $0.markerID == 0 }) {
@@ -1021,14 +1306,21 @@ public struct GuidedCaptureEngine: Sendable {
                 if let r0 = allVisible.first(where: { $0.markerID == 0 }) {
                     return (r0, false, false)
                 }
+                // Item 1: Any seen marker 1...7 can be targeted in any phase before Finish
+                for s in confirmedSightings where (1...7).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
+                    return (s, true, false)
+                }
+                for s in allVisible where (1...7).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
+                    return (s, false, false)
+                }
                 return nil
 
             case .markers1To3:
-                // Any unlocked marker in 1...3
-                for s in confirmedSightings where (1...3).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
+                // Any unlocked marker in 1...7
+                for s in confirmedSightings where (1...7).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
                     return (s, true, false)
                 }
-                for s in allVisible where (1...3).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
+                for s in allVisible where (1...7).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
                     return (s, false, false)
                 }
                 return nil
@@ -1038,7 +1330,14 @@ public struct GuidedCaptureEngine: Sendable {
                 return nil
 
             case .closingMarker0, .readyToFinish:
+                // Item 1: Any unlocked marker 1...7 seen before closing Marker 0 locks can still be targeted
                 if !isClosingMarker0Locked {
+                    for s in confirmedSightings where (1...7).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
+                        return (s, true, false)
+                    }
+                    for s in allVisible where (1...7).contains(s.markerID) && !lockedMarkerIDs.contains(s.markerID) {
+                        return (s, false, false)
+                    }
                     if let c0 = confirmedSightings.first(where: { $0.markerID == 0 }) {
                         return (c0, true, true)
                     }
@@ -1130,10 +1429,14 @@ public struct GuidedCaptureEngine: Sendable {
                             intensity: intensities[seg] ?? 0.7
                         )
 
-                        if hold.confirmedSamples.count >= 3,
-                           let firstS = hold.confirmedSamples.first,
-                           let lastS = hold.confirmedSamples.last,
-                           (lastS.timestampS - firstS.timestampS) >= (Self.minHoldSpanS - 1e-6) {
+                        let spanS: Double = {
+                            guard let firstS = hold.confirmedSamples.first,
+                                  let lastS = hold.confirmedSamples.last else { return 0.0 }
+                            return lastS.timestampS - firstS.timestampS
+                        }()
+                        let reachesThreeStillHold = hold.confirmedSamples.count >= 3 && spanS >= (Self.minHoldSpanS - 1e-6)
+                        let reachesTossedPeriodicTwoStillHold = tossedMarkerMode && !target.isClosing && hold.confirmedSamples.count >= 2 && spanS >= 1.80
+                        if reachesThreeStillHold || reachesTossedPeriodicTwoStillHold {
                             hold.isLocked = true
                             hold.lockedAtTimestampS = timestampS
                             didLockMarkerThisStep = true
@@ -1151,6 +1454,20 @@ public struct GuidedCaptureEngine: Sendable {
                                 }
                             } else {
                                 lockedMarkerIDs.insert(mid)
+                                let newlyPaired = pairGraphState.markSoloLocked(mid)
+                                for pairedID in newlyPaired {
+                                    lockedMarkerIDs.insert(pairedID)
+                                    if let pos = pairGraphState.latestSeenPositionsWorld[pairedID] {
+                                        lockedPositionsByMarkerID[pairedID] = pos
+                                    }
+                                    var ph = marker1To3Holds[pairedID] ?? MarkerHoldProgress(markerID: pairedID)
+                                    ph.isLocked = true
+                                    ph.lockedAtTimestampS = timestampS
+                                    if let pos = pairGraphState.latestSeenPositionsWorld[pairedID] {
+                                        ph.latestPositionWorld = pos
+                                    }
+                                    marker1To3Holds[pairedID] = ph
+                                }
                                 emittedHaptic = .markerLocked(markerID: mid)
                                 if mid == 0 {
                                     justLockedKey = "locked_marker_0_opening"
@@ -1238,13 +1555,22 @@ public struct GuidedCaptureEngine: Sendable {
         if phase == .openingMarker0 && lockedMarkerIDs.contains(0) {
             phase = .markers1To3
         }
+        let targetUpperID = max(3, pairGraphState.seenMarkerIDs.max() ?? 3)
+        let allPlacedLocked = (1...targetUpperID).allSatisfy { mid in
+            if mid <= 3 || pairGraphState.seenMarkerIDs.contains(mid) {
+                return lockedMarkerIDs.contains(mid)
+            }
+            return true
+        }
         if phase == .markers1To3 {
-            let all1To3Locked = lockedMarkerIDs.contains(1) && lockedMarkerIDs.contains(2) && lockedMarkerIDs.contains(3)
-            if all1To3Locked || endEarlyChosen {
+            if allPlacedLocked || endEarlyChosen {
                 // Look-up comes AFTER the return hold at Marker 0 (2026-11-02, drift experiment B): drift while looking
                 // at roof and trees can no longer move the markers or spoil the loop check (walk 8: ~60 cm in 94 s).
                 phase = .closingMarker0
             }
+        } else if phase == .closingMarker0 && !isClosingMarker0Locked && !endEarlyChosen && !allPlacedLocked {
+            // Item 1 (C1, C4): A new marker seen in closing_marker_0 sends the walk back to collecting (.markers1To3), never ignored.
+            phase = .markers1To3
         }
         if phase == .closingMarker0 && isClosingMarker0Locked && requireLookUpStep && !lookUpTracker.isDone && !endEarlyChosen {
             phase = .houseWallLookUp
@@ -1269,13 +1595,23 @@ public struct GuidedCaptureEngine: Sendable {
         }
         if phase == .closingMarker0 && isFinishAvailable(unifiedLoopClosed: unifiedLoopClosed) {
             phase = .readyToFinish
-        } else if phase == .readyToFinish && !isFinishAvailable(unifiedLoopClosed: unifiedLoopClosed) {
-            phase = .closingMarker0
+            hasReachedReadyToFinish = true
+            if unifiedLoopClosed {
+                loopWasClosedAtFinishReady = true
+            }
+        } else if phase == .readyToFinish {
+            hasReachedReadyToFinish = true
+            if unifiedLoopClosed {
+                loopWasClosedAtFinishReady = true
+            }
+            if !isFinishAvailable(unifiedLoopClosed: unifiedLoopClosed) {
+                phase = .closingMarker0
+            }
         }
 
-        // 4. Update pitch out-of-band timers (only outside look-up and active holds)
+        // 4. Update pitch out-of-band timers (only outside look-up, readyToFinish, and active holds)
         let isHoldCounting = (activeRingState != nil && !(activeRingState?.isLocked ?? true))
-        if phase != .houseWallLookUp && !isHoldCounting && dt > 0 {
+        if phase != .houseWallLookUp && phase != .readyToFinish && !isHoldCounting && dt > 0 {
             if pitchDeg > -18.0 {
                 pitchTooHighDurationS += min(dt, 0.25)
                 pitchTooLowDurationS = 0.0
@@ -1317,20 +1653,8 @@ public struct GuidedCaptureEngine: Sendable {
             if timestampS < justLockedBannerUntilS {
                 return (justLockedKey, justLockedText, true)
             }
-            if let ring = activeRingState, !ring.isLocked {
-                if ring.pauseReason == "too_far" {
-                    return ("hold_too_far_\(ring.markerID)", "Step closer to marker \(ring.markerID)", false)
-                }
-                if ring.pauseReason == "too_close" {
-                    return ("hold_too_close_\(ring.markerID)", "Step back from marker \(ring.markerID)", false)
-                }
-                if ring.isPaused && ring.confirmedSegments > 0 {
-                    return ("hold_paused_moving", "Hold steady… almost there", false)
-                }
-                return ("hold_steady", "Hold steady", true)
-            }
 
-            // Look-up step owns the screen: its instruction is never replaced by pace cues (device walk 4, 2026-11-01).
+            // Look-up step owns the screen: its instruction is never replaced by pair-distance warnings or pace cues (Item 5 / C8).
             if phase == .houseWallLookUp {
                 let isRoof = lookUpTracker.stage == .roof
                 if lookUpTracker.skyWarningActive {
@@ -1346,6 +1670,63 @@ public struct GuidedCaptureEngine: Sendable {
                 return isRoof
                     ? ("lookup_roof_hold", "Hold on the roof edge", false)
                     : ("lookup_trees_hold", "Hold on the branches", false)
+            }
+
+            if phase == .readyToFinish {
+                if !unifiedLoopClosed && !loopWasClosedAtFinishReady {
+                    return ("finish_loop_not_closed", "Back at marker 0, but the walk drifted. Tap Finish to save.", true)
+                }
+                return ("all_done_finish", "All done. Tap Finish.", true)
+            }
+
+            // Active close-range solo hold (<= 1.60 m or already accumulating segments) takes precedence over pair warnings.
+            if let ring = activeRingState, !ring.isLocked, (ring.rangeMeters <= 1.60 || ring.confirmedSegments > 0) {
+                if ring.pauseReason == "too_far" {
+                    return ("hold_too_far_\(ring.markerID)", "Step closer to marker \(ring.markerID)", false)
+                }
+                if ring.pauseReason == "too_close" {
+                    return ("hold_too_close_\(ring.markerID)", "Step back from marker \(ring.markerID)", false)
+                }
+                if ring.isPaused && ring.confirmedSegments > 0 {
+                    return ("hold_paused_moving", "Hold steady… almost there", false)
+                }
+                return ("hold_steady", "Hold steady", true)
+            }
+
+            if (tossedMarkerMode || !pairGraphState.confirmedPairEdges.isEmpty || pairGraphState.seenMarkerIDs.contains(where: { $0 >= 4 })),
+               let farID = pairGraphState.isolatedTooFarMarkerID,
+               !pairGraphState.connectedToOrigin.contains(farID),
+               !lockedMarkerIDs.contains(farID) {
+                return (
+                    "pair_marker_too_far_\(farID)",
+                    "Marker \(farID) is over 3.5 m from its neighbour — nudge it closer or toss another marker between them so both fit in view",
+                    true
+                )
+            }
+            if (tossedMarkerMode || !pairGraphState.confirmedPairEdges.isEmpty),
+               allVisible.count == 1,
+               let solo = allVisible.first,
+               solo.markerID != 0,
+               !pairGraphState.connectedToOrigin.contains(solo.markerID),
+               !lockedMarkerIDs.contains(solo.markerID),
+               solo.rangeMeters > 1.50 {
+                return (
+                    "pair_frame_neighbour_\(solo.markerID)",
+                    "Move so marker \(solo.markerID) and its neighbour are both in view",
+                    true
+                )
+            }
+            if let ring = activeRingState, !ring.isLocked {
+                if ring.pauseReason == "too_far" {
+                    return ("hold_too_far_\(ring.markerID)", "Step closer to marker \(ring.markerID)", false)
+                }
+                if ring.pauseReason == "too_close" {
+                    return ("hold_too_close_\(ring.markerID)", "Step back from marker \(ring.markerID)", false)
+                }
+                if ring.isPaused && ring.confirmedSegments > 0 {
+                    return ("hold_paused_moving", "Hold steady… almost there", false)
+                }
+                return ("hold_steady", "Hold steady", true)
             }
             // Corrections are silent while a hold is counting; outside a hold, check pace & tilt (`YS-73`, `YS-74`)
             if turnRateRadS > ExposureAndStillnessGate.maxTurnRateRadS {
@@ -1364,11 +1745,22 @@ public struct GuidedCaptureEngine: Sendable {
 
             switch phase {
             case .openingMarker0:
+                if tossedMarkerMode {
+                    return ("origin_toss_and_find_marker_0", "Toss markers 2–3 big steps apart, then point at marker 0", true)
+                }
                 return ("origin_find_marker_0", "Stand over marker 0 and point at it", true)
             case .markers1To3:
-                let remaining = [1, 2, 3].filter { !lockedMarkerIDs.contains($0) }
+                let seenUnconnected = pairGraphState.seenMarkerIDs
+                    .filter { (1...7).contains($0) && !lockedMarkerIDs.contains($0) }
+                    .sorted()
+                let targetUpperID = max(3, pairGraphState.seenMarkerIDs.max() ?? 3)
+                let candidatePool = (1...targetUpperID).filter { $0 <= 3 || pairGraphState.seenMarkerIDs.contains($0) }
+                let remaining = candidatePool.filter { !lockedMarkerIDs.contains($0) }
                 if remaining.count == 1, let nextID = remaining.first {
                     return ("walk_to_marker_\(nextID)", "Walk to marker \(nextID)", true)
+                }
+                if let nextSeenID = seenUnconnected.first {
+                    return ("walk_to_marker_\(nextSeenID)", "Walk to marker \(nextSeenID)", true)
                 }
                 return ("look_for_markers", "Look around for your markers", true)
             case .houseWallLookUp:
@@ -1378,7 +1770,7 @@ public struct GuidedCaptureEngine: Sendable {
             case .closingMarker0:
                 return ("return_marker_0", "Head back to marker 0", true)
             case .readyToFinish:
-                if !unifiedLoopClosed {
+                if !unifiedLoopClosed && !loopWasClosedAtFinishReady {
                     return ("finish_loop_not_closed", "Back at marker 0, but the walk drifted. Tap Finish to save.", true)
                 }
                 return ("all_done_finish", "All done. Tap Finish.", true)
@@ -1578,6 +1970,8 @@ public enum GuidedVoiceCatalog: Sendable {
         case 3: return "three"
         case 4: return "four"
         case 5: return "five"
+        case 6: return "six"
+        case 7: return "seven"
         default: return "\(id)"
         }
     }
@@ -1603,6 +1997,8 @@ public enum GuidedVoiceCatalog: Sendable {
         switch key {
         case "origin_find_marker_0":
             return "Stand over marker zero and point at it."
+        case "origin_toss_and_find_marker_0":
+            return "Toss markers two to three big steps apart, then point at marker zero."
         case "hold_steady":
             // YS-75: Never speak during hold counting!
             return nil
@@ -1673,6 +2069,14 @@ public enum GuidedVoiceCatalog: Sendable {
             }
             if key.hasPrefix("hold_too_close_") {
                 return "Step back."
+            }
+            if key.hasPrefix("pair_marker_too_far_"),
+               let mid = Int(key.replacingOccurrences(of: "pair_marker_too_far_", with: "")) {
+                return "Marker \(markerNumberWord(mid)) is too far from its neighbour. Nudge it closer or toss another marker between them."
+            }
+            if key.hasPrefix("pair_frame_neighbour_"),
+               let mid = Int(key.replacingOccurrences(of: "pair_frame_neighbour_", with: "")) {
+                return "Move so marker \(markerNumberWord(mid)) and its neighbour are both in view."
             }
             return nil
         }

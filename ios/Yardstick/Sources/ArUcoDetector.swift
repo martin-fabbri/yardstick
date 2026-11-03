@@ -44,6 +44,13 @@ public struct DetectedMarkerSighting: Sendable {
     public let sizeMMMeasured: Double
     public let rangeMeters: Double
     public let viewingAngleDeg: Double
+    public let positionCamera: SIMD3<Double>
+    public let quaternionCameraXYZW: SIMD4<Double>
+    public let edgeDisagreementRatio: Double
+    public let planeRMSEMeters: Double
+    public let depthSampleCount: Int
+    public let positionUncertaintyMeters: Double
+    public let isGroundPlanePrintedSizeFallback: Bool
 
     public init(
         markerID: Int,
@@ -54,7 +61,14 @@ public struct DetectedMarkerSighting: Sendable {
         sizeMMPrinted: Double,
         sizeMMMeasured: Double,
         rangeMeters: Double,
-        viewingAngleDeg: Double = 0.0
+        viewingAngleDeg: Double = 0.0,
+        positionCamera: SIMD3<Double> = .zero,
+        quaternionCameraXYZW: SIMD4<Double> = SIMD4<Double>(0, 0, 0, 1),
+        edgeDisagreementRatio: Double = 0.0,
+        planeRMSEMeters: Double = 0.0,
+        depthSampleCount: Int = 0,
+        positionUncertaintyMeters: Double = 0.0,
+        isGroundPlanePrintedSizeFallback: Bool = false
     ) {
         self.markerID = markerID
         self.cornersUV = cornersUV
@@ -65,10 +79,69 @@ public struct DetectedMarkerSighting: Sendable {
         self.sizeMMMeasured = sizeMMMeasured
         self.rangeMeters = rangeMeters
         self.viewingAngleDeg = viewingAngleDeg
+        self.positionCamera = positionCamera
+        self.quaternionCameraXYZW = quaternionCameraXYZW
+        self.edgeDisagreementRatio = edgeDisagreementRatio
+        self.planeRMSEMeters = planeRMSEMeters
+        self.depthSampleCount = depthSampleCount
+        self.positionUncertaintyMeters = positionUncertaintyMeters
+        self.isGroundPlanePrintedSizeFallback = isGroundPlanePrintedSizeFallback
+    }
+}
+
+/// A single-frame camera-space relative vector and yaw measurement between two simultaneously visible markers (`YS-115`).
+public struct SingleFramePairSighting: Sendable, Equatable {
+    public let idA: Int
+    public let idB: Int
+    public let dxCamM: Double
+    public let dyCamM: Double
+    public let dzCamM: Double
+    public let distM: Double
+    public let dYawRad: Double
+    public let rangeAM: Double
+    public let rangeBM: Double
+    public let angleADeg: Double
+    public let angleBDeg: Double
+    public let weight: Double
+    public let sigmaDistM: Double
+
+    public init(
+        idA: Int,
+        idB: Int,
+        dxCamM: Double,
+        dyCamM: Double,
+        dzCamM: Double,
+        distM: Double,
+        dYawRad: Double,
+        rangeAM: Double,
+        rangeBM: Double,
+        angleADeg: Double,
+        angleBDeg: Double,
+        weight: Double,
+        sigmaDistM: Double = 0.0
+    ) {
+        self.idA = idA
+        self.idB = idB
+        self.dxCamM = dxCamM
+        self.dyCamM = dyCamM
+        self.dzCamM = dzCamM
+        self.distM = distM
+        self.dYawRad = dYawRad
+        self.rangeAM = rangeAM
+        self.rangeBM = rangeBM
+        self.angleADeg = angleADeg
+        self.angleBDeg = angleBDeg
+        self.weight = weight
+        self.sigmaDistM = sigmaDistM
     }
 }
 
 public enum ArUcoDetector {
+    /// Supported ArUco `DICT_5X5_250` marker IDs (`0...7`, `YS-115`).
+    public static let validMarkerIDs: Set<Int> = [0, 1, 2, 3, 4, 5, 6, 7]
+
+    /// Minimum quad area fraction of image area (`0.0004` = `0.04%`, `YS-115`) so `180 mm` / `160 mm` markers at `3.5–4.2 m` pass while sub-pixel contour noise is rejected.
+    public static let minQuadAreaRatio: Double = 0.0004
     /// OpenCV Apache-2.0 attribution text displayed in Settings ▸ About (`YS-70`).
     public static let openCVApacheAttributionNotice = """
     ArUco Marker Detection & Sub-Pixel Corner Refinement (`DICT_5X5_250`)
@@ -165,7 +238,10 @@ public enum ArUcoDetector {
                 maxShift = shift
             }
         }
-        return (maxShift / meanEdge) <= maxCornerShiftRatio
+        // For small distant quads (meanEdge < 65 px, range > 2.7 m), integer contour vertices have up to ~2.5 px
+        // pixel-quantization offset relative to sub-pixel border gradients (`YS-115` C6).
+        let maxAllowedPx = (meanEdge < 65.0) ? max(maxCornerShiftRatio * meanEdge, 2.5) : (maxCornerShiftRatio * meanEdge)
+        return maxShift <= maxAllowedPx
     }
 
     /// Refine 2D corner positions to sub-pixel accuracy on the outer black-to-white marker border using
@@ -291,11 +367,13 @@ public enum ArUcoDetector {
         lumaBytes: [UInt8],
         width: Int,
         height: Int,
-        maxCornerShiftRatio: Double = 0.03
+        maxCornerShiftRatio: Double = 0.03,
+        minQuadAreaRatio: Double = ArUcoDetector.minQuadAreaRatio
     ) -> [(markerID: Int, cornersUV: [SIMD2<Double>])] {
         guard lumaBytes.count == width * height, width >= 64, height >= 64 else {
             return []
         }
+        let minQuadAreaPx = Double(width * height) * max(0.0, minQuadAreaRatio)
 
         // 1. Build 1-based integral image for O(1) adaptive box-mean thresholding
         let strideI = width + 1
@@ -435,6 +513,9 @@ public enum ArUcoDetector {
                         if e < minEdge { minEdge = e }
                     }
                     guard minEdge >= max(4.0, perim * 0.05) else {
+                        continue
+                    }
+                    guard quadAreaUV(ordered) >= minQuadAreaPx else {
                         continue
                     }
 
@@ -743,7 +824,9 @@ public enum ArUcoDetector {
             }
         }
 
-        guard let (markerID, rotCount) = matchCode5x5(observedBits, maxHamming: 0) else {
+        guard let (markerID, rotCount) = matchCode5x5(observedBits, maxHamming: 0),
+              validMarkerIDs.contains(markerID)
+        else {
             return nil
         }
 
@@ -851,30 +934,23 @@ public enum ArUcoDetector {
             height: h,
             maxCornerShiftRatio: maxCornerShiftRatio
         )
-        var confirmed: [DetectedMarkerSighting] = []
-        for d2 in dets2D {
-            let pSize = printedSizesByMarker[d2.markerID] ?? defaultPrintedSizeMM
-            if let s3D = measureMarker3DOnLiDARPlane(
-                markerID: d2.markerID,
-                cornersUV: d2.cornersUV,
-                printedSizeMM: pSize,
-                depthMapMM: depthMapMM,
-                confidenceMap: confidenceMap,
-                depthWidth: depthWidth,
-                depthHeight: depthHeight,
-                rgbWidth: w,
-                rgbHeight: h,
-                fx: fx,
-                fy: fy,
-                cx: cx,
-                cy: cy,
-                cameraToWorld: cameraToWorld,
-                maxEdgeDisagreementRatio: maxEdgeDisagreementRatio
-            ) {
-                confirmed.append(s3D)
-            }
-        }
-        return confirmed
+        return measureMarkers3DForFrame(
+            dets2D: dets2D,
+            printedSizesByMarker: printedSizesByMarker,
+            defaultPrintedSizeMM: defaultPrintedSizeMM,
+            depthMapMM: depthMapMM,
+            confidenceMap: confidenceMap,
+            depthWidth: depthWidth,
+            depthHeight: depthHeight,
+            rgbWidth: w,
+            rgbHeight: h,
+            fx: fx,
+            fy: fy,
+            cx: cx,
+            cy: cy,
+            cameraToWorld: cameraToWorld,
+            maxEdgeDisagreementRatio: maxEdgeDisagreementRatio
+        )
     }
 
     /// Compute variance of discrete Laplacian on a downsampled luma grid as a fast sharpness metric (`YS-13`).
@@ -1016,7 +1092,8 @@ public enum ArUcoDetector {
         cy: Double,
         cameraToWorld: simd_double4x4,
         maxEdgeDisagreementRatio: Double = 0.04,
-        maxPlaneTiltFromViewDeg: Double = 60.0
+        maxPlaneTiltFromViewDeg: Double = 60.0,
+        maxRangeMeters: Double = 4.20
     ) -> DetectedMarkerSighting? {
         guard cornersUV.count == 4, depthMapMM.count == depthWidth * depthHeight else {
             return nil
@@ -1076,7 +1153,7 @@ public enum ArUcoDetector {
         }
         centroidCam /= Double(interiorCamPts.count)
         let rangeM = simd_length(centroidCam)
-        guard rangeM >= 0.50 && rangeM <= 3.50 else {
+        guard rangeM >= 0.50 && rangeM <= maxRangeMeters else {
             return nil
         }
 
@@ -1091,6 +1168,12 @@ public enum ArUcoDetector {
             normalCam = viewDir
         }
         let dCam = -simd_dot(normalCam, centroidCam)
+        var planeSqSum = 0.0
+        for p in interiorCamPts {
+            let r = simd_dot(normalCam, p) + dCam
+            planeSqSum += r * r
+        }
+        let planeRMSEM = sqrt(planeSqSum / Double(max(1, interiorCamPts.count)))
 
         // Intersect the 4 full-res RGB corner rays with the fitted LiDAR depth plane
         var cornersCam: [SIMD3<Double>] = []
@@ -1118,15 +1201,28 @@ public enum ArUcoDetector {
         let meanEdgeM = edgeSumM * 0.25
         guard meanEdgeM > 1e-9 else { return nil }
 
+        let maxEdge = edgesM.max() ?? meanEdgeM
+        let minEdge = edgesM.min() ?? meanEdgeM
+        let edgeDisagreementRatio = (maxEdge - minEdge) / meanEdgeM
+
         // Reject any quad whose 3D edge lengths disagree by > maxEdgeDisagreementRatio (4%, YS-69)
         if maxEdgeDisagreementRatio > 0.0 {
-            let maxEdge = edgesM.max() ?? meanEdgeM
-            let minEdge = edgesM.min() ?? meanEdgeM
-            if ((maxEdge - minEdge) / meanEdgeM) > maxEdgeDisagreementRatio {
+            if edgeDisagreementRatio > maxEdgeDisagreementRatio {
                 return nil
             }
         }
         let measuredMM = meanEdgeM * 1000.0
+
+        // Camera-space center and orientation quaternion
+        let centerCam = (cornersCam[0] + cornersCam[1] + cornersCam[2] + cornersCam[3]) * 0.25
+        let zAxisCam = simd_normalize(normalCam)
+        let topEdgeCam = cornersCam[1] - cornersCam[0]
+        let xProjCam = topEdgeCam - simd_dot(topEdgeCam, zAxisCam) * zAxisCam
+        guard simd_length(xProjCam) > 1e-9 else { return nil }
+        let xAxisCam = simd_normalize(xProjCam)
+        let yAxisCam = simd_normalize(simd_cross(zAxisCam, xAxisCam))
+        let rotMatCam = simd_double3x3(columns: (xAxisCam, yAxisCam, zAxisCam))
+        let quatCam = simd_normalize(simd_quatd(rotMatCam))
 
         // Transform corners, center, and fitted plane normal into ARKit world coordinates
         let cornersWorld = cornersCam.map { p -> SIMD3<Double> in
@@ -1154,8 +1250,307 @@ public enum ArUcoDetector {
             sizeMMPrinted: printedSizeMM,
             sizeMMMeasured: measuredMM,
             rangeMeters: rangeM,
-            viewingAngleDeg: viewingAngleDeg
+            viewingAngleDeg: viewingAngleDeg,
+            positionCamera: centerCam,
+            quaternionCameraXYZW: SIMD4<Double>(quatCam.imag.x, quatCam.imag.y, quatCam.imag.z, quatCam.real),
+            edgeDisagreementRatio: edgeDisagreementRatio,
+            planeRMSEMeters: planeRMSEM,
+            depthSampleCount: interiorCamPts.count,
+            positionUncertaintyMeters: 0.0,
+            isGroundPlanePrintedSizeFallback: false
         )
+    }
+
+    /// Estimate the 3D position and orientation of a far marker (`1.50–4.20 m`) in a multi-marker frame from the
+    /// gravity-aligned ground plane (or near-marker reference normal) and its known printed size (`180 mm`) when the
+    /// interior LiDAR quad plane fit fails (`seen_2d_no_3d`, `YS-115` C5/C6, `CS011`).
+    ///
+    /// Records its own range/position uncertainty (`positionUncertaintyMeters`) and `depthSampleCount = 0` while preserving
+    /// raw edge disagreement (`edgeDisagreementRatio`).
+    public static func measureMarker3DFromGroundPlaneAndPrintedSize(
+        markerID: Int,
+        cornersUV: [SIMD2<Double>],
+        printedSizeMM: Double,
+        fx: Double,
+        fy: Double,
+        cx: Double,
+        cy: Double,
+        cameraToWorld: simd_double4x4,
+        referenceNormalCam: SIMD3<Double>? = nil,
+        minRangeMeters: Double = 1.50,
+        maxRangeMeters: Double = 4.20,
+        maxGroundEdgeDisagreementRatio: Double = 0.35
+    ) -> DetectedMarkerSighting? {
+        guard cornersUV.count == 4, printedSizeMM > 0.0, fx > 0.0, fy > 0.0 else {
+            return nil
+        }
+
+        let centerUV = (cornersUV[0] + cornersUV[1] + cornersUV[2] + cornersUV[3]) * 0.25
+        let rayCenter = simd_normalize(SIMD3<Double>((centerUV.x - cx) / fx, -(centerUV.y - cy) / fy, -1.0))
+        let viewDir = -rayCenter
+
+        let rotCW = simd_double3x3(
+            SIMD3<Double>(cameraToWorld.columns.0.x, cameraToWorld.columns.0.y, cameraToWorld.columns.0.z),
+            SIMD3<Double>(cameraToWorld.columns.1.x, cameraToWorld.columns.1.y, cameraToWorld.columns.1.z),
+            SIMD3<Double>(cameraToWorld.columns.2.x, cameraToWorld.columns.2.y, cameraToWorld.columns.2.z)
+        )
+        var gravNormalCam = rotCW.transpose * SIMD3<Double>(0.0, 1.0, 0.0)
+        if simd_length(gravNormalCam) > 1e-6 {
+            gravNormalCam = simd_normalize(gravNormalCam)
+            if simd_dot(gravNormalCam, viewDir) < 0.0 {
+                gravNormalCam = -gravNormalCam
+            }
+        } else {
+            gravNormalCam = viewDir
+        }
+
+        var normalCam = gravNormalCam
+        if let refRaw = referenceNormalCam, simd_length(refRaw) > 1e-6 {
+            var refN = simd_normalize(refRaw)
+            if simd_dot(refN, viewDir) < 0.0 {
+                refN = -refN
+            }
+            if abs(simd_dot(gravNormalCam, viewDir)) < 0.15 {
+                normalCam = refN
+            } else if simd_dot(gravNormalCam, refN) >= 0.95 {
+                normalCam = simd_normalize(gravNormalCam + refN)
+            }
+        }
+
+        let cosView = min(1.0, max(-1.0, abs(simd_dot(normalCam, viewDir))))
+        let viewingAngleDeg = acos(cosView) * 180.0 / .pi
+        guard viewingAngleDeg <= 78.0 else {
+            return nil
+        }
+
+        let denomCenter = simd_dot(normalCam, rayCenter)
+        guard abs(denomCenter) > 0.12 else {
+            return nil
+        }
+
+        var unitRangeCornersCam: [SIMD3<Double>] = []
+        unitRangeCornersCam.reserveCapacity(4)
+        for cUV in cornersUV {
+            let ray = simd_normalize(SIMD3<Double>((cUV.x - cx) / fx, -(cUV.y - cy) / fy, -1.0))
+            let denom = simd_dot(normalCam, ray)
+            guard abs(denom) > 0.08 else { return nil }
+            let tUnit = denomCenter / denom
+            guard tUnit > 0.0 else { return nil }
+            unitRangeCornersCam.append(ray * tUnit)
+        }
+
+        var unitEdges = [Double](repeating: 0.0, count: 4)
+        var unitEdgeSum = 0.0
+        var pxEdgeSum = 0.0
+        for i in 0..<4 {
+            let e = simd_length(unitRangeCornersCam[(i + 1) % 4] - unitRangeCornersCam[i])
+            unitEdges[i] = e
+            unitEdgeSum += e
+            pxEdgeSum += simd_length(cornersUV[(i + 1) % 4] - cornersUV[i])
+        }
+        let meanUnitEdge = unitEdgeSum * 0.25
+        let meanPxEdge = max(4.0, pxEdgeSum * 0.25)
+        guard meanUnitEdge > 1e-6 else { return nil }
+
+        let maxUnitEdge = unitEdges.max() ?? meanUnitEdge
+        let minUnitEdge = unitEdges.min() ?? meanUnitEdge
+        let edgeDisagreementRatio = (maxUnitEdge - minUnitEdge) / meanUnitEdge
+        guard edgeDisagreementRatio <= maxGroundEdgeDisagreementRatio else {
+            return nil
+        }
+
+        let printedSizeM = printedSizeMM / 1000.0
+        let rangeEstM = printedSizeM / meanUnitEdge
+        guard rangeEstM >= minRangeMeters && rangeEstM <= maxRangeMeters else {
+            return nil
+        }
+
+        let cornersCam = unitRangeCornersCam.map { $0 * rangeEstM }
+        let centerCam = (cornersCam[0] + cornersCam[1] + cornersCam[2] + cornersCam[3]) * 0.25
+        let rangeM = simd_length(centerCam)
+
+        // Uncertainty from pixel quantization (1.5 px), ground-plane edge spread, and 1.5° ground slope uncertainty at grazing angle
+        let relPxErr = 1.5 / meanPxEdge
+        let relEdgeErr = 0.5 * edgeDisagreementRatio
+        let relSlopeErr = 0.025 * tan(min(75.0, viewingAngleDeg) * .pi / 180.0)
+        let sigmaRangeM = max(0.05, rangeM * sqrt(relPxErr * relPxErr + relEdgeErr * relEdgeErr + relSlopeErr * relSlopeErr))
+
+        let zAxisCam = simd_normalize(normalCam)
+        let topEdgeCam = cornersCam[1] - cornersCam[0]
+        let xProjCam = topEdgeCam - simd_dot(topEdgeCam, zAxisCam) * zAxisCam
+        guard simd_length(xProjCam) > 1e-9 else { return nil }
+        let xAxisCam = simd_normalize(xProjCam)
+        let yAxisCam = simd_normalize(simd_cross(zAxisCam, xAxisCam))
+        let rotMatCam = simd_double3x3(columns: (xAxisCam, yAxisCam, zAxisCam))
+        let quatCam = simd_normalize(simd_quatd(rotMatCam))
+
+        let cornersWorld = cornersCam.map { p -> SIMD3<Double> in
+            let hp = cameraToWorld * SIMD4<Double>(p.x, p.y, p.z, 1.0)
+            return SIMD3<Double>(hp.x, hp.y, hp.z)
+        }
+        let centerWorld = (cornersWorld[0] + cornersWorld[1] + cornersWorld[2] + cornersWorld[3]) * 0.25
+        let normalWorld4 = cameraToWorld * SIMD4<Double>(normalCam.x, normalCam.y, normalCam.z, 0.0)
+        let zAxis = simd_normalize(SIMD3<Double>(normalWorld4.x, normalWorld4.y, normalWorld4.z))
+        let topEdge = cornersWorld[1] - cornersWorld[0]
+        let xProj = topEdge - simd_dot(topEdge, zAxis) * zAxis
+        guard simd_length(xProj) > 1e-9 else { return nil }
+        let xAxis = simd_normalize(xProj)
+        let yAxis = simd_normalize(simd_cross(zAxis, xAxis))
+        let rotMat = simd_double3x3(columns: (xAxis, yAxis, zAxis))
+        let quat = simd_normalize(simd_quatd(rotMat))
+
+        return DetectedMarkerSighting(
+            markerID: markerID,
+            cornersUV: cornersUV,
+            cornersWorld: cornersWorld,
+            positionWorld: centerWorld,
+            quaternionXYZW: SIMD4<Double>(quat.imag.x, quat.imag.y, quat.imag.z, quat.real),
+            sizeMMPrinted: printedSizeMM,
+            sizeMMMeasured: printedSizeMM,
+            rangeMeters: rangeM,
+            viewingAngleDeg: viewingAngleDeg,
+            positionCamera: centerCam,
+            quaternionCameraXYZW: SIMD4<Double>(quatCam.imag.x, quatCam.imag.y, quatCam.imag.z, quatCam.real),
+            edgeDisagreementRatio: edgeDisagreementRatio,
+            planeRMSEMeters: sigmaRangeM,
+            depthSampleCount: 0,
+            positionUncertaintyMeters: sigmaRangeM,
+            isGroundPlanePrintedSizeFallback: true
+        )
+    }
+
+    /// Measure 3D sightings for all 2D markers in a frame, using `measureMarker3DOnLiDARPlane` first and
+    /// falling back to `measureMarker3DFromGroundPlaneAndPrintedSize` for any far marker (`1.50–4.20 m`) in a
+    /// two-or-more-marker pair frame (`dets2D.count >= 2`) when the LiDAR quad fit fails (`YS-115` C5/C6).
+    public static func measureMarkers3DForFrame(
+        dets2D: [(markerID: Int, cornersUV: [SIMD2<Double>])],
+        printedSizesByMarker: [Int: Double],
+        defaultPrintedSizeMM: Double,
+        depthMapMM: [UInt16],
+        confidenceMap: [UInt8],
+        depthWidth: Int,
+        depthHeight: Int,
+        rgbWidth: Int,
+        rgbHeight: Int,
+        fx: Double,
+        fy: Double,
+        cx: Double,
+        cy: Double,
+        cameraToWorld: simd_double4x4,
+        maxEdgeDisagreementRatio: Double = 0.04,
+        maxPlaneTiltFromViewDeg: Double = 60.0
+    ) -> [DetectedMarkerSighting] {
+        var measured: [DetectedMarkerSighting] = []
+        var unmeasured2D: [(markerID: Int, cornersUV: [SIMD2<Double>])] = []
+        for d2 in dets2D {
+            let pSize = printedSizesByMarker[d2.markerID] ?? defaultPrintedSizeMM
+            if let s3D = measureMarker3DOnLiDARPlane(
+                markerID: d2.markerID,
+                cornersUV: d2.cornersUV,
+                printedSizeMM: pSize,
+                depthMapMM: depthMapMM,
+                confidenceMap: confidenceMap,
+                depthWidth: depthWidth,
+                depthHeight: depthHeight,
+                rgbWidth: rgbWidth,
+                rgbHeight: rgbHeight,
+                fx: fx,
+                fy: fy,
+                cx: cx,
+                cy: cy,
+                cameraToWorld: cameraToWorld,
+                maxEdgeDisagreementRatio: maxEdgeDisagreementRatio,
+                maxPlaneTiltFromViewDeg: maxPlaneTiltFromViewDeg
+            ) {
+                measured.append(s3D)
+            } else {
+                unmeasured2D.append(d2)
+            }
+        }
+
+        if dets2D.count >= 2 && !unmeasured2D.isEmpty {
+            let refNormalCam: SIMD3<Double>? = measured.first.map { s in
+                let q = s.quaternionCameraXYZW
+                return simd_double3x3(simd_quatd(ix: q.x, iy: q.y, iz: q.z, r: q.w)).columns.2
+            }
+            for d2 in unmeasured2D {
+                let pSize = printedSizesByMarker[d2.markerID] ?? defaultPrintedSizeMM
+                if let fallback3D = measureMarker3DFromGroundPlaneAndPrintedSize(
+                    markerID: d2.markerID,
+                    cornersUV: d2.cornersUV,
+                    printedSizeMM: pSize,
+                    fx: fx,
+                    fy: fy,
+                    cx: cx,
+                    cy: cy,
+                    cameraToWorld: cameraToWorld,
+                    referenceNormalCam: refNormalCam
+                ) {
+                    measured.append(fallback3D)
+                }
+            }
+        }
+        return measured
+    }
+
+    /// Compute the canonical camera-space pair measurement `(idA < idB)` between two markers visible in the same frame (`YS-115`).
+    public static func computeSingleFramePairMeasurement(
+        sightingA: DetectedMarkerSighting,
+        sightingB: DetectedMarkerSighting,
+        maxPairDistanceMeters: Double = 4.20
+    ) -> SingleFramePairSighting? {
+        guard sightingA.markerID != sightingB.markerID else { return nil }
+        let (a, b) = (sightingA.markerID < sightingB.markerID) ? (sightingA, sightingB) : (sightingB, sightingA)
+        let pA = (simd_length(a.positionCamera) > 1e-6) ? a.positionCamera : a.positionWorld
+        let pB = (simd_length(b.positionCamera) > 1e-6) ? b.positionCamera : b.positionWorld
+        let qA = (simd_length(a.positionCamera) > 1e-6) ? a.quaternionCameraXYZW : a.quaternionXYZW
+        let qB = (simd_length(b.positionCamera) > 1e-6) ? b.quaternionCameraXYZW : b.quaternionXYZW
+
+        let deltaCam = pB - pA
+        let distM = simd_length(deltaCam)
+        guard distM >= 0.15 && distM <= maxPairDistanceMeters else { return nil }
+
+        let rotA = simd_double3x3(simd_quatd(ix: qA.x, iy: qA.y, iz: qA.z, r: qA.w))
+        let rotB = simd_double3x3(simd_quatd(ix: qB.x, iy: qB.y, iz: qB.z, r: qB.w))
+        // Express the relative vector in Marker A's local frame (matching `markers.py::compute_single_frame_pair_measurement`)
+        let deltaLocalA = rotA.transpose * deltaCam
+        let relRot = rotA.transpose * rotB
+        let dYawRad = atan2(relRot.columns.0.y, relRot.columns.0.x)
+
+        let sigmaLiDARA = max(0.008, 0.004 * max(1.0, a.rangeMeters * a.rangeMeters) / max(0.25, cos(a.viewingAngleDeg * .pi / 180.0)))
+        let sigmaLiDARB = max(0.008, 0.004 * max(1.0, b.rangeMeters * b.rangeMeters) / max(0.25, cos(b.viewingAngleDeg * .pi / 180.0)))
+        let sigmaA = max(sigmaLiDARA, a.positionUncertaintyMeters)
+        let sigmaB = max(sigmaLiDARB, b.positionUncertaintyMeters)
+        let sigmaDistM = sqrt(sigmaA * sigmaA + sigmaB * sigmaB)
+        let weight = 1.0 / (sigmaA * sigmaA + sigmaB * sigmaB)
+
+        return SingleFramePairSighting(
+            idA: a.markerID,
+            idB: b.markerID,
+            dxCamM: deltaLocalA.x,
+            dyCamM: deltaLocalA.y,
+            dzCamM: deltaLocalA.z,
+            distM: distM,
+            dYawRad: dYawRad,
+            rangeAM: a.rangeMeters,
+            rangeBM: b.rangeMeters,
+            angleADeg: a.viewingAngleDeg,
+            angleBDeg: b.viewingAngleDeg,
+            weight: weight,
+            sigmaDistM: sigmaDistM
+        )
+    }
+
+    /// Shoelace area of a 4-corner polygon in pixel coordinates.
+    public static func quadAreaUV(_ quad: [SIMD2<Double>]) -> Double {
+        guard quad.count == 4 else { return 0.0 }
+        var sum = 0.0
+        for i in 0..<4 {
+            let a = quad[i]
+            let b = quad[(i + 1) % 4]
+            sum += a.x * b.y - b.x * a.y
+        }
+        return 0.5 * abs(sum)
     }
 
     private static func pointInQuad(_ p: SIMD2<Double>, quad: [SIMD2<Double>]) -> Bool {

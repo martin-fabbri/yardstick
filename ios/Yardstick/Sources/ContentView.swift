@@ -494,7 +494,7 @@ private struct WelcomeOnboardingSheetView: View {
         List {
             Section {
                 Label("Marker 0 is your start. Put it by the back door.", systemImage: "0.circle.fill")
-                Label("Put 1, 2 and 3 near the corners and along the fence.", systemImage: "square.dashed")
+                Label("Toss them 2–3 big steps apart around the yard.", systemImage: "square.dashed")
                 Label("Lay them flat, out of shade.", systemImage: "sun.max.fill")
             }
         }
@@ -522,10 +522,8 @@ private struct BeforeYouStartSheetView: View {
     let onStartWalk: () -> Void
 
     @Environment(\.accessibilityDifferentiateWithoutColor) private var differentiateWithoutColor
-    @State private var preWalkTapeInput: String = ""
     @State private var customPrintSizeCMInput: String = "18.0"
     @State private var showPrintCustomSizeField: Bool = false
-    @FocusState private var isTapeFieldFocused: Bool
 
     private var isSimulatorPreviewAllowed: Bool {
         ProcessInfo.processInfo.arguments.contains { $0.hasPrefix("--ui-test-screen=") }
@@ -572,9 +570,7 @@ private struct BeforeYouStartSheetView: View {
             }
         }
         .onAppear {
-            if let existingTape = recorder.preWalkTapeMeters0To1, existingTape > 0 {
-                preWalkTapeInput = String(format: "%.2f", existingTape)
-            }
+            recorder.setPreWalkTapeMeters0To1(nil)
             recorder.startPreFlightCameraProbeIfAuthorized()
             _ = recorder.evaluatePreFlightChecklist()
         }
@@ -644,59 +640,11 @@ private struct BeforeYouStartSheetView: View {
                     }
                 }
                 .padding(.vertical, 4)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 6) {
-                        Image(systemName: (recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? "checkmark.circle.fill" : "circle")
-                            .foregroundStyle((recorder.preWalkTapeMeters0To1 ?? 0) > 0 ? .green : .secondary)
-                        Text("Tape measurement")
-                    }
-                    Text("Measure from the centre of marker 0 to the centre of marker 1.")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                    HStack(spacing: 8) {
-                        TextField("Metres, for example 3.00", text: $preWalkTapeInput)
-                            .keyboardType(.decimalPad)
-                            .focused($isTapeFieldFocused)
-                            .textFieldStyle(.roundedBorder)
-                            .font(.title3)
-                            .accessibilityLabel("Tape measurement in metres")
-                            .onChange(of: preWalkTapeInput) { _, newValue in
-                                let normalized = newValue
-                                    .trimmingCharacters(in: .whitespaces)
-                                    .replacingOccurrences(of: ",", with: ".")
-                                if let val = Double(normalized), val > 0 {
-                                    recorder.setPreWalkTapeMeters0To1(val)
-                                } else if normalized.isEmpty {
-                                    recorder.setPreWalkTapeMeters0To1(nil)
-                                }
-                            }
-                        Text("m")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                    }
-                    Picker("Tape lay", selection: $recorder.tapeSurface) {
-                        ForEach(CaptureSessionRecorder.TapeSurface.allCases, id: \.self) { surface in
-                            Text(surface.label).tag(surface)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .accessibilityLabel("Where the tape lay")
-                }
-                .padding(.vertical, 4)
-                .contentShape(Rectangle())
-                .onTapGesture { isTapeFieldFocused = true }
             } footer: {
                 Text("Stops you: too dark, no space, too hot.")
             }
         }
         .scrollDismissesKeyboard(.interactively)
-        .toolbar {
-            ToolbarItemGroup(placement: .keyboard) {
-                Spacer()
-                Button("Done") { isTapeFieldFocused = false }
-            }
-        }
     }
 
     @ViewBuilder
@@ -934,7 +882,7 @@ private struct WalkFullScreenCoverView: View {
                     }
                     MarkerProgressCapsuleView(
                         lockedMarkerIDs: recorder.lockedMarkerIDs,
-                        seenMarkerIDs: recorder.detectedMarkerIDs,
+                        seenMarkerIDs: recorder.seenMarkerIDs.union(recorder.detectedMarkerIDs),
                         phase: recorder.guidedWalkPhase,
                         isFinishAvailable: recorder.isFinishAvailable,
                         isAccessibilitySize: true,
@@ -948,7 +896,7 @@ private struct WalkFullScreenCoverView: View {
                     Spacer(minLength: 4)
                     MarkerProgressCapsuleView(
                         lockedMarkerIDs: recorder.lockedMarkerIDs,
-                        seenMarkerIDs: recorder.detectedMarkerIDs,
+                        seenMarkerIDs: recorder.seenMarkerIDs.union(recorder.detectedMarkerIDs),
                         phase: recorder.guidedWalkPhase,
                         isFinishAvailable: recorder.isFinishAvailable,
                         isAccessibilitySize: false,
@@ -1059,8 +1007,10 @@ private struct MarkerProgressCapsuleView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
             } else {
-                HStack(spacing: 10) {
-                    ForEach(0..<4, id: \.self) { mid in
+                let maxSeenOrLocked = max(3, max(lockedMarkerIDs.max() ?? 3, seenMarkerIDs.max() ?? 3))
+                let markerCount = min(8, maxSeenOrLocked + 1)
+                HStack(spacing: markerCount > 4 ? 6 : 10) {
+                    ForEach(0..<markerCount, id: \.self) { mid in
                         markerSymbolView(for: mid)
                     }
                 }
